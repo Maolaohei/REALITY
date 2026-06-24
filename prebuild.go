@@ -54,10 +54,10 @@ func (pc *PrebuildCache) Get(serverName string) *TargetProfile {
 	pc.mu.RLock()
 	p, ok := pc.profiles[serverName]
 	pc.mu.RUnlock()
-	if !ok {
+	if !ok || p == nil {
 		return nil
 	}
-	if time.Since(p.CapturedAt) > p.TTL {
+	if time.Since(p.CapturedAt) >= p.TTL {
 		pc.mu.Lock()
 		delete(pc.profiles, serverName)
 		pc.mu.Unlock()
@@ -67,9 +67,14 @@ func (pc *PrebuildCache) Get(serverName string) *TargetProfile {
 }
 
 // Store adds or replaces a profile for serverName.
+// A shallow copy is made to prevent callers from mutating cached data.
 func (pc *PrebuildCache) Store(serverName string, p *TargetProfile) {
+	if p == nil {
+		return
+	}
+	cp := *p
 	pc.mu.Lock()
-	pc.profiles[serverName] = p
+	pc.profiles[serverName] = &cp
 	pc.mu.Unlock()
 }
 
