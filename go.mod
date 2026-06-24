@@ -1,4 +1,4 @@
-module github.com/xtls/reality
+module github.com/Maolaohei/REALITY
 
 go 1.24.0
 

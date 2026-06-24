@@ -24,9 +24,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xtls/reality/fips140tls"
-	"github.com/xtls/reality/hpke"
-	"github.com/xtls/reality/tls13"
+	"github.com/Maolaohei/REALITY/fips140tls"
+	"github.com/Maolaohei/REALITY/hpke"
+	"github.com/Maolaohei/REALITY/tls13"
 )
 
 type clientHandshakeState struct {

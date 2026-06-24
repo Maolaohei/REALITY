@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/crypto/cryptobyte"
 
-	"github.com/xtls/reality/hpke"
+	"github.com/Maolaohei/REALITY/hpke"
 )
 
 // sortedSupportedAEADs is just a sorted version of hpke.SupportedAEADS.
