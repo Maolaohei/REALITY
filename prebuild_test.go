@@ -2,6 +2,7 @@ package reality
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -373,7 +374,136 @@ func TestProbeTarget_ContextCanceled(t *testing.T) {
 }
 
 // ============================================================================
-// Performance Tests
+// Auto-probe Infrastructure Tests
+// ============================================================================
+
+func TestEnsureAutoProbe_EmptyDest(t *testing.T) {
+	// Empty dest should not start any probe
+	config := &Config{
+		DialContext: (&net.Dialer{}).DialContext,
+		Type:        "tcp",
+		Dest:        "",
+	}
+	ensureAutoProbe(config)
+
+	// Verify no entries created
+	count := 0
+	probeOnces.Range(func(key, value any) bool {
+		count++
+		return true
+	})
+	if count != 0 {
+		t.Errorf("expected 0 probe entries for empty dest, got %v", count)
+	}
+}
+
+func TestEnsureAutoProbe_CopiesConfig(t *testing.T) {
+	config := &Config{
+		DialContext: (&net.Dialer{}).DialContext,
+		Type:        "tcp",
+		Dest:        "127.0.0.1:19999",
+		Show:        false,
+	}
+
+	// ensureAutoProbe should copy config values, not capture pointer
+	ensureAutoProbe(config)
+
+	// Verify entry was created
+	if _, ok := probeOnces.Load("127.0.0.1:19999"); !ok {
+		t.Error("expected probeOnces entry for dest")
+	}
+	if _, ok := probeStops.Load("127.0.0.1:19999"); !ok {
+		t.Error("expected probeStops entry for dest")
+	}
+
+	// Clean up
+	StopAutoProbe("127.0.0.1:19999")
+}
+
+func TestEnsureAutoProbe_Idempotent(t *testing.T) {
+	config := &Config{
+		DialContext: (&net.Dialer{}).DialContext,
+		Type:        "tcp",
+		Dest:        "127.0.0.1:19998",
+	}
+
+	// Call twice — should only create one entry
+	ensureAutoProbe(config)
+	ensureAutoProbe(config)
+
+	count := 0
+	probeOnces.Range(func(key, value any) bool {
+		if key == "127.0.0.1:19998" {
+			count++
+		}
+		return true
+	})
+	if count != 1 {
+		t.Errorf("expected 1 entry for dest, got %v", count)
+	}
+
+	StopAutoProbe("127.0.0.1:19998")
+}
+
+func TestStopAutoProbe_CleansUp(t *testing.T) {
+	config := &Config{
+		DialContext: (&net.Dialer{}).DialContext,
+		Type:        "tcp",
+		Dest:        "127.0.0.1:19997",
+	}
+
+	ensureAutoProbe(config)
+
+	// Verify entries exist
+	if _, ok := probeOnces.Load("127.0.0.1:19997"); !ok {
+		t.Error("expected probeOnces entry before stop")
+	}
+	if _, ok := probeStops.Load("127.0.0.1:19997"); !ok {
+		t.Error("expected probeStops entry before stop")
+	}
+
+	StopAutoProbe("127.0.0.1:19997")
+
+	// Verify entries cleaned up
+	if _, ok := probeOnces.Load("127.0.0.1:19997"); ok {
+		t.Error("expected probeOnces entry cleaned up after stop")
+	}
+	if _, ok := probeStops.Load("127.0.0.1:19997"); ok {
+		t.Error("expected probeStops entry cleaned up after stop")
+	}
+}
+
+func TestStopAutoProbe_Noop(t *testing.T) {
+	// Stopping a non-existent dest should not panic
+	StopAutoProbe("nonexistent")
+}
+
+func TestEnsureAutoProbe_NoMemoryLeak(t *testing.T) {
+	// Create and stop many entries to verify cleanup
+	const n = 100
+	for i := 0; i < n; i++ {
+		config := &Config{
+			DialContext: (&net.Dialer{}).DialContext,
+			Type:        "tcp",
+			Dest:        fmt.Sprintf("127.0.0.1:%d", 19000+i),
+		}
+		ensureAutoProbe(config)
+		StopAutoProbe(config.Dest)
+	}
+
+	// Verify all entries cleaned up
+	count := 0
+	probeOnces.Range(func(key, value any) bool {
+		count++
+		return true
+	})
+	if count != 0 {
+		t.Errorf("expected 0 probe entries after cleanup, got %v", count)
+	}
+}
+
+// ============================================================================
+// Performance Tests (continued)
 // ============================================================================
 
 func BenchmarkPrebuildCache_Get(b *testing.B) {

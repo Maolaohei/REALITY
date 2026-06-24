@@ -2,6 +2,8 @@ package reality
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"sync"
 	"time"
 )
@@ -90,7 +92,6 @@ func ProbeTarget(ctx context.Context, config *Config) error {
 	defer target.Close()
 
 	// Read the target's TLS response to capture record lengths.
-	// We use the same approach as the real Server() goroutine.
 	buf := make([]byte, maxRecordSize)
 	s2cSaved := make([]byte, 0, maxRecordSize)
 	handshakeLen := 0
@@ -146,4 +147,111 @@ func ProbeTarget(ctx context.Context, config *Config) error {
 		defaultPrebuildCache.Store(config.Dest, profile)
 	}
 	return nil
+}
+
+// ============================================================================
+// Auto-start infrastructure
+// ============================================================================
+
+var (
+	// probeOnces tracks per-destination sync.Once to ensure the initial
+	// probe runs exactly once.
+	probeOnces sync.Map // map[string]*sync.Once
+	// probeStops tracks cancel functions for background refresh goroutines.
+	probeStops sync.Map // map[string]context.CancelFunc
+	// probeRefreshInterval is how often to refresh cached target profiles.
+	// Must be shorter than the 30-min TTL to avoid stale entries.
+	probeRefreshInterval = 25 * time.Minute
+	// probeTimeout is the maximum time for a single probe operation.
+	probeTimeout = 10 * time.Second
+)
+
+// probeConfig holds the values needed to probe a target, copied from
+// Config to avoid retaining a pointer to the caller's mutable Config.
+type probeConfig struct {
+	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
+	show        bool
+	dest        string
+	typ         string
+}
+
+func newProbeConfig(config *Config) probeConfig {
+	return probeConfig{
+		dialContext: config.DialContext,
+		show:        config.Show,
+		dest:        config.Dest,
+		typ:         config.Type,
+	}
+}
+
+// ensureAutoProbe ensures that the target is probed on first connection
+// and a background refresh goroutine is running. Called from Server().
+func ensureAutoProbe(config *Config) {
+	dest := config.Dest
+	if dest == "" {
+		return // skip auto-probe for empty destinations
+	}
+
+	// Copy config values to avoid capturing a mutable pointer.
+	pc := newProbeConfig(config)
+
+	onceVal, _ := probeOnces.LoadOrStore(dest, &sync.Once{})
+	once := onceVal.(*sync.Once)
+
+	once.Do(func() {
+		// Synchronous initial probe — the first connection benefits
+		// immediately from the cache without waiting for a goroutine.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			defer cancel()
+			if err := ProbeTarget(ctx, &Config{
+				DialContext: pc.dialContext,
+				Show:        pc.show,
+				Dest:        pc.dest,
+				Type:        pc.typ,
+			}); err != nil && pc.show {
+				fmt.Printf("REALITY prebuild: initial probe for %v failed: %v\n", pc.dest, err)
+			}
+		}()
+
+		// Start background refresh goroutine.
+		ctx, cancel := context.WithCancel(context.Background())
+		probeStops.Store(dest, cancel)
+		go func() {
+			defer func() {
+				// Clean up sync.Map entries to prevent memory leak.
+				probeStops.Delete(dest)
+				probeOnces.Delete(dest)
+			}()
+			ticker := time.NewTicker(probeRefreshInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
+					if err := ProbeTarget(probeCtx, &Config{
+						DialContext: pc.dialContext,
+						Show:        pc.show,
+						Dest:        pc.dest,
+						Type:        pc.typ,
+					}); err != nil && pc.show {
+						fmt.Printf("REALITY prebuild: refresh probe for %v failed: %v\n", pc.dest, err)
+					}
+					probeCancel()
+				}
+			}
+		}()
+	})
+}
+
+// StopAutoProbe cancels the background refresh goroutine for the given
+// destination. Useful for graceful shutdown.
+func StopAutoProbe(dest string) {
+	if cancel, ok := probeStops.Load(dest); ok {
+		cancel.(context.CancelFunc)()
+		probeStops.Delete(dest)
+		probeOnces.Delete(dest)
+	}
 }

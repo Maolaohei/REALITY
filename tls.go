@@ -201,6 +201,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		fmt.Printf("REALITY remoteAddr: %v\n", remoteAddr)
 	}
 
+	// Trigger automatic pre-build probe on first connection.
+	// This starts a background probe + periodic refresh for the target.
+	ensureAutoProbe(config)
+
 	target, err := config.DialContext(ctx, config.Type, config.Dest)
 	if err != nil {
 		conn.Close()
