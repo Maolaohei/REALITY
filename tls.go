@@ -172,6 +172,14 @@ var (
 	// that encrypt() padding is always consistent with REALITY's output.
 	realityOutputCache sync.Map // map[string]*realityOutputProfile
 
+	// realityMetadataCache stores handshake metadata after first successful
+	// connection. Used to verify target hasn't changed without full re-probe.
+	realityMetadata sync.Map // map[string]*realityMetadataCache
+
+	// targetFingerprintCache stores target TLS capabilities. Updated in
+	// background to reduce synchronous ProbeTarget frequency.
+	targetFingerprint sync.Map // map[string]*targetFingerprintCache
+
 	// recordBufPool reuses 64 KiB buffers for Server() handshake reads,
 	// avoiding per-connection allocation of two 64 KiB slices.
 	recordBufPool = sync.Pool{
@@ -190,11 +198,61 @@ type realityOutputProfile struct {
 	capturedAt   time.Time
 }
 
+// realityMetadataCache caches REALITY handshake metadata after the first
+// successful connection. Used to verify target hasn't changed without
+// re-establishing the full profile.
+type realityMetadataCache struct {
+	CipherSuite    uint16
+	ALPN           string
+	RecordCount    int
+	RecordLens     [7]int
+	ServerHelloLen int
+	ExtensionsLen  int
+	LastUpdated    time.Time
+}
+
+// targetFingerprintCache caches the target server's TLS capabilities.
+// Updated in background; reduces synchronous ProbeTarget frequency.
+type targetFingerprintCache struct {
+	CipherSuite       uint16
+	ALPN              string
+	SupportedVersions []uint16
+	KeyShareGroup     uint16
+	SignatureSchemes  []SignatureScheme
+	LastUpdated       time.Time
+}
+
 // bigEndianUint16 decodes a big-endian 16-bit unsigned integer from b.
 // This is equivalent to the previous Value() helper for 2-byte slices,
 // but uses the optimized encoding/binary path.
 func bigEndianUint16(b []byte) uint16 {
 	return binary.BigEndian.Uint16(b)
+}
+
+// verifyTargetUnchanged checks if the target's TLS behavior matches cached
+// metadata. Returns true if unchanged (safe to use cached profile).
+func verifyTargetUnchanged(dest, serverName string, hello *serverHelloMsg, clientHello *clientHelloMsg) bool {
+	alpn := ""
+	if len(clientHello.alpnProtocols) > 0 {
+		alpn = clientHello.alpnProtocols[0]
+	}
+	key := dest + "|" + serverName + "|" + alpn
+	val, ok := realityMetadata.Load(key)
+	if !ok {
+		return false
+	}
+	meta := val.(*realityMetadataCache)
+	if meta.CipherSuite != hello.cipherSuite {
+		return false
+	}
+	if meta.ALPN != alpn {
+		return false
+	}
+	// If last update was within 30 minutes, consider target unchanged.
+	if time.Since(meta.LastUpdated) > 30*time.Minute {
+		return false
+	}
+	return true
 }
 
 // bigEndianUint24 decodes a big-endian 24-bit unsigned integer from b.
@@ -560,6 +618,45 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					TTL:          30 * time.Minute,
 				}
 				defaultPrebuildCache.Store(config.Dest, profile)
+			}
+
+			// Phase 2: Cache handshake metadata for verification.
+			alpn := ""
+			if len(hs.clientHello.alpnProtocols) > 0 {
+				alpn = hs.clientHello.alpnProtocols[0]
+			}
+			metaKey := config.Dest + "|" + hs.clientHello.serverName + "|" + alpn
+			recordCount := 0
+			for _, l := range usedLen {
+				if l > 0 {
+					recordCount++
+				}
+			}
+			meta := &realityMetadataCache{
+				CipherSuite:    hs.hello.cipherSuite,
+				ALPN:           alpn,
+				RecordCount:    recordCount,
+				RecordLens:     usedLen,
+				ServerHelloLen: usedLen[0],
+				ExtensionsLen:  usedLen[2],
+				LastUpdated:    time.Now(),
+			}
+			realityMetadata.Store(metaKey, meta)
+
+			// Phase 3: Cache target fingerprint for background updates.
+			fpKey := config.Dest + "|" + hs.clientHello.serverName
+			fp := &targetFingerprintCache{
+				CipherSuite:       hs.hello.cipherSuite,
+				ALPN:              alpn,
+				SupportedVersions: hs.clientHello.supportedVersions,
+				KeyShareGroup:     uint16(hs.hello.serverShare.group),
+				SignatureSchemes:  hs.clientHello.supportedSignatureAlgorithms,
+				LastUpdated:       time.Now(),
+			}
+			targetFingerprint.Store(fpKey, fp)
+
+			if config.Show {
+				fmt.Printf("REALITY remoteAddr: %v\tcached metadata + fingerprint for %v\n", remoteAddr, config.Dest)
 			}
 			break
 		}
