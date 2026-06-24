@@ -633,12 +633,7 @@ func mutualCipherSuite(have []uint16, want uint16) *cipherSuite {
 }
 
 func cipherSuiteByID(id uint16) *cipherSuite {
-	for _, cipherSuite := range cipherSuites {
-		if cipherSuite.id == id {
-			return cipherSuite
-		}
-	}
-	return nil
+	return cipherSuiteMap[id]
 }
 
 func mutualCipherSuiteTLS13(have []uint16, want uint16) *cipherSuiteTLS13 {
@@ -651,13 +646,24 @@ func mutualCipherSuiteTLS13(have []uint16, want uint16) *cipherSuiteTLS13 {
 }
 
 func cipherSuiteTLS13ByID(id uint16) *cipherSuiteTLS13 {
-	for _, cipherSuite := range cipherSuitesTLS13 {
-		if cipherSuite.id == id {
-			return cipherSuite
-		}
-	}
-	return nil
+	return cipherSuiteTLS13Map[id]
 }
+
+var cipherSuiteMap = func() map[uint16]*cipherSuite {
+	m := make(map[uint16]*cipherSuite, len(cipherSuites))
+	for _, cs := range cipherSuites {
+		m[cs.id] = cs
+	}
+	return m
+}()
+
+var cipherSuiteTLS13Map = func() map[uint16]*cipherSuiteTLS13 {
+	m := make(map[uint16]*cipherSuiteTLS13, len(cipherSuitesTLS13))
+	for _, cs := range cipherSuitesTLS13 {
+		m[cs.id] = cs
+	}
+	return m
+}()
 
 // A list of cipher suite IDs that are, or have been, implemented by this
 // package.

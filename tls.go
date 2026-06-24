@@ -60,6 +60,11 @@ type CloseWriteConn interface {
 	CloseWrite() error
 }
 
+var (
+	errMirrorWrite = errors.New("mirror: write not supported")
+	errMirrorClose = errors.New("mirror: close not supported")
+)
+
 type MirrorConn struct {
 	*sync.Mutex
 	net.Conn
@@ -80,11 +85,11 @@ func (c *MirrorConn) Read(b []byte) (int, error) {
 }
 
 func (c *MirrorConn) Write(b []byte) (int, error) {
-	return 0, fmt.Errorf("Write(%v)", len(b))
+	return 0, errMirrorWrite
 }
 
 func (c *MirrorConn) Close() error {
-	return fmt.Errorf("Close()")
+	return errMirrorClose
 }
 
 func (c *MirrorConn) SetDeadline(t time.Time) error {
@@ -330,7 +335,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	go func() {
 		bufPtr := recordBufPool.Get().(*[]byte)
 		buf := *bufPtr
-		s2cSaved := make([]byte, 0, maxRecordSize)
+		s2cSavedPtr := recordBufPool.Get().(*[]byte)
+		s2cSaved := (*s2cSavedPtr)[:0]
 		handshakeLen := 0
 
 		// Check pre-build cache first. If we have a cached profile for this
@@ -350,9 +356,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			hs.hello.supportedVersion = VersionTLS13
 			hs.hello.cipherSuite = profile.CipherSuite
 			hs.hello.serverShare.group = profile.KeyGroup
-			hs.hello.serverShare.data = make([]byte, 32) // placeholder
+			hs.hello.serverShare.data = nil // not used in prebuild path
 			mutex.Unlock()
 			recordBufPool.Put(bufPtr)
+			recordBufPool.Put(s2cSavedPtr)
 			waitGroup.Done()
 			return
 		}
@@ -455,7 +462,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			if err != nil {
 				break
 			}
-			for {
+			postHandshakeReady := false
+			for i := 0; i < 30; i++ {
 				key := config.Dest + " " + hs.clientHello.serverName
 				if len(hs.clientHello.alpnProtocols) == 0 {
 					key += " 0"
@@ -466,28 +474,39 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				}
 				if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
 					if postHandshakeRecordsLens, ok := val.([]int); ok {
+						maxPtLen := 0
 						for _, length := range postHandshakeRecordsLens {
-							plainText := make([]byte, length-16)
-							plainText[0] = 23
-							plainText[1] = 3
-							plainText[2] = 3
-							plainText[3] = byte((length - 5) >> 8)
-							plainText[4] = byte((length - 5))
-							plainText[5] = 23
-							postHandshakeRecord := hs.c.out.cipher.(aead).Seal(plainText[:5], hs.c.out.seq[:], plainText[5:], plainText[:5])
+							if ptLen := length - 16; ptLen > maxPtLen {
+								maxPtLen = ptLen
+							}
+						}
+						plainText := make([]byte, maxPtLen)
+						for _, length := range postHandshakeRecordsLens {
+							pt := plainText[:length-16]
+							pt[0] = 23
+							pt[1] = 3
+							pt[2] = 3
+							pt[3] = byte((length - 5) >> 8)
+							pt[4] = byte((length - 5))
+							pt[5] = 23
+							postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
 							hs.c.out.incSeq()
 							hs.c.write(postHandshakeRecord)
 							if config.Show {
 								fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
 							}
 						}
+						postHandshakeReady = true
 						break
 					}
 				}
-				time.Sleep(5 * time.Second)
+				time.Sleep(time.Second)
 				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
 					hs.c.MaxUselessRecords = maxUseless.(int)
 				}
+			}
+			if !postHandshakeReady {
+				break
 			}
 			hs.c.isHandshakeComplete.Store(true)
 
@@ -525,6 +544,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			underlying.CloseWrite()
 		}
 		recordBufPool.Put(bufPtr)
+		recordBufPool.Put(s2cSavedPtr)
 		waitGroup.Done()
 	}()
 

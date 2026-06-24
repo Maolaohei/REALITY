@@ -119,7 +119,7 @@ func (c *PostHandshakeRecordDetectConn) Read(b []byte) (n int, err error) {
 		return c.Conn.Read(b)
 	}
 	c.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	data, _ := io.ReadAll(c.Conn)
+	data, _ := io.ReadAll(io.LimitReader(c.Conn, 1<<20))
 	var postHandshakeRecordsLens []int
 	for {
 		if len(data) >= 5 && bytes.Equal(data[:3], []byte{23, 3, 3}) {
@@ -179,6 +179,9 @@ func (c *CCSDetectConn) Write(b []byte) (n int, err error) {
 			return c.Conn.Write(b)
 		}
 		GlobalMaxCSSMsgCount.Store(c.Key, math.MaxInt)
+		// Set a short read deadline so the background reader goroutine
+		// (spawned above) exits promptly instead of blocking forever.
+		c.Conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		return c.Conn.Write(b)
 	}
 	return c.Conn.Write(b)
