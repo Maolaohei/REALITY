@@ -3,6 +3,7 @@ package reality
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -159,12 +160,20 @@ var (
 	probeOnces sync.Map // map[string]*sync.Once
 	// probeStops tracks cancel functions for background refresh goroutines.
 	probeStops sync.Map // map[string]context.CancelFunc
-	// probeRefreshInterval is how often to refresh cached target profiles.
-	// Must be shorter than the 30-min TTL to avoid stale entries.
-	probeRefreshInterval = 25 * time.Minute
+	// probeRefreshMin/Max define the random range for refresh intervals.
+	// Randomized to avoid predictable timing patterns that could be
+	// detected by traffic analysis. Must stay within the 30-min TTL.
+	probeRefreshMin = 20 * time.Minute
+	probeRefreshMax = 30 * time.Minute
 	// probeTimeout is the maximum time for a single probe operation.
 	probeTimeout = 10 * time.Second
 )
+
+// probeRefreshInterval returns a random duration between probeRefreshMin
+// and probeRefreshMax. Each call produces a different value.
+func probeRefreshInterval() time.Duration {
+	return probeRefreshMin + time.Duration(rand.Int63n(int64(probeRefreshMax-probeRefreshMin)))
+}
 
 // probeConfig holds the values needed to probe a target, copied from
 // Config to avoid retaining a pointer to the caller's mutable Config.
@@ -223,13 +232,15 @@ func ensureAutoProbe(config *Config) {
 				probeStops.Delete(dest)
 				probeOnces.Delete(dest)
 			}()
-			ticker := time.NewTicker(probeRefreshInterval)
-			defer ticker.Stop()
+			// Use manual timer with random intervals to avoid
+			// predictable timing patterns.
+			timer := time.NewTimer(probeRefreshInterval())
+			defer timer.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-ticker.C:
+				case <-timer.C:
 					probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
 					if err := ProbeTarget(probeCtx, &Config{
 						DialContext: pc.dialContext,
@@ -240,6 +251,8 @@ func ensureAutoProbe(config *Config) {
 						fmt.Printf("REALITY prebuild: refresh probe for %v failed: %v\n", pc.dest, err)
 					}
 					probeCancel()
+					// Reset with a new random interval.
+					timer.Reset(probeRefreshInterval())
 				}
 			}
 		}()
