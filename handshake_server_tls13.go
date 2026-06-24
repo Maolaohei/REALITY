@@ -141,9 +141,11 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	{
 		var cert []byte
 		if len(c.config.Mldsa65Key) > 0 {
-			cert = bytes.Clone(signedCertMldsa65)
+			cert = make([]byte, len(signedCertMldsa65))
+			copy(cert, signedCertMldsa65)
 		} else {
-			cert = bytes.Clone(signedCert)
+			cert = make([]byte, len(signedCert))
+			copy(cert, signedCert)
 		}
 
 		h := hmac.New(sha512.New, c.AuthKey)

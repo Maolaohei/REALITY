@@ -45,7 +45,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -69,7 +68,6 @@ type MirrorConn struct {
 
 func (c *MirrorConn) Read(b []byte) (int, error) {
 	c.Unlock()
-	runtime.Gosched()
 	n, err := c.Conn.Read(b)
 	c.Lock() // calling c.Lock() before c.Target.Write(), to make sure that this goroutine has the priority to make the next move
 	if n != 0 {
@@ -158,8 +156,32 @@ var (
 		"Finished",
 		"New Session Ticket",
 	}
+
+	// recordBufPool reuses 64 KiB buffers for Server() handshake reads,
+	// avoiding per-connection allocation of two 64 KiB slices.
+	recordBufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, maxRecordSize)
+			return &buf
+		},
+	}
 )
 
+// bigEndianUint16 decodes a big-endian 16-bit unsigned integer from b.
+// This is equivalent to the previous Value() helper for 2-byte slices,
+// but uses the optimized encoding/binary path.
+func bigEndianUint16(b []byte) uint16 {
+	return binary.BigEndian.Uint16(b)
+}
+
+// bigEndianUint24 decodes a big-endian 24-bit unsigned integer from b.
+// Used for 3-byte version fields (e.g., ClientVer[3]).
+func bigEndianUint24(b []byte) uint32 {
+	return uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
+}
+
+// Value(vals ...byte) converts a big-endian byte sequence to an int.
+// Deprecated: use bigEndianUint16/24 for fixed-width cases.
 func Value(vals ...byte) (value int) {
 	for i, val := range vals {
 		value |= int(val) << ((len(vals) - i - 1) * 8)
@@ -264,8 +286,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientTime: %v\n", remoteAddr, hs.c.ClientTime)
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientShortId: %v\n", remoteAddr, hs.c.ClientShortId)
 				}
-				if (config.MinClientVer == nil || Value(hs.c.ClientVer[:]...) >= Value(config.MinClientVer...)) &&
-					(config.MaxClientVer == nil || Value(hs.c.ClientVer[:]...) <= Value(config.MaxClientVer...)) &&
+				if (config.MinClientVer == nil || bigEndianUint24(hs.c.ClientVer[:]) >= bigEndianUint24(config.MinClientVer)) &&
+					(config.MaxClientVer == nil || bigEndianUint24(hs.c.ClientVer[:]) <= bigEndianUint24(config.MaxClientVer)) &&
 					(config.MaxTimeDiff == 0 || time.Since(hs.c.ClientTime).Abs() <= config.MaxTimeDiff) &&
 					(config.ShortIds[hs.c.ClientShortId]) {
 					hs.c.conn = conn
@@ -298,12 +320,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	}()
 
 	go func() {
+		bufPtr := recordBufPool.Get().(*[]byte)
+		buf := *bufPtr
 		s2cSaved := make([]byte, 0, maxRecordSize)
-		buf := make([]byte, maxRecordSize)
 		handshakeLen := 0
 	f:
 		for {
-			runtime.Gosched()
 			n, err := target.Read(buf)
 			if n == 0 {
 				if err != nil {
@@ -327,13 +349,13 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					break
 				}
 				if handshakeLen == 0 && len(s2cSaved) > recordHeaderLen {
-					if Value(s2cSaved[1:3]...) != VersionTLS12 ||
+					if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 ||
 						(i == 0 && (recordType(s2cSaved[0]) != recordTypeHandshake || s2cSaved[5] != typeServerHello)) ||
 						(i == 1 && (recordType(s2cSaved[0]) != recordTypeChangeCipherSpec || s2cSaved[5] != 1)) ||
 						(i > 1 && recordType(s2cSaved[0]) != recordTypeApplicationData) {
 						break f
 					}
-					handshakeLen = recordHeaderLen + Value(s2cSaved[3:5]...)
+					handshakeLen = recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
 				}
 				if config.Show {
 					fmt.Printf("REALITY remoteAddr: %v\tlen(s2cSaved): %v\t%v: %v\n", remoteAddr, len(s2cSaved), t, handshakeLen)
@@ -452,6 +474,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			// Call `underlying.CloseWrite()` once `io.Copy()` returned
 			underlying.CloseWrite()
 		}
+		recordBufPool.Put(bufPtr)
 		waitGroup.Done()
 	}()
 
