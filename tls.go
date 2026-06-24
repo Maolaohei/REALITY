@@ -158,8 +158,8 @@ var (
 	}
 
 	// defaultPrebuildCache is the package-level cache for pre-built target
-	// profiles. Entries expire after 30 minutes by default.
-	defaultPrebuildCache = NewPrebuildCache(30 * time.Minute)
+	// profiles. Entries expire after 30 minutes, max 64 entries with LRU eviction.
+	defaultPrebuildCache = NewPrebuildCache(30*time.Minute, 64)
 
 	// recordBufPool reuses 64 KiB buffers for Server() handshake reads,
 	// avoiding per-connection allocation of two 64 KiB slices.

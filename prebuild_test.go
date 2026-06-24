@@ -14,7 +14,7 @@ import (
 // ============================================================================
 
 func TestPrebuildCache_StoreAndGet(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 
 	profile := &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
@@ -43,7 +43,7 @@ func TestPrebuildCache_StoreAndGet(t *testing.T) {
 }
 
 func TestPrebuildCache_GetMiss(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	got := cache.Get("nonexistent.com")
 	if got != nil {
 		t.Errorf("expected nil for missing key, got %v", got)
@@ -51,7 +51,7 @@ func TestPrebuildCache_GetMiss(t *testing.T) {
 }
 
 func TestPrebuildCache_GetExpired(t *testing.T) {
-	cache := NewPrebuildCache(time.Millisecond)
+	cache := NewPrebuildCache(time.Millisecond, 0)
 	profile := &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite:  0x1301,
@@ -68,7 +68,7 @@ func TestPrebuildCache_GetExpired(t *testing.T) {
 }
 
 func TestPrebuildCache_Replace(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("example.com", &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite:  0x1301, KeyGroup: X25519,
@@ -93,7 +93,7 @@ func TestPrebuildCache_Replace(t *testing.T) {
 // ============================================================================
 
 func TestPrebuildCache_ConcurrentReadWrite(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	const goroutines = 100
 	const iterations = 1000
 
@@ -116,7 +116,7 @@ func TestPrebuildCache_ConcurrentReadWrite(t *testing.T) {
 }
 
 func TestPrebuildCache_ConcurrentDelete(t *testing.T) {
-	cache := NewPrebuildCache(time.Millisecond)
+	cache := NewPrebuildCache(time.Millisecond, 0)
 	var wg sync.WaitGroup
 	const n = 50
 	wg.Add(n)
@@ -136,7 +136,7 @@ func TestPrebuildCache_ConcurrentDelete(t *testing.T) {
 // ============================================================================
 
 func TestPrebuildCache_EmptyKey(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("", &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite: 0x1301, KeyGroup: X25519,
@@ -149,7 +149,7 @@ func TestPrebuildCache_EmptyKey(t *testing.T) {
 }
 
 func TestPrebuildCache_ZeroTTL(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("example.com", &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite: 0x1301, KeyGroup: X25519,
@@ -163,7 +163,7 @@ func TestPrebuildCache_ZeroTTL(t *testing.T) {
 }
 
 func TestPrebuildCache_NegativeTTL(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("example.com", &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite: 0x1301, KeyGroup: X25519,
@@ -176,7 +176,7 @@ func TestPrebuildCache_NegativeTTL(t *testing.T) {
 }
 
 func TestPrebuildCache_ZeroHandshakeLen(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("example.com", &TargetProfile{
 		HandshakeLen: [7]int{0, 0, 0, 0, 0, 0, 0},
 		CipherSuite: 0, KeyGroup: 0,
@@ -192,7 +192,7 @@ func TestPrebuildCache_ZeroHandshakeLen(t *testing.T) {
 }
 
 func TestPrebuildCache_MaxHandshakeLen(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("example.com", &TargetProfile{
 		HandshakeLen: [7]int{16389, 6, 16389, 16389, 16389, 16389, 16389},
 		CipherSuite: 0x1302, KeyGroup: X25519MLKEM768,
@@ -208,7 +208,7 @@ func TestPrebuildCache_MaxHandshakeLen(t *testing.T) {
 }
 
 func TestPrebuildCache_MultipleKeys(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	keys := map[string]*TargetProfile{
 		"a.com": {HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0}, CipherSuite: 0x1301, KeyGroup: X25519, CapturedAt: time.Now(), TTL: time.Minute},
 		"b.com": {HandshakeLen: [7]int{150, 6, 250, 350, 120, 60, 0}, CipherSuite: 0x1302, KeyGroup: X25519MLKEM768, CapturedAt: time.Now(), TTL: time.Minute},
@@ -234,7 +234,7 @@ func TestPrebuildCache_MultipleKeys(t *testing.T) {
 // ============================================================================
 
 func TestPrebuildCache_GetDeletesExpired(t *testing.T) {
-	cache := NewPrebuildCache(time.Millisecond)
+	cache := NewPrebuildCache(time.Millisecond, 0)
 	cache.Store("example.com", &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite: 0x1301, KeyGroup: X25519,
@@ -254,7 +254,7 @@ func TestPrebuildCache_GetDeletesExpired(t *testing.T) {
 }
 
 func TestPrebuildCache_StoreDoesNotAffectOtherKeys(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("a.com", &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite: 0x1301, KeyGroup: X25519,
@@ -275,7 +275,7 @@ func TestPrebuildCache_StoreDoesNotAffectOtherKeys(t *testing.T) {
 }
 
 func TestPrebuildCache_StoreNilProfile(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("example.com", nil) // should not panic
 	got := cache.Get("example.com")
 	if got != nil {
@@ -288,7 +288,7 @@ func TestPrebuildCache_StoreNilProfile(t *testing.T) {
 // ============================================================================
 
 func TestPrebuildCache_GetDuringStore(t *testing.T) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(2)
@@ -309,6 +309,122 @@ func TestPrebuildCache_GetDuringStore(t *testing.T) {
 	got := cache.Get("key")
 	if got == nil {
 		t.Error("expected non-nil after concurrent operations")
+	}
+}
+
+// ============================================================================
+// LRU Eviction Tests
+// ============================================================================
+
+func TestPrebuildCache_LRUEviction(t *testing.T) {
+	cache := NewPrebuildCache(time.Minute, 3) // capacity = 3
+
+	for i := 0; i < 5; i++ {
+		cache.Store(fmt.Sprintf("key%d", i), &TargetProfile{
+			HandshakeLen: [7]int{i, 6, 200, 300, 100, 50, 0},
+			CipherSuite:  0x1301, KeyGroup: X25519,
+			CapturedAt: time.Now(), TTL: time.Minute,
+		})
+	}
+
+	if cache.Len() != 3 {
+		t.Errorf("expected 3 entries, got %v", cache.Len())
+	}
+
+	// key0 and key1 should have been evicted (LRU)
+	if got := cache.Get("key0"); got != nil {
+		t.Error("expected key0 evicted")
+	}
+	if got := cache.Get("key1"); got != nil {
+		t.Error("expected key1 evicted")
+	}
+
+	// key2, key3, key4 should still exist
+	if got := cache.Get("key2"); got == nil {
+		t.Error("expected key2 to exist")
+	}
+	if got := cache.Get("key3"); got == nil {
+		t.Error("expected key3 to exist")
+	}
+	if got := cache.Get("key4"); got == nil {
+		t.Error("expected key4 to exist")
+	}
+}
+
+func TestPrebuildCache_LRUAccessUpdates(t *testing.T) {
+	cache := NewPrebuildCache(time.Minute, 3)
+
+	// Fill cache
+	cache.Store("a", &TargetProfile{HandshakeLen: [7]int{1}, CapturedAt: time.Now(), TTL: time.Minute})
+	cache.Store("b", &TargetProfile{HandshakeLen: [7]int{2}, CapturedAt: time.Now(), TTL: time.Minute})
+	cache.Store("c", &TargetProfile{HandshakeLen: [7]int{3}, CapturedAt: time.Now(), TTL: time.Minute})
+
+	// Access "a" to make it recently used
+	cache.Get("a")
+
+	// Add "d" — should evict "b" (least recently accessed), not "a"
+	cache.Store("d", &TargetProfile{HandshakeLen: [7]int{4}, CapturedAt: time.Now(), TTL: time.Minute})
+
+	if got := cache.Get("a"); got == nil {
+		t.Error("expected 'a' to survive (was just accessed)")
+	}
+	if got := cache.Get("b"); got != nil {
+		t.Error("expected 'b' to be evicted (LRU)")
+	}
+	if got := cache.Get("c"); got == nil {
+		t.Error("expected 'c' to exist")
+	}
+	if got := cache.Get("d"); got == nil {
+		t.Error("expected 'd' to exist")
+	}
+}
+
+func TestPrebuildCache_ReplaceDoesNotEvict(t *testing.T) {
+	cache := NewPrebuildCache(time.Minute, 2)
+
+	cache.Store("a", &TargetProfile{HandshakeLen: [7]int{1}, CapturedAt: time.Now(), TTL: time.Minute})
+	cache.Store("b", &TargetProfile{HandshakeLen: [7]int{2}, CapturedAt: time.Now(), TTL: time.Minute})
+
+	// Replace "a" — should NOT trigger eviction since key already exists
+	cache.Store("a", &TargetProfile{HandshakeLen: [7]int{10}, CapturedAt: time.Now(), TTL: time.Minute})
+
+	if cache.Len() != 2 {
+		t.Errorf("expected 2 entries after replace, got %v", cache.Len())
+	}
+	if got := cache.Get("a"); got == nil || got.HandshakeLen[0] != 10 {
+		t.Error("expected 'a' to be updated with new value")
+	}
+}
+
+func TestPrebuildCache_UnlimitedCapacity(t *testing.T) {
+	cache := NewPrebuildCache(time.Minute, 0) // 0 = unlimited
+
+	for i := 0; i < 1000; i++ {
+		cache.Store(fmt.Sprintf("key%d", i), &TargetProfile{
+			HandshakeLen: [7]int{i}, CapturedAt: time.Now(), TTL: time.Minute,
+		})
+	}
+
+	if cache.Len() != 1000 {
+		t.Errorf("expected 1000 entries with unlimited capacity, got %v", cache.Len())
+	}
+}
+
+func TestPrebuildCache_Len(t *testing.T) {
+	cache := NewPrebuildCache(time.Minute, 10)
+
+	if cache.Len() != 0 {
+		t.Errorf("expected 0, got %v", cache.Len())
+	}
+
+	cache.Store("a", &TargetProfile{HandshakeLen: [7]int{1}, CapturedAt: time.Now(), TTL: time.Minute})
+	if cache.Len() != 1 {
+		t.Errorf("expected 1, got %v", cache.Len())
+	}
+
+	cache.Store("b", &TargetProfile{HandshakeLen: [7]int{2}, CapturedAt: time.Now(), TTL: time.Minute})
+	if cache.Len() != 2 {
+		t.Errorf("expected 2, got %v", cache.Len())
 	}
 }
 
@@ -507,7 +623,7 @@ func TestEnsureAutoProbe_NoMemoryLeak(t *testing.T) {
 // ============================================================================
 
 func BenchmarkPrebuildCache_Get(b *testing.B) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("example.com", &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite: 0x1301, KeyGroup: X25519,
@@ -520,7 +636,7 @@ func BenchmarkPrebuildCache_Get(b *testing.B) {
 }
 
 func BenchmarkPrebuildCache_Store(b *testing.B) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	profile := &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite: 0x1301, KeyGroup: X25519,
@@ -533,7 +649,7 @@ func BenchmarkPrebuildCache_Store(b *testing.B) {
 }
 
 func BenchmarkPrebuildCache_GetMiss(b *testing.B) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		cache.Get("nonexistent.com")
@@ -541,7 +657,7 @@ func BenchmarkPrebuildCache_GetMiss(b *testing.B) {
 }
 
 func BenchmarkPrebuildCache_ConcurrentGet(b *testing.B) {
-	cache := NewPrebuildCache(time.Minute)
+	cache := NewPrebuildCache(time.Minute, 0)
 	cache.Store("example.com", &TargetProfile{
 		HandshakeLen: [7]int{100, 6, 200, 300, 100, 50, 0},
 		CipherSuite: 0x1301, KeyGroup: X25519,

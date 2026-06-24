@@ -3,6 +3,7 @@ package reality
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"sync"
@@ -37,22 +38,30 @@ type TargetProfile struct {
 }
 
 // PrebuildCache stores per-serverName target profiles with automatic
-// expiration. Safe for concurrent use.
+// expiration and LRU eviction. Safe for concurrent use.
 type PrebuildCache struct {
 	mu       sync.RWMutex
 	profiles map[string]*TargetProfile
+	access   map[string]int64 // monotonic counter for LRU ordering
+	counter  int64
+	capacity int
 	ttl      time.Duration
 }
 
-// NewPrebuildCache creates a new cache with the given per-entry TTL.
-func NewPrebuildCache(ttl time.Duration) *PrebuildCache {
+// NewPrebuildCache creates a new cache with the given per-entry TTL
+// and maximum capacity. When the cache is full, the least recently
+// accessed entry is evicted on Store(). A capacity of 0 means unlimited.
+func NewPrebuildCache(ttl time.Duration, capacity int) *PrebuildCache {
 	return &PrebuildCache{
 		profiles: make(map[string]*TargetProfile),
+		access:   make(map[string]int64),
+		capacity: capacity,
 		ttl:      ttl,
 	}
 }
 
 // Get returns the cached profile for serverName, or nil if expired/missing.
+// Updates LRU access timestamp on hit.
 func (pc *PrebuildCache) Get(serverName string) *TargetProfile {
 	pc.mu.RLock()
 	p, ok := pc.profiles[serverName]
@@ -63,22 +72,61 @@ func (pc *PrebuildCache) Get(serverName string) *TargetProfile {
 	if time.Since(p.CapturedAt) >= p.TTL {
 		pc.mu.Lock()
 		delete(pc.profiles, serverName)
+		delete(pc.access, serverName)
 		pc.mu.Unlock()
 		return nil
 	}
+	// Update LRU timestamp.
+	pc.mu.Lock()
+	pc.counter++
+	pc.access[serverName] = pc.counter
+	pc.mu.Unlock()
 	return p
 }
 
 // Store adds or replaces a profile for serverName.
 // A shallow copy is made to prevent callers from mutating cached data.
+// If the cache is at capacity, the least recently accessed entry is evicted.
 func (pc *PrebuildCache) Store(serverName string, p *TargetProfile) {
 	if p == nil {
 		return
 	}
 	cp := *p
 	pc.mu.Lock()
+	// Evict LRU entry if at capacity (and capacity > 0) and this is a new key.
+	if pc.capacity > 0 {
+		if _, exists := pc.profiles[serverName]; !exists && len(pc.profiles) >= pc.capacity {
+			pc.evictLRU()
+		}
+	}
+	pc.counter++
+	pc.access[serverName] = pc.counter
 	pc.profiles[serverName] = &cp
 	pc.mu.Unlock()
+}
+
+// evictLRU removes the least recently accessed entry. Must be called with mu held.
+func (pc *PrebuildCache) evictLRU() {
+	var oldestKey string
+	var oldestAccess int64 = math.MaxInt64
+	for k, v := range pc.access {
+		if v < oldestAccess {
+			oldestAccess = v
+			oldestKey = k
+		}
+	}
+	if oldestKey != "" {
+		delete(pc.profiles, oldestKey)
+		delete(pc.access, oldestKey)
+	}
+}
+
+// Len returns the current number of entries in the cache.
+func (pc *PrebuildCache) Len() int {
+	pc.mu.RLock()
+	n := len(pc.profiles)
+	pc.mu.RUnlock()
+	return n
 }
 
 // ProbeTarget connects to the target server, captures its TLS record
