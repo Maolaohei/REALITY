@@ -75,18 +75,43 @@ var (
 	ed25519Priv       ed25519.PrivateKey
 	signedCert        []byte
 	signedCertMldsa65 []byte
+	initErr           error // records any failure during init()
 )
 
 func init() {
 	certificate := x509.Certificate{SerialNumber: &big.Int{}}
 	certificateMldsa65 := x509.Certificate{SerialNumber: &big.Int{}, ExtraExtensions: []pkix.Extension{{Id: []int{0, 0}, Value: empty[:3309]}}}
-	_, ed25519Priv, _ = ed25519.GenerateKey(rand.Reader)
-	signedCert, _ = x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
-	signedCertMldsa65, _ = x509.CreateCertificate(rand.Reader, &certificateMldsa65, &certificateMldsa65, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		initErr = fmt.Errorf("REALITY init: ed25519.GenerateKey: %w", err)
+		return
+	}
+	ed25519Priv = priv
+
+	cert, err := x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	if err != nil {
+		initErr = fmt.Errorf("REALITY init: CreateCertificate: %w", err)
+		return
+	}
+	signedCert = cert
+
+	certMldsa, err := x509.CreateCertificate(rand.Reader, &certificateMldsa65, &certificateMldsa65, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	if err != nil {
+		initErr = fmt.Errorf("REALITY init: CreateCertificate (ML-DSA-65): %w", err)
+		return
+	}
+	signedCertMldsa65 = certMldsa
 }
 
 func (hs *serverHandshakeStateTLS13) handshake() error {
 	c := hs.c
+
+	// Fail fast if init() failed to generate keys/certificates.
+	if initErr != nil {
+		return initErr
+	}
+
 	if c.config.Show {
 		remoteAddr := c.RemoteAddr().String()
 		fmt.Printf("REALITY remoteAddr: %v\tis using X25519MLKEM768 for TLS' communication: %v\n", remoteAddr, hs.hello.serverShare.group == X25519MLKEM768)
@@ -155,7 +180,10 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		if len(c.config.Mldsa65Key) > 0 {
 			h.Write(hs.clientHello.original)
 			h.Write(hs.hello.original)
-			key, _ := mldsa65.Scheme().UnmarshalBinaryPrivateKey(c.config.Mldsa65Key)
+			key, err := mldsa65.Scheme().UnmarshalBinaryPrivateKey(c.config.Mldsa65Key)
+			if err != nil {
+				return fmt.Errorf("REALITY: invalid Mldsa65Key: %w", err)
+			}
 			mldsa65.SignTo(key.(*mldsa65.PrivateKey), h.Sum(nil), nil, false, cert[126:]) // fixed location
 		}
 
