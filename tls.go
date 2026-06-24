@@ -137,8 +137,18 @@ func NewRatelimitedConn(conn net.Conn, limit *LimitFallback) net.Conn {
 }
 
 var (
-	size  = 8192
-	empty = make([]byte, size)
+	// maxRecordSize is the buffer size for reading TLS handshake records from
+	// the target server. Raised from 8192 to 65536 (64 KiB) to support targets
+	// with large certificate chains (long SANs, multi-level intermediates).
+	maxRecordSize = 65536
+
+	// maxTLSRecordPayload is the maximum payload size of a single TLS record
+	// as defined by RFC 8446 §5.1 (2^14 = 16384 bytes).
+	maxTLSRecordPayload = 16384
+
+	// empty is a reusable zero-filled buffer for padding and ML-DSA-65 cert
+	// extensions. 8192 bytes is sufficient (largest use: 3309 bytes).
+	empty = make([]byte, 8192)
 	types = [7]string{
 		"Server Hello",
 		"Change Cipher Spec",
@@ -288,8 +298,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	}()
 
 	go func() {
-		s2cSaved := make([]byte, 0, size)
-		buf := make([]byte, size)
+		s2cSaved := make([]byte, 0, maxRecordSize)
+		buf := make([]byte, maxRecordSize)
 		handshakeLen := 0
 	f:
 		for {
@@ -307,9 +317,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			s2cSaved = append(s2cSaved, buf[:n]...)
 			if hs.c.conn != conn {
 				copying = true // if the target already sent some data, just start bidirectional direct forwarding
-				break
-			}
-			if len(s2cSaved) > size {
 				break
 			}
 			for i, t := range types {
@@ -331,7 +338,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				if config.Show {
 					fmt.Printf("REALITY remoteAddr: %v\tlen(s2cSaved): %v\t%v: %v\n", remoteAddr, len(s2cSaved), t, handshakeLen)
 				}
-				if handshakeLen > size { // too long
+				if handshakeLen > maxTLSRecordPayload { // exceeds TLS spec max (RFC 8446 §5.1)
 					break f
 				}
 				if i == 1 && handshakeLen > 0 && handshakeLen != 6 {
