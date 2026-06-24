@@ -157,6 +157,10 @@ var (
 		"New Session Ticket",
 	}
 
+	// defaultPrebuildCache is the package-level cache for pre-built target
+	// profiles. Entries expire after 30 minutes by default.
+	defaultPrebuildCache = NewPrebuildCache(30 * time.Minute)
+
 	// recordBufPool reuses 64 KiB buffers for Server() handshake reads,
 	// avoiding per-connection allocation of two 64 KiB slices.
 	recordBufPool = sync.Pool{
@@ -324,6 +328,32 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		buf := *bufPtr
 		s2cSaved := make([]byte, 0, maxRecordSize)
 		handshakeLen := 0
+
+		// Check pre-build cache first. If we have a cached profile for this
+		// target, we can skip reading from the target and use cached lengths.
+		// This eliminates the target connection latency for the handshake.
+		if profile := defaultPrebuildCache.Get(config.Dest); profile != nil {
+			if config.Show {
+				fmt.Printf("REALITY remoteAddr: %v\tusing pre-built profile for %v (captured %v ago)\n",
+					remoteAddr, config.Dest, time.Since(profile.CapturedAt).Round(time.Second))
+			}
+			copy(hs.c.out.handshakeLen[:], profile.HandshakeLen[:])
+			// Signal that we have the cached data and can proceed with handshake
+			mutex.Lock()
+			// Set a minimal ServerHello to indicate we have cached data
+			hs.hello = new(serverHelloMsg)
+			hs.hello.vers = VersionTLS12
+			hs.hello.supportedVersion = VersionTLS13
+			hs.hello.cipherSuite = profile.CipherSuite
+			hs.hello.serverShare.group = profile.KeyGroup
+			hs.hello.serverShare.data = make([]byte, 32) // placeholder
+			mutex.Unlock()
+			recordBufPool.Put(bufPtr)
+			waitGroup.Done()
+			return
+		}
+
+		// No cached profile — read from target as usual and cache the result.
 	f:
 		for {
 			n, err := target.Read(buf)
@@ -456,6 +486,22 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				}
 			}
 			hs.c.isHandshakeComplete.Store(true)
+
+			// Cache the captured record lengths for pre-built mode.
+			// This allows future connections to skip the target read entirely.
+			if hs.hello != nil {
+				profile := &TargetProfile{
+					HandshakeLen: hs.c.out.handshakeLen,
+					CipherSuite:  hs.hello.cipherSuite,
+					KeyGroup:     hs.hello.serverShare.group,
+					CapturedAt:   time.Now(),
+					TTL:          30 * time.Minute,
+				}
+				defaultPrebuildCache.Store(config.Dest, profile)
+				if config.Show {
+					fmt.Printf("REALITY remoteAddr: %v\tcached pre-build profile for %v\n", remoteAddr, config.Dest)
+				}
+			}
 			break
 		}
 		mutex.Unlock()
