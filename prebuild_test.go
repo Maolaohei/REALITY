@@ -503,16 +503,24 @@ func TestEnsureAutoProbe_EmptyDest(t *testing.T) {
 		Type:        "tcp",
 		Dest:        "",
 	}
-	ensureAutoProbe(config)
 
-	// Verify no entries created
-	count := 0
+	// Record entries before
+	before := 0
 	probeOnces.Range(func(key, value any) bool {
-		count++
+		before++
 		return true
 	})
-	if count != 0 {
-		t.Errorf("expected 0 probe entries for empty dest, got %v", count)
+
+	ensureAutoProbe(config)
+
+	// Verify no new entries created
+	after := 0
+	probeOnces.Range(func(key, value any) bool {
+		after++
+		return true
+	})
+	if after != before {
+		t.Errorf("expected no new probe entries for empty dest, got %d new", after-before)
 	}
 }
 
@@ -598,6 +606,13 @@ func TestStopAutoProbe_Noop(t *testing.T) {
 }
 
 func TestEnsureAutoProbe_NoMemoryLeak(t *testing.T) {
+	// Record entries before
+	before := 0
+	probeOnces.Range(func(key, value any) bool {
+		before++
+		return true
+	})
+
 	// Create and stop many entries to verify cleanup
 	const n = 100
 	for i := 0; i < n; i++ {
@@ -610,14 +625,14 @@ func TestEnsureAutoProbe_NoMemoryLeak(t *testing.T) {
 		StopAutoProbe(config.Dest)
 	}
 
-	// Verify all entries cleaned up
-	count := 0
+	// Verify our entries cleaned up (allow for entries from other tests)
+	after := 0
 	probeOnces.Range(func(key, value any) bool {
-		count++
+		after++
 		return true
 	})
-	if count != 0 {
-		t.Errorf("expected 0 probe entries after cleanup, got %v", count)
+	if after > before {
+		t.Errorf("expected no new probe entries after cleanup, got %d new", after-before)
 	}
 }
 
