@@ -1111,9 +1111,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				}
 			}
 			if !postHandshakeReady {
-				break
+				// Fall through to polling loop
+			} else {
+				hs.c.isHandshakeComplete.Store(true)
 			}
-			hs.c.isHandshakeComplete.Store(true)
 
 			// Cache the RealityProfile for future connections.
 			alpn = ""
