@@ -2,8 +2,10 @@ package reality
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"testing"
@@ -1788,4 +1790,145 @@ func BenchmarkLayoutCacheMiss(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = realityLayoutCache.Load("bench.layout.miss|nonexistent.com|h2")
 	}
+}
+
+// ============================================================================
+// P1: Persistent Profile Cache Tests
+// ============================================================================
+
+func TestPersistentStoreSaveLoad(t *testing.T) {
+	dir := t.TempDir()
+	store := InitPersistentStore(dir)
+
+	// Store some profiles
+	fp1 := computeFingerprint(0x1301, "h2", 1215, 41)
+	realityProfileCache.Store("persist.test|microsoft.com|h2", &RealityProfile{
+		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp1,
+		CipherSuite: 0x1301, ALPN: "h2", RecordCount: 5, CapturedAt: time.Now(),
+	})
+	realityLayoutCache.Store("persist.test|microsoft.com|h2", &HandshakeLayout{
+		Fingerprint: fp1, ServerHelloLen: 1215, EncryptedExtensionsLen: 41,
+		CertificateLen: 8273, CertificateVerifyLen: 286, FinishedLen: 74,
+		RecordLens: [7]int{1215, 6, 41, 8273, 286, 74, 0}, RecordCount: 5,
+		CapturedAt: time.Now(),
+	})
+
+	// Save
+	store.Save()
+
+	// Verify file exists
+	if _, err := os.Stat(store.GetFilePath()); os.IsNotExist(err) {
+		t.Fatal("profiles.json not created")
+	}
+
+	// Clear caches
+	realityProfileCache.Delete("persist.test|microsoft.com|h2")
+	realityLayoutCache.Delete("persist.test|microsoft.com|h2")
+
+	// Reset loadOnce to simulate fresh startup
+	loadOnce = sync.Once{}
+	profileStore = nil
+	InitPersistentStore(dir)
+
+	// Verify loaded
+	val, ok := realityProfileCache.Load("persist.test|microsoft.com|h2")
+	if !ok {
+		t.Fatal("profile not loaded from disk")
+	}
+	p := val.(*RealityProfile)
+	if p.Fingerprint != fp1 {
+		t.Errorf("fingerprint = %d, want %d", p.Fingerprint, fp1)
+	}
+	if p.CipherSuite != 0x1301 {
+		t.Errorf("CipherSuite = %d, want 0x1301", p.CipherSuite)
+	}
+
+	val2, ok2 := realityLayoutCache.Load("persist.test|microsoft.com|h2")
+	if !ok2 {
+		t.Fatal("layout not loaded from disk")
+	}
+	l := val2.(*HandshakeLayout)
+	if l.ServerHelloLen != 1215 {
+		t.Errorf("ServerHelloLen = %d, want 1215", l.ServerHelloLen)
+	}
+	if l.CertificateLen != 8273 {
+		t.Errorf("CertificateLen = %d, want 8273", l.CertificateLen)
+	}
+
+	// Cleanup
+	realityProfileCache.Delete("persist.test|microsoft.com|h2")
+	realityLayoutCache.Delete("persist.test|microsoft.com|h2")
+}
+
+func TestPersistentStoreSkipsExpired(t *testing.T) {
+	dir := t.TempDir()
+
+	// Reset loadOnce to allow fresh initialization
+	loadOnce = sync.Once{}
+	profileStore = nil
+	store := InitPersistentStore(dir)
+
+	// Store expired profile
+	fp := computeFingerprint(0x1301, "h2", 1215, 41)
+	realityProfileCache.Store("persist.expired|microsoft.com|h2", &RealityProfile{
+		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
+		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now().Add(-31 * time.Minute),
+	})
+
+	store.Save()
+
+	// Clear and reload
+	realityProfileCache.Delete("persist.expired|microsoft.com|h2")
+	loadOnce = sync.Once{}
+	profileStore = nil
+	InitPersistentStore(dir)
+
+	// Should NOT be loaded (expired)
+	_, ok := realityProfileCache.Load("persist.expired|microsoft.com|h2")
+	if ok {
+		t.Error("expired profile should not be loaded from disk")
+	}
+
+	realityProfileCache.Delete("persist.expired|microsoft.com|h2")
+}
+
+func TestPersistentStoreAtomicWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	loadOnce = sync.Once{}
+	profileStore = nil
+	store := InitPersistentStore(dir)
+
+	// Store profile
+	fp := computeFingerprint(0x1301, "h2", 1215, 41)
+	realityProfileCache.Store("persist.atomic|microsoft.com|h2", &RealityProfile{
+		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
+		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
+	})
+
+	store.Save()
+
+	// Verify no .tmp file left
+	tmpPath := store.GetFilePath() + ".tmp"
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Error("temp file should be cleaned up after atomic write")
+	}
+
+	// Verify main file exists and is valid JSON
+	data, err := os.ReadFile(store.GetFilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file ProfileFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if file.Version != 1 {
+		t.Errorf("version = %d, want 1", file.Version)
+	}
+	if len(file.Profiles) != 1 {
+		t.Errorf("profiles count = %d, want 1", len(file.Profiles))
+	}
+
+	realityProfileCache.Delete("persist.atomic|microsoft.com|h2")
 }

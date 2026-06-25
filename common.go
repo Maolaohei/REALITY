@@ -564,6 +564,10 @@ type Config struct {
 
 	Mldsa65Key []byte
 
+	// CacheDir is the directory for persistent profile storage.
+	// If empty, persistence is disabled.
+	CacheDir string
+
 	LimitFallbackUpload   LimitFallback
 	LimitFallbackDownload LimitFallback
 
