@@ -877,14 +877,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			// Stage 1: Hard Filter (deterministic, O(1))
 			// If exact fingerprint match → HIT, skip all scoring
 			// ═══════════════════════════════════════════════════════════════
+			stage1Hit := false
 			if _, hit := unifiedCache.Stage1_HardFilter(profileKey, currentFP); hit {
-				cacheStats.LayoutHit.Add(1)
-				cacheStats.MetaHit.Add(1)
-				cacheStats.PollingSkipped.Add(1)
-				if config.Show {
-					fmt.Printf("REALITY remoteAddr: %v\tv5 HIT — fp=%v\n", remoteAddr, currentFP)
-				}
-				// Inject cached post-handshake records
+				if config.PostHandshake {
+				// HIT — but need GlobalPostHandshakeRecordsLens data to inject
 				alpnKey := "0"
 				if alpn == "h2" {
 					alpnKey = "2"
@@ -892,7 +888,14 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					alpnKey = "1"
 				}
 				if val, ok := GlobalPostHandshakeRecordsLens.Load(config.Dest+" "+hs.clientHello.serverName+" "+alpnKey); ok {
-					if postHandshakeRecordsLens, ok := val.([]int); ok {
+					if postHandshakeRecordsLens, ok := val.([]int); ok && len(postHandshakeRecordsLens) > 0 {
+						stage1Hit = true
+						cacheStats.LayoutHit.Add(1)
+						cacheStats.MetaHit.Add(1)
+						cacheStats.PollingSkipped.Add(1)
+						if config.Show {
+							fmt.Printf("REALITY remoteAddr: %v\tv5 HIT — fp=%v\n", remoteAddr, currentFP)
+						}
 						maxPtLen := 0
 						for _, length := range postHandshakeRecordsLens {
 							if ptLen := length - 16; ptLen > maxPtLen {
@@ -916,7 +919,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 							pt[2] = 3
 							pt[3] = byte((length - 5) >> 8)
 							pt[4] = byte((length - 5))
-							pt[5] = 23
+							pt[5] = 22
 							postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
 							hs.c.out.incSeq()
 							hs.c.write(postHandshakeRecord)
@@ -926,11 +929,15 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 						postHandshakeReady = true
 					}
 				}
-			} else {
-				// ═══════════════════════════════════════════════════════════════
-				// Stage 2: Soft Selection (fallback, only on MISS)
-				// Check old caches for partial match
-				// ═══════════════════════════════════════════════════════════════
+				}
+				// If no postHandshake data yet, fall through to Stage 2
+			}
+
+			// ═══════════════════════════════════════════════════════════════
+			// Stage 2: Soft Selection (fallback, only on MISS)
+			// Check old caches for partial match
+			// ═══════════════════════════════════════════════════════════════
+			if !stage1Hit && !postHandshakeReady && config.PostHandshake {
 				cacheStats.LayoutMiss.Add(1)
 				cacheStats.MetaMiss.Add(1)
 
@@ -950,7 +957,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 							alpnKey = "1"
 						}
 						if val, ok := GlobalPostHandshakeRecordsLens.Load(config.Dest+" "+hs.clientHello.serverName+" "+alpnKey); ok {
-							if postHandshakeRecordsLens, ok := val.([]int); ok {
+							if postHandshakeRecordsLens, ok := val.([]int); ok && len(postHandshakeRecordsLens) > 0 {
 								maxPtLen := 0
 								for _, length := range postHandshakeRecordsLens {
 									if ptLen := length - 16; ptLen > maxPtLen {
@@ -974,7 +981,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 									pt[2] = 3
 									pt[3] = byte((length - 5) >> 8)
 									pt[4] = byte((length - 5))
-									pt[5] = 23
+									pt[5] = 22
 									postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
 									hs.c.out.incSeq()
 									hs.c.write(postHandshakeRecord)
@@ -1009,7 +1016,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 								alpnKey = "1"
 							}
 							if val, ok := GlobalPostHandshakeRecordsLens.Load(config.Dest+" "+hs.clientHello.serverName+" "+alpnKey); ok {
-								if postHandshakeRecordsLens, ok := val.([]int); ok {
+								if postHandshakeRecordsLens, ok := val.([]int); ok && len(postHandshakeRecordsLens) > 0 {
 									maxPtLen := 0
 									for _, length := range postHandshakeRecordsLens {
 										if ptLen := length - 16; ptLen > maxPtLen {
@@ -1033,7 +1040,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 										pt[2] = 3
 										pt[3] = byte((length - 5) >> 8)
 										pt[4] = byte((length - 5))
-										pt[5] = 23
+										pt[5] = 22
 										postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
 										hs.c.out.incSeq()
 										hs.c.write(postHandshakeRecord)
@@ -1050,12 +1057,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					}
 				}
 
-				if config.Show && postHandshakeReady {
-					fmt.Printf("REALITY remoteAddr: %v\tv5 soft fallback HIT\n", remoteAddr)
-				}
+			if config.Show && postHandshakeReady {
+				fmt.Printf("REALITY remoteAddr: %v\tv5 soft fallback HIT\n", remoteAddr)
 			}
+		}
 
-			if !postHandshakeReady {
+			if !postHandshakeReady && config.PostHandshake {
 				for i := 0; i < 30; i++ {
 					key := config.Dest + " " + hs.clientHello.serverName
 					if len(hs.clientHello.alpnProtocols) == 0 {
@@ -1090,7 +1097,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 								pt[2] = 3
 								pt[3] = byte((length - 5) >> 8)
 								pt[4] = byte((length - 5))
-								pt[5] = 23
+								pt[5] = 22
 								postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
 								hs.c.out.incSeq()
 								hs.c.write(postHandshakeRecord)

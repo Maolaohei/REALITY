@@ -564,6 +564,11 @@ type Config struct {
 
 	Mldsa65Key []byte
 
+	// PostHandshake enables injection of post-handshake records
+	// (e.g. NewSessionTicket) to mimic the real server's behavior.
+	// Disabled by default for backward compatibility with older clients.
+	PostHandshake bool
+
 	// CacheDir is the directory for persistent profile storage.
 	// If empty, persistence is disabled.
 	CacheDir string
