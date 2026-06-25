@@ -46,6 +46,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -182,6 +183,12 @@ var (
 	// realityLayoutCache caches TLS handshake layout for fast path.
 	realityLayoutCache sync.Map // map[string]*HandshakeLayout
 
+	// realityVariantCache caches multiple profile variants per target.
+	realityVariantCache sync.Map // map[string]*ProfileVariantSet
+
+	// MaxVariantsPerTarget is the maximum number of profile variants per target.
+	MaxVariantsPerTarget = 4
+
 	// Cache statistics for diagnostics.
 	cacheStats CacheStats
 
@@ -240,6 +247,176 @@ func (l *HandshakeLayout) IsExpired() bool {
 	return time.Since(l.CapturedAt) > ProfileTTL
 }
 
+// ProfileVariant represents one possible TLS behavior for a target.
+// Multiple variants can exist for the same target when it exhibits
+// different TLS profiles (e.g., certificate rotation, ALPN negotiation changes).
+type ProfileVariant struct {
+	Fingerprint uint64
+	RecordLens  [7]int
+	CipherSuite uint16
+	ALPN        string
+	RecordCount int
+	CapturedAt  time.Time
+	LastHit     time.Time
+	HitCount    uint64
+	MissCount   uint64
+}
+
+// Weight returns the hit ratio for this variant.
+func (v *ProfileVariant) Weight() float64 {
+	total := v.HitCount + v.MissCount
+	if total == 0 {
+		return 0
+	}
+	return float64(v.HitCount) / float64(total)
+}
+
+// IsExpired checks if the variant has exceeded the TTL.
+func (v *ProfileVariant) IsExpired() bool {
+	return time.Since(v.CapturedAt) > ProfileTTL
+}
+
+// ProfileVariantSet manages multiple variants for a single target.
+type ProfileVariantSet struct {
+	mu       sync.RWMutex
+	variants []*ProfileVariant
+	maxSize  int
+}
+
+// NewProfileVariantSet creates a new variant set with a maximum size.
+func NewProfileVariantSet(maxSize int) *ProfileVariantSet {
+	return &ProfileVariantSet{
+		variants: make([]*ProfileVariant, 0, maxSize),
+		maxSize:  maxSize,
+	}
+}
+
+// FindByFingerprint returns the variant matching the given fingerprint.
+func (s *ProfileVariantSet) FindByFingerprint(fp uint64) *ProfileVariant {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, v := range s.variants {
+		if v.Fingerprint == fp {
+			return v
+		}
+	}
+	return nil
+}
+
+// FindBest returns the highest-weight variant that is not expired.
+func (s *ProfileVariantSet) FindBest() *ProfileVariant {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var best *ProfileVariant
+	for _, v := range s.variants {
+		if v.IsExpired() {
+			continue
+		}
+		if best == nil || v.Weight() > best.Weight() {
+			best = v
+		}
+	}
+	return best
+}
+
+// AddOrHit adds a new variant or increments hit count for an existing one.
+func (s *ProfileVariantSet) AddOrHit(fp uint64, recordLens [7]int, cipherSuite uint16, alpn string) *ProfileVariant {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if variant exists
+	for _, v := range s.variants {
+		if v.Fingerprint == fp {
+			v.HitCount++
+			v.LastHit = time.Now()
+			return v
+		}
+	}
+
+	// New variant — add if space available
+	if len(s.variants) >= s.maxSize {
+		// Evict lowest weight variant
+		s.evictLowest()
+	}
+
+	v := &ProfileVariant{
+		Fingerprint: fp,
+		RecordLens:  recordLens,
+		CipherSuite: cipherSuite,
+		ALPN:        alpn,
+		RecordCount: countNonZero(recordLens),
+		CapturedAt:  time.Now(),
+		LastHit:     time.Now(),
+		HitCount:    1,
+	}
+	s.variants = append(s.variants, v)
+	return v
+}
+
+// Miss increments miss count for the variant with matching fingerprint.
+func (s *ProfileVariantSet) Miss(fp uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range s.variants {
+		if v.Fingerprint == fp {
+			v.MissCount++
+			return
+		}
+	}
+}
+
+// evictLowest removes the variant with the lowest weight.
+func (s *ProfileVariantSet) evictLowest() {
+	if len(s.variants) == 0 {
+		return
+	}
+	lowestIdx := 0
+	lowestWeight := s.variants[0].Weight()
+	for i, v := range s.variants[1:] {
+		if v.Weight() < lowestWeight {
+			lowestWeight = v.Weight()
+			lowestIdx = i + 1
+		}
+	}
+	s.variants = append(s.variants[:lowestIdx], s.variants[lowestIdx+1:]...)
+}
+
+// Len returns the number of variants.
+func (s *ProfileVariantSet) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.variants)
+}
+
+// CleanExpired removes expired variants.
+func (s *ProfileVariantSet) CleanExpired() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := len(s.variants)
+	s.variants = slices.DeleteFunc(s.variants, func(v *ProfileVariant) bool {
+		return v.IsExpired()
+	})
+	return before - len(s.variants)
+}
+
+// IsEmpty returns true if no variants exist.
+func (s *ProfileVariantSet) IsEmpty() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.variants) == 0
+}
+
+// countNonZero counts non-zero elements in an array.
+func countNonZero(arr [7]int) int {
+	n := 0
+	for _, v := range arr {
+		if v > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // targetFingerprintCache caches the target server's TLS capabilities.
 // Updated in background; reduces synchronous ProbeTarget frequency.
 type targetFingerprintCache struct {
@@ -265,6 +442,9 @@ type CacheStats struct {
 	ProfileInvalidated atomic.Uint64
 	ProfileEntries     atomic.Int64
 	LayoutEntries      atomic.Int64
+	VariantHit         atomic.Uint64
+	VariantMiss        atomic.Uint64
+	VariantEvicted     atomic.Uint64
 }
 
 // CacheReport generates a human-readable cache diagnostics report.
@@ -272,8 +452,9 @@ func (s *CacheStats) CacheReport() string {
 	outputTotal := s.OutputHit.Load() + s.OutputMiss.Load()
 	metaTotal := s.MetaHit.Load() + s.MetaMiss.Load()
 	layoutTotal := s.LayoutHit.Load() + s.LayoutMiss.Load()
+	variantTotal := s.VariantHit.Load() + s.VariantMiss.Load()
 
-	var outputRate, metaRate, layoutRate float64
+	var outputRate, metaRate, layoutRate, variantRate float64
 	if outputTotal > 0 {
 		outputRate = float64(s.OutputHit.Load()) / float64(outputTotal) * 100
 	}
@@ -282,6 +463,9 @@ func (s *CacheStats) CacheReport() string {
 	}
 	if layoutTotal > 0 {
 		layoutRate = float64(s.LayoutHit.Load()) / float64(layoutTotal) * 100
+	}
+	if variantTotal > 0 {
+		variantRate = float64(s.VariantHit.Load()) / float64(variantTotal) * 100
 	}
 
 	return fmt.Sprintf(`REALITY cache report:
@@ -295,6 +479,11 @@ func (s *CacheStats) CacheReport() string {
     miss:           %d
     hit rate:       %.1f%%
     invalidated:    %d
+  variant:
+    hit:            %d
+    miss:           %d
+    hit rate:       %.1f%%
+    evicted:        %d
   output:
     hit:            %d
     miss:           %d
@@ -305,6 +494,7 @@ func (s *CacheStats) CacheReport() string {
   active layouts:      %d`,
 		s.LayoutHit.Load(), s.LayoutMiss.Load(), layoutRate, s.LayoutInvalidated.Load(),
 		s.MetaHit.Load(), s.MetaMiss.Load(), metaRate, s.ProfileInvalidated.Load(),
+		s.VariantHit.Load(), s.VariantMiss.Load(), variantRate, s.VariantEvicted.Load(),
 		s.OutputHit.Load(), s.OutputMiss.Load(), outputRate,
 		s.FingerprintChanged.Load(), s.PollingSkipped.Load(),
 		s.ProfileEntries.Load(), s.LayoutEntries.Load())

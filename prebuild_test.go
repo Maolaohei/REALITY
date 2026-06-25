@@ -2034,3 +2034,131 @@ func TestBackgroundRefreshFormatStats(t *testing.T) {
 		t.Error("stats should not be empty")
 	}
 }
+
+// ============================================================================
+// P3: Multi-Version Profile Tests
+// ============================================================================
+
+func TestProfileVariantBasic(t *testing.T) {
+	v := &ProfileVariant{
+		Fingerprint: 12345,
+		RecordLens:  [7]int{100, 6, 200, 300, 100, 50, 0},
+		CipherSuite: 0x1301,
+		ALPN:        "h2",
+		CapturedAt:  time.Now(),
+		HitCount:    10,
+		MissCount:   2,
+	}
+	if v.Weight() != 0.8333333333333334 {
+		t.Errorf("Weight = %v, want ~0.833", v.Weight())
+	}
+	if v.IsExpired() {
+		t.Error("variant should not be expired")
+	}
+}
+
+func TestProfileVariantSetFindBest(t *testing.T) {
+	set := NewProfileVariantSet(4)
+
+	// Add variants with different weights
+	v1 := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
+	v1.HitCount = 5
+	v1.MissCount = 5 // weight 0.5
+
+	v2 := set.AddOrHit(200, [7]int{200}, 0x1302, "h2")
+	v2.HitCount = 9
+	v2.MissCount = 1 // weight 0.9
+
+	v3 := set.AddOrHit(300, [7]int{300}, 0x1301, "http/1.1")
+	v3.HitCount = 3
+	v3.MissCount = 7 // weight 0.3
+
+	best := set.FindBest()
+	if best == nil {
+		t.Fatal("FindBest returned nil")
+	}
+	if best.Fingerprint != 200 {
+		t.Errorf("best fingerprint = %d, want 200 (highest weight)", best.Fingerprint)
+	}
+}
+
+func TestProfileVariantSetEviction(t *testing.T) {
+	set := NewProfileVariantSet(2) // max 2 variants
+
+	set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
+	set.AddOrHit(200, [7]int{200}, 0x1302, "h2")
+
+	if set.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", set.Len())
+	}
+
+	// Add third — should evict lowest
+	set.AddOrHit(300, [7]int{300}, 0x1301, "h2")
+
+	if set.Len() != 2 {
+		t.Fatalf("Len = %d after eviction, want 2", set.Len())
+	}
+
+	// 100 should be evicted (lowest weight: 1 hit / 1 total = 1.0, but 200 also 1.0)
+	// Actually all have equal weight (1 hit, 0 miss), so first added (100) gets evicted
+	v := set.FindByFingerprint(100)
+	if v != nil {
+		t.Error("variant 100 should have been evicted")
+	}
+}
+
+func TestProfileVariantSetMiss(t *testing.T) {
+	set := NewProfileVariantSet(4)
+	v := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
+
+	if v.MissCount != 0 {
+		t.Errorf("MissCount = %d, want 0", v.MissCount)
+	}
+
+	set.Miss(100)
+	if v.MissCount != 1 {
+		t.Errorf("MissCount = %d after Miss, want 1", v.MissCount)
+	}
+
+	set.Miss(999) // non-existent — should be no-op
+}
+
+func TestProfileVariantSetCleanExpired(t *testing.T) {
+	set := NewProfileVariantSet(4)
+
+	v := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
+	v.CapturedAt = time.Now().Add(-31 * time.Minute) // expired
+
+	set.AddOrHit(200, [7]int{200}, 0x1302, "h2") // fresh
+
+	removed := set.CleanExpired()
+	if removed != 1 {
+		t.Errorf("CleanExpired removed %d, want 1", removed)
+	}
+	if set.Len() != 1 {
+		t.Errorf("Len = %d after clean, want 1", set.Len())
+	}
+}
+
+func TestProfileVariantSetConcurrent(t *testing.T) {
+	set := NewProfileVariantSet(8)
+
+	var wg sync.WaitGroup
+	const n = 100
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(id int) {
+			defer wg.Done()
+			fp := uint64(id % 10) // 10 unique fingerprints
+			set.AddOrHit(fp, [7]int{id}, 0x1301, "h2")
+			set.FindByFingerprint(fp)
+			set.FindBest()
+			set.Len()
+		}(i)
+	}
+	wg.Wait()
+
+	if set.Len() > 8 {
+		t.Errorf("Len = %d, exceeds max 8", set.Len())
+	}
+}
