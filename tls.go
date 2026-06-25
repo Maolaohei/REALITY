@@ -380,6 +380,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		fmt.Printf("REALITY remoteAddr: %v\n", remoteAddr)
 	}
 
+	// Initialize persistent store on first call.
+	if profileStore == nil && config.CacheDir != "" {
+		store := InitPersistentStore(config.CacheDir)
+		store.StartPeriodicSave(5 * time.Minute)
+	}
+
 	// Trigger automatic pre-build probe on first connection.
 	// This starts a background probe + periodic refresh for the target.
 	ensureAutoProbe(config)
@@ -940,6 +946,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				cacheStats.LayoutEntries.Add(1)
 				if config.Show {
 					fmt.Printf("REALITY remoteAddr: %v\tcached layout for %v\n", remoteAddr, config.Dest)
+				}
+				// Persist new profile to disk.
+				if profileStore != nil {
+					go profileStore.Save()
 				}
 			}
 
