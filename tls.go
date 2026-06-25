@@ -261,6 +261,53 @@ type CacheStats struct {
 	PollingSkipped     atomic.Uint64
 	LayoutHit          atomic.Uint64
 	LayoutMiss         atomic.Uint64
+	LayoutInvalidated  atomic.Uint64
+	ProfileInvalidated atomic.Uint64
+	ProfileEntries     atomic.Int64
+	LayoutEntries      atomic.Int64
+}
+
+// CacheReport generates a human-readable cache diagnostics report.
+func (s *CacheStats) CacheReport() string {
+	outputTotal := s.OutputHit.Load() + s.OutputMiss.Load()
+	metaTotal := s.MetaHit.Load() + s.MetaMiss.Load()
+	layoutTotal := s.LayoutHit.Load() + s.LayoutMiss.Load()
+
+	var outputRate, metaRate, layoutRate float64
+	if outputTotal > 0 {
+		outputRate = float64(s.OutputHit.Load()) / float64(outputTotal) * 100
+	}
+	if metaTotal > 0 {
+		metaRate = float64(s.MetaHit.Load()) / float64(metaTotal) * 100
+	}
+	if layoutTotal > 0 {
+		layoutRate = float64(s.LayoutHit.Load()) / float64(layoutTotal) * 100
+	}
+
+	return fmt.Sprintf(`REALITY cache report:
+  layout:
+    hit:            %d
+    miss:           %d
+    hit rate:       %.1f%%
+    invalidated:    %d
+  profile:
+    hit:            %d
+    miss:           %d
+    hit rate:       %.1f%%
+    invalidated:    %d
+  output:
+    hit:            %d
+    miss:           %d
+    hit rate:       %.1f%%
+  fingerprint changed: %d
+  polling skipped:     %d
+  active profiles:     %d
+  active layouts:      %d`,
+		s.LayoutHit.Load(), s.LayoutMiss.Load(), layoutRate, s.LayoutInvalidated.Load(),
+		s.MetaHit.Load(), s.MetaMiss.Load(), metaRate, s.ProfileInvalidated.Load(),
+		s.OutputHit.Load(), s.OutputMiss.Load(), outputRate,
+		s.FingerprintChanged.Load(), s.PollingSkipped.Load(),
+		s.ProfileEntries.Load(), s.LayoutEntries.Load())
 }
 
 // bigEndianUint16 decodes a big-endian 16-bit unsigned integer from b.
@@ -630,6 +677,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				layout := val.(*HandshakeLayout)
 				if layout.IsExpired() {
 					cacheStats.LayoutMiss.Add(1)
+					cacheStats.LayoutInvalidated.Add(1)
 					realityLayoutCache.Delete(profileKey)
 				} else if layout.Fingerprint == currentFP {
 					cacheStats.LayoutHit.Add(1)
@@ -707,12 +755,13 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 							fmt.Printf("REALITY remoteAddr: %v\tprofile cache EXPIRED — cs=%v/%v alpn=%v/%v sh=%v/%v ext=%v/%v fp=%v/%v\n",
 								remoteAddr,
 								profile.CipherSuite, hs.hello.cipherSuite,
-								profile.ALPN, alpn,
-								profile.RecordLens[0], usedLen[0],
-								profile.RecordLens[2], usedLen[2],
-								profile.Fingerprint, currentFP)
-						}
-						realityProfileCache.Delete(profileKey)
+						profile.ALPN, alpn,
+						profile.RecordLens[0], usedLen[0],
+						profile.RecordLens[2], usedLen[2],
+						profile.Fingerprint, currentFP)
+					}
+					cacheStats.ProfileInvalidated.Add(1)
+					realityProfileCache.Delete(profileKey)
 					} else if profile.Fingerprint == currentFP {
 						cacheStats.OutputHit.Add(1)
 						cacheStats.MetaHit.Add(1)
@@ -868,8 +917,11 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				RecordCount:  recordCount,
 				CapturedAt:   time.Now(),
 			}
-			if _, loaded := realityProfileCache.LoadOrStore(profileKey, profile); !loaded && config.Show {
-				fmt.Printf("REALITY remoteAddr: %v\tcached profile for %v\n", remoteAddr, config.Dest)
+			if _, loaded := realityProfileCache.LoadOrStore(profileKey, profile); !loaded {
+				cacheStats.ProfileEntries.Add(1)
+				if config.Show {
+					fmt.Printf("REALITY remoteAddr: %v\tcached profile for %v\n", remoteAddr, config.Dest)
+				}
 			}
 
 			// v2: Cache handshake layout for fast path.
@@ -884,8 +936,11 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				RecordCount:            recordCount,
 				CapturedAt:             time.Now(),
 			}
-			if _, loaded := realityLayoutCache.LoadOrStore(profileKey, layout); !loaded && config.Show {
-				fmt.Printf("REALITY remoteAddr: %v\tcached layout for %v\n", remoteAddr, config.Dest)
+			if _, loaded := realityLayoutCache.LoadOrStore(profileKey, layout); !loaded {
+				cacheStats.LayoutEntries.Add(1)
+				if config.Show {
+					fmt.Printf("REALITY remoteAddr: %v\tcached layout for %v\n", remoteAddr, config.Dest)
+				}
 			}
 
 			// Also keep the target-based cache for ProbeTarget compatibility.
@@ -914,11 +969,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 			// Print cache statistics for diagnostics.
 			if config.Show {
-				fmt.Printf("REALITY cache stats — output: %d/%d, meta: %d/%d, layout: %d/%d, fp changed: %d, skipped: %d\n",
-					cacheStats.OutputHit.Load(), cacheStats.OutputMiss.Load(),
-					cacheStats.MetaHit.Load(), cacheStats.MetaMiss.Load(),
-					cacheStats.LayoutHit.Load(), cacheStats.LayoutMiss.Load(),
-					cacheStats.FingerprintChanged.Load(), cacheStats.PollingSkipped.Load())
+				fmt.Println(cacheStats.CacheReport())
 			}
 			break
 		}
