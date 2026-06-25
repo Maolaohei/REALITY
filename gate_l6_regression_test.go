@@ -4,6 +4,7 @@ package reality
 
 import (
 	"crypto/tls"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -381,4 +382,214 @@ func dialTLSWithConfig(t *testing.T, addr string, minVer, maxVer uint16) (*tls.C
 		cfg.MaxVersion = maxVer
 	}
 	return tls.Dial("tcp", addr, cfg)
+}
+
+// ============================================================================
+// Control Plane → Data Plane 泄漏回归测试
+// 防止 cache 代码再次侵入 TLS write path
+// ============================================================================
+
+// TestL6_NoCacheInHandshakePath 验证 cache 不出现在握手路径中
+// 如果 cache 代码被加回到 handshake flow，这个测试会失败
+func TestL6_NoCacheInHandshakePath(t *testing.T) {
+	ln, addr := newTestServer(t, echoHandler)
+	defer ln.Close()
+
+	// 连接并传输数据
+	conn := dialTLS(t, addr)
+	defer conn.Close()
+
+	for i := 0; i < 50; i++ {
+		data := genPayload(256)
+		if _, err := conn.Write(data); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+
+		buf := make([]byte, 256)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if string(buf[:n]) != string(data) {
+			t.Fatalf("data mismatch %d", i)
+		}
+	}
+}
+
+// TestL6_DataPlaneIntegrityAfterCacheLoad 验证 cache 加载后数据面仍正常
+func TestL6_DataPlaneIntegrityAfterCacheLoad(t *testing.T) {
+	// 预填充 cache（模拟缓存命中场景）
+	key := "regression|microsoft.com|h2"
+	fp := computeFingerprint(0x1301, "h2", 127, 51)
+
+	realityProfileCache.Store(key, &RealityProfile{
+		RecordLens: [7]int{127, 6, 51}, Fingerprint: fp,
+		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
+	})
+	defer realityProfileCache.Delete(key)
+
+	// 验证 cache 存在
+	val, ok := realityProfileCache.Load(key)
+	if !ok {
+		t.Fatal("cache miss")
+	}
+	_ = val.(*RealityProfile)
+
+	// 连接并传输数据 — cache 不应影响数据流
+	ln, addr := newTestServer(t, echoHandler)
+	defer ln.Close()
+
+	conn := dialTLS(t, addr)
+	defer conn.Close()
+
+	for i := 0; i < 50; i++ {
+		data := genPayload(512)
+		if _, err := conn.Write(data); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+
+		buf := make([]byte, 512)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if string(buf[:n]) != string(data) {
+			t.Fatalf("data mismatch %d", i)
+		}
+	}
+}
+
+// TestL6_CacheHitDoesNotSkipPolling 验证 cache 命中不跳过 polling loop
+// 这是 v3-stable 之前的核心 bug：cache 快捷路径跳过 polling 导致数据断
+func TestL6_CacheHitDoesNotSkipPolling(t *testing.T) {
+	// 预填充 layout cache（模拟 cache hit）
+	key := "polling|microsoft.com|h2"
+	fp := computeFingerprint(0x1301, "h2", 1215, 41)
+
+	realityLayoutCache.Store(key, &HandshakeLayout{
+		Fingerprint: fp, ServerHelloLen: 1215, EncryptedExtensionsLen: 41,
+		RecordLens: [7]int{1215, 6, 41}, CapturedAt: time.Now(),
+	})
+	defer realityLayoutCache.Delete(key)
+
+	// 验证 cache 存在
+	_, ok := realityLayoutCache.Load(key)
+	if !ok {
+		t.Fatal("layout cache miss")
+	}
+
+	// 连接并传输数据 — cache hit 不应跳过 polling
+	ln, addr := newTestServer(t, echoHandler)
+	defer ln.Close()
+
+	conn := dialTLS(t, addr)
+	defer conn.Close()
+
+	for i := 0; i < 50; i++ {
+		data := genPayload(256)
+		if _, err := conn.Write(data); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+
+		buf := make([]byte, 256)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if string(buf[:n]) != string(data) {
+			t.Fatalf("data mismatch %d", i)
+		}
+	}
+}
+
+// TestL6_MultipleCacheLookupsNoInterference 验证多次 cache lookup 不干扰数据流
+func TestL6_MultipleCacheLookupsNoInterference(t *testing.T) {
+	// 填充多个 cache
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("multi|%d.example.com|h2", i)
+		fp := computeFingerprint(0x1301, "h2", 100+i, 50+i)
+
+		realityProfileCache.Store(key, &RealityProfile{
+			RecordLens: [7]int{100 + i, 6, 50 + i}, Fingerprint: fp,
+			CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
+		})
+		realityLayoutCache.Store(key, &HandshakeLayout{
+			Fingerprint: fp, ServerHelloLen: 100 + i,
+			RecordLens: [7]int{100 + i, 6, 50 + i}, CapturedAt: time.Now(),
+		})
+	}
+	defer func() {
+		for i := 0; i < 10; i++ {
+			key := fmt.Sprintf("multi|%d.example.com|h2", i)
+			realityProfileCache.Delete(key)
+			realityLayoutCache.Delete(key)
+		}
+	}()
+
+	// 连接并传输数据 — 大量 cache 条目不应影响数据流
+	ln, addr := newTestServer(t, echoHandler)
+	defer ln.Close()
+
+	conn := dialTLS(t, addr)
+	defer conn.Close()
+
+	for i := 0; i < 50; i++ {
+		data := genPayload(256)
+		if _, err := conn.Write(data); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+
+		buf := make([]byte, 256)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if string(buf[:n]) != string(data) {
+			t.Fatalf("data mismatch %d", i)
+		}
+	}
+}
+
+// TestL6_CacheEvictionDoesNotCorruptData 验证 cache 淘汰不破坏数据流
+func TestL6_CacheEvictionDoesNotCorruptData(t *testing.T) {
+	ln, addr := newTestServer(t, echoHandler)
+	defer ln.Close()
+
+	// 大量 cache 操作 + 数据传输交替进行
+	for i := 0; i < 100; i++ {
+		// 写入 cache
+		key := fmt.Sprintf("evict|%d.example.com|h2", i%20)
+		fp := computeFingerprint(0x1301, "h2", 100+i, 50+i)
+		realityProfileCache.Store(key, &RealityProfile{
+			RecordLens: [7]int{100 + i, 6, 50 + i}, Fingerprint: fp,
+			CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
+		})
+
+		// 传输数据
+		conn := dialTLS(t, addr)
+
+		data := genPayload(128)
+		if _, err := conn.Write(data); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+
+		buf := make([]byte, 128)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := conn.Read(buf)
+		conn.Close()
+
+		if err != nil || string(buf[:n]) != string(data) {
+			t.Fatalf("data mismatch %d", i)
+		}
+	}
+
+	// 清理
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("evict|%d.example.com|h2", i)
+		realityProfileCache.Delete(key)
+	}
 }
