@@ -30,6 +30,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"hash/fnv"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
@@ -47,6 +48,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juju/ratelimit"
@@ -139,6 +141,9 @@ func NewRatelimitedConn(conn net.Conn, limit *LimitFallback) net.Conn {
 	}
 }
 
+// ProfileTTL is the time-to-live for cached RealityProfile entries.
+const ProfileTTL = 30 * time.Minute
+
 var (
 	// maxRecordSize is the buffer size for reading TLS handshake records from
 	// the target server. Raised from 8192 to 65536 (64 KiB) to support targets
@@ -166,19 +171,16 @@ var (
 	// profiles. Entries expire after 30 minutes, max 64 entries with LRU eviction.
 	defaultPrebuildCache = NewPrebuildCache(30*time.Minute, 64)
 
-	// realityOutputCache caches the handshakeLen values that REALITY actually
-	// produced during a successful handshake, keyed by "dest serverName alpn".
-	// On subsequent connections, these override the target-probed lengths so
-	// that encrypt() padding is always consistent with REALITY's output.
-	realityOutputCache sync.Map // map[string]*realityOutputProfile
-
-	// realityMetadataCache stores handshake metadata after first successful
-	// connection. Used to verify target hasn't changed without full re-probe.
-	realityMetadata sync.Map // map[string]*realityMetadataCache
+	// realityProfileCache is the unified cache for REALITY handshake profiles.
+	// Stores record lengths, fingerprint, and metadata. TTL-based invalidation.
+	realityProfileCache sync.Map // map[string]*RealityProfile
 
 	// targetFingerprintCache stores target TLS capabilities. Updated in
 	// background to reduce synchronous ProbeTarget frequency.
 	targetFingerprint sync.Map // map[string]*targetFingerprintCache
+
+	// Cache statistics for diagnostics.
+	cacheStats CacheStats
 
 	// recordBufPool reuses 64 KiB buffers for Server() handshake reads,
 	// avoiding per-connection allocation of two 64 KiB slices.
@@ -188,27 +190,31 @@ var (
 			return &buf
 		},
 	}
+
+	// postHandshakeBufPool reuses buffers for postHandshake record injection,
+	// avoiding per-connection allocation of maxPtLen-sized slices.
+	postHandshakeBufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 16*1024)
+			return &buf
+		},
+	}
 )
 
-// realityOutputProfile stores handshakeLen values that REALITY actually used
-// during a successful handshake. These override target-probed lengths so that
-// encrypt() padding is always consistent.
-type realityOutputProfile struct {
-	handshakeLen [7]int
-	capturedAt   time.Time
+// RealityProfile is the unified cache entry for REALITY handshake profiles.
+// Combines output record lengths, fingerprint, and metadata in one structure.
+type RealityProfile struct {
+	RecordLens    [7]int
+	Fingerprint   uint64
+	CipherSuite   uint16
+	ALPN          string
+	RecordCount   int
+	CapturedAt    time.Time
 }
 
-// realityMetadataCache caches REALITY handshake metadata after the first
-// successful connection. Used to verify target hasn't changed without
-// re-establishing the full profile.
-type realityMetadataCache struct {
-	CipherSuite    uint16
-	ALPN           string
-	RecordCount    int
-	RecordLens     [7]int
-	ServerHelloLen int
-	ExtensionsLen  int
-	LastUpdated    time.Time
+// IsExpired checks if the profile has exceeded the TTL.
+func (p *RealityProfile) IsExpired() bool {
+	return time.Since(p.CapturedAt) > ProfileTTL
 }
 
 // targetFingerprintCache caches the target server's TLS capabilities.
@@ -222,6 +228,16 @@ type targetFingerprintCache struct {
 	LastUpdated       time.Time
 }
 
+// CacheStats tracks cache hit/miss rates for diagnostics.
+type CacheStats struct {
+	OutputHit          atomic.Uint64
+	OutputMiss         atomic.Uint64
+	MetaHit            atomic.Uint64
+	MetaMiss           atomic.Uint64
+	FingerprintChanged atomic.Uint64
+	PollingSkipped     atomic.Uint64
+}
+
 // bigEndianUint16 decodes a big-endian 16-bit unsigned integer from b.
 // This is equivalent to the previous Value() helper for 2-byte slices,
 // but uses the optimized encoding/binary path.
@@ -230,29 +246,43 @@ func bigEndianUint16(b []byte) uint16 {
 }
 
 // verifyTargetUnchanged checks if the target's TLS behavior matches cached
-// metadata. Returns true if unchanged (safe to use cached profile).
+// profile. Returns true if unchanged (safe to use cached profile).
 func verifyTargetUnchanged(dest, serverName string, hello *serverHelloMsg, clientHello *clientHelloMsg) bool {
 	alpn := ""
 	if len(clientHello.alpnProtocols) > 0 {
 		alpn = clientHello.alpnProtocols[0]
 	}
 	key := dest + "|" + serverName + "|" + alpn
-	val, ok := realityMetadata.Load(key)
+	val, ok := realityProfileCache.Load(key)
 	if !ok {
 		return false
 	}
-	meta := val.(*realityMetadataCache)
-	if meta.CipherSuite != hello.cipherSuite {
+	profile := val.(*RealityProfile)
+	if profile.IsExpired() {
 		return false
 	}
-	if meta.ALPN != alpn {
+	if profile.CipherSuite != hello.cipherSuite {
 		return false
 	}
-	// If last update was within 30 minutes, consider target unchanged.
-	if time.Since(meta.LastUpdated) > 30*time.Minute {
+	if profile.ALPN != alpn {
 		return false
 	}
 	return true
+}
+
+// computeFingerprint computes FNV64 hash of (CipherSuite, ALPN, ServerHelloLen, ExtensionsLen).
+// Used for cache hit/miss decisions — more robust than comparing individual fields.
+func computeFingerprint(cipherSuite uint16, alpn string, serverHelloLen, extensionsLen int) uint64 {
+	h := fnv.New64a()
+	var buf [2]byte
+	binary.BigEndian.PutUint16(buf[:], cipherSuite)
+	h.Write(buf[:])
+	h.Write([]byte(alpn))
+	binary.BigEndian.PutUint16(buf[:], uint16(serverHelloLen))
+	h.Write(buf[:])
+	binary.BigEndian.PutUint16(buf[:], uint16(extensionsLen))
+	h.Write(buf[:])
+	return h.Sum64()
 }
 
 // bigEndianUint24 decodes a big-endian 24-bit unsigned integer from b.
@@ -508,15 +538,23 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			// This ensures encrypt() padding matches REALITY's actual output,
 			// not the target's record sizes which may differ.
 			var cachedLen [7]int
-			if profile, ok := realityOutputCache.Load(config.Dest + " " + hs.clientHello.serverName); ok {
-				cachedLen = profile.(*realityOutputProfile).handshakeLen
-				for i := range hs.c.out.handshakeLen {
-					if cachedLen[i] > 0 {
-						hs.c.out.handshakeLen[i] = cachedLen[i]
+			alpnOverride := ""
+			if len(hs.clientHello.alpnProtocols) > 0 {
+				alpnOverride = hs.clientHello.alpnProtocols[0]
+			}
+			profileKeyOverride := config.Dest + "|" + hs.clientHello.serverName + "|" + alpnOverride
+			if val, ok := realityProfileCache.Load(profileKeyOverride); ok {
+				profile := val.(*RealityProfile)
+				if !profile.IsExpired() {
+					cachedLen = profile.RecordLens
+					for i := range hs.c.out.handshakeLen {
+						if cachedLen[i] > 0 {
+							hs.c.out.handshakeLen[i] = cachedLen[i]
+						}
 					}
-				}
-				if config.Show {
-					fmt.Printf("REALITY remoteAddr: %v\tusing cached output lengths for %v\n", remoteAddr, config.Dest)
+					if config.Show {
+						fmt.Printf("REALITY remoteAddr: %v\tusing cached output lengths for %v\n", remoteAddr, config.Dest)
+					}
 				}
 			}
 
@@ -553,46 +591,156 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				break
 			}
 			postHandshakeReady := false
-			for i := 0; i < 30; i++ {
-				key := config.Dest + " " + hs.clientHello.serverName
-				if len(hs.clientHello.alpnProtocols) == 0 {
-					key += " 0"
-				} else if hs.clientHello.alpnProtocols[0] == "h2" {
-					key += " 2"
+
+			// Profile cache decision: if fingerprint matches and not expired, skip polling loop.
+			alpn := ""
+			if len(hs.clientHello.alpnProtocols) > 0 {
+				alpn = hs.clientHello.alpnProtocols[0]
+			}
+			profileKey := config.Dest + "|" + hs.clientHello.serverName + "|" + alpn
+			currentFP := computeFingerprint(hs.hello.cipherSuite, alpn, usedLen[0], usedLen[2])
+			if val, ok := realityProfileCache.Load(profileKey); ok {
+				profile := val.(*RealityProfile)
+				if profile.IsExpired() {
+					cacheStats.OutputMiss.Add(1)
+					cacheStats.MetaMiss.Add(1)
+					if config.Show {
+						fmt.Printf("REALITY remoteAddr: %v\tprofile cache EXPIRED — cs=%v/%v alpn=%v/%v sh=%v/%v ext=%v/%v fp=%v/%v\n",
+							remoteAddr,
+							profile.CipherSuite, hs.hello.cipherSuite,
+							profile.ALPN, alpn,
+							profile.RecordLens[0], usedLen[0],
+							profile.RecordLens[2], usedLen[2],
+							profile.Fingerprint, currentFP)
+					}
+					realityProfileCache.Delete(profileKey)
+				} else if profile.Fingerprint == currentFP {
+					cacheStats.OutputHit.Add(1)
+					cacheStats.MetaHit.Add(1)
+					cacheStats.PollingSkipped.Add(1)
+					if config.Show {
+						fmt.Printf("REALITY remoteAddr: %v\tprofile cache HIT — cs=%v alpn=%v sh=%v ext=%v fp=%v\n",
+							remoteAddr,
+							profile.CipherSuite, alpn,
+							profile.RecordLens[0], profile.RecordLens[2],
+							profile.Fingerprint)
+					}
+					// Target unchanged — inject cached post-handshake records
+					// and skip the polling loop entirely.
+					alpnKey := "0"
+					if alpn == "h2" {
+						alpnKey = "2"
+					} else if alpn != "" {
+						alpnKey = "1"
+					}
+					if val, ok := GlobalPostHandshakeRecordsLens.Load(config.Dest+" "+hs.clientHello.serverName+" "+alpnKey); ok {
+						if postHandshakeRecordsLens, ok := val.([]int); ok {
+							maxPtLen := 0
+							for _, length := range postHandshakeRecordsLens {
+								if ptLen := length - 16; ptLen > maxPtLen {
+									maxPtLen = ptLen
+								}
+							}
+							bp := postHandshakeBufPool.Get().(*[]byte)
+							plainText := *bp
+							if cap(plainText) < maxPtLen {
+								plainText = make([]byte, maxPtLen)
+							} else {
+								plainText = plainText[:maxPtLen]
+							}
+							for i := range plainText {
+								plainText[i] = 0
+							}
+							for _, length := range postHandshakeRecordsLens {
+								pt := plainText[:length-16]
+								pt[0] = 23
+								pt[1] = 3
+								pt[2] = 3
+								pt[3] = byte((length - 5) >> 8)
+								pt[4] = byte((length - 5))
+								pt[5] = 23
+								postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
+								hs.c.out.incSeq()
+								hs.c.write(postHandshakeRecord)
+							}
+							*bp = plainText
+							postHandshakeBufPool.Put(bp)
+							postHandshakeReady = true
+						}
+					}
+					if config.Show {
+						fmt.Printf("REALITY remoteAddr: %v\tskipped polling loop\n", remoteAddr)
+					}
 				} else {
-					key += " 1"
-				}
-				if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
-					if postHandshakeRecordsLens, ok := val.([]int); ok {
-						maxPtLen := 0
-						for _, length := range postHandshakeRecordsLens {
-							if ptLen := length - 16; ptLen > maxPtLen {
-								maxPtLen = ptLen
-							}
-						}
-						plainText := make([]byte, maxPtLen)
-						for _, length := range postHandshakeRecordsLens {
-							pt := plainText[:length-16]
-							pt[0] = 23
-							pt[1] = 3
-							pt[2] = 3
-							pt[3] = byte((length - 5) >> 8)
-							pt[4] = byte((length - 5))
-							pt[5] = 23
-							postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
-							hs.c.out.incSeq()
-							hs.c.write(postHandshakeRecord)
-							if config.Show {
-								fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
-							}
-						}
-						postHandshakeReady = true
-						break
+					cacheStats.FingerprintChanged.Add(1)
+					cacheStats.MetaMiss.Add(1)
+					if config.Show {
+						fmt.Printf("REALITY remoteAddr: %v\tprofile cache MISS — fp changed: cached=%v current=%v cs=%v/%v alpn=%v/%v sh=%v/%v ext=%v/%v\n",
+							remoteAddr,
+							profile.Fingerprint, currentFP,
+							profile.CipherSuite, hs.hello.cipherSuite,
+							profile.ALPN, alpn,
+							profile.RecordLens[0], usedLen[0],
+							profile.RecordLens[2], usedLen[2])
 					}
 				}
-				time.Sleep(time.Second)
-				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
-					hs.c.MaxUselessRecords = maxUseless.(int)
+			} else {
+				cacheStats.MetaMiss.Add(1)
+			}
+
+			if !postHandshakeReady {
+				for i := 0; i < 30; i++ {
+					key := config.Dest + " " + hs.clientHello.serverName
+					if len(hs.clientHello.alpnProtocols) == 0 {
+						key += " 0"
+					} else if hs.clientHello.alpnProtocols[0] == "h2" {
+						key += " 2"
+					} else {
+						key += " 1"
+					}
+					if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
+						if postHandshakeRecordsLens, ok := val.([]int); ok {
+							maxPtLen := 0
+							for _, length := range postHandshakeRecordsLens {
+								if ptLen := length - 16; ptLen > maxPtLen {
+									maxPtLen = ptLen
+								}
+							}
+							bp := postHandshakeBufPool.Get().(*[]byte)
+							plainText := *bp
+							if cap(plainText) < maxPtLen {
+								plainText = make([]byte, maxPtLen)
+							} else {
+								plainText = plainText[:maxPtLen]
+							}
+							for i := range plainText {
+								plainText[i] = 0
+							}
+							for _, length := range postHandshakeRecordsLens {
+								pt := plainText[:length-16]
+								pt[0] = 23
+								pt[1] = 3
+								pt[2] = 3
+								pt[3] = byte((length - 5) >> 8)
+								pt[4] = byte((length - 5))
+								pt[5] = 23
+								postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
+								hs.c.out.incSeq()
+								hs.c.write(postHandshakeRecord)
+								if config.Show {
+									fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
+								}
+							}
+							*bp = plainText
+							postHandshakeBufPool.Put(bp)
+							postHandshakeReady = true
+							break
+						}
+					}
+					time.Sleep(time.Second)
+					if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
+						hs.c.MaxUselessRecords = maxUseless.(int)
+					}
 				}
 			}
 			if !postHandshakeReady {
@@ -600,48 +748,41 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			hs.c.isHandshakeComplete.Store(true)
 
-			// Cache the REALITY output handshakeLen for future connections.
-			cacheKey := config.Dest + " " + hs.clientHello.serverName
-			if _, loaded := realityOutputCache.LoadOrStore(cacheKey, &realityOutputProfile{
-				handshakeLen: usedLen,
-				capturedAt:   time.Now(),
-			}); !loaded && config.Show {
-				fmt.Printf("REALITY remoteAddr: %v\tcached output lengths for %v\n", remoteAddr, config.Dest)
-			}
-			// Also keep the target-based cache for ProbeTarget compatibility.
-			if hs.hello != nil {
-				profile := &TargetProfile{
-					HandshakeLen: hs.c.out.handshakeLen,
-					CipherSuite:  hs.hello.cipherSuite,
-					KeyGroup:     hs.hello.serverShare.group,
-					CapturedAt:   time.Now(),
-					TTL:          30 * time.Minute,
-				}
-				defaultPrebuildCache.Store(config.Dest, profile)
-			}
-
-			// Phase 2: Cache handshake metadata for verification.
-			alpn := ""
+			// Cache the RealityProfile for future connections.
+			alpn = ""
 			if len(hs.clientHello.alpnProtocols) > 0 {
 				alpn = hs.clientHello.alpnProtocols[0]
 			}
-			metaKey := config.Dest + "|" + hs.clientHello.serverName + "|" + alpn
+			profileKey = config.Dest + "|" + hs.clientHello.serverName + "|" + alpn
 			recordCount := 0
 			for _, l := range usedLen {
 				if l > 0 {
 					recordCount++
 				}
 			}
-			meta := &realityMetadataCache{
-				CipherSuite:    hs.hello.cipherSuite,
-				ALPN:           alpn,
-				RecordCount:    recordCount,
-				RecordLens:     usedLen,
-				ServerHelloLen: usedLen[0],
-				ExtensionsLen:  usedLen[2],
-				LastUpdated:    time.Now(),
+			profile := &RealityProfile{
+				RecordLens:   usedLen,
+				Fingerprint:  computeFingerprint(hs.hello.cipherSuite, alpn, usedLen[0], usedLen[2]),
+				CipherSuite:  hs.hello.cipherSuite,
+				ALPN:         alpn,
+				RecordCount:  recordCount,
+				CapturedAt:   time.Now(),
 			}
-			realityMetadata.Store(metaKey, meta)
+			if _, loaded := realityProfileCache.LoadOrStore(profileKey, profile); !loaded && config.Show {
+				fmt.Printf("REALITY remoteAddr: %v\tcached profile for %v\n", remoteAddr, config.Dest)
+			}
+
+			// Also keep the target-based cache for ProbeTarget compatibility.
+			if hs.hello != nil {
+				tp := &TargetProfile{
+					HandshakeLen: hs.c.out.handshakeLen,
+					CipherSuite:  hs.hello.cipherSuite,
+					KeyGroup:     hs.hello.serverShare.group,
+					CapturedAt:   time.Now(),
+					TTL:          ProfileTTL,
+				}
+				defaultPrebuildCache.Store(config.Dest, tp)
+			}
 
 			// Phase 3: Cache target fingerprint for background updates.
 			fpKey := config.Dest + "|" + hs.clientHello.serverName
@@ -655,8 +796,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			targetFingerprint.Store(fpKey, fp)
 
+			// Print cache statistics for diagnostics.
 			if config.Show {
-				fmt.Printf("REALITY remoteAddr: %v\tcached metadata + fingerprint for %v\n", remoteAddr, config.Dest)
+				fmt.Printf("REALITY cache stats — output: %d hits / %d misses, meta: %d hits / %d misses, fp changed: %d, polling skipped: %d\n",
+					cacheStats.OutputHit.Load(), cacheStats.OutputMiss.Load(),
+					cacheStats.MetaHit.Load(), cacheStats.MetaMiss.Load(),
+					cacheStats.FingerprintChanged.Load(), cacheStats.PollingSkipped.Load())
 			}
 			break
 		}
