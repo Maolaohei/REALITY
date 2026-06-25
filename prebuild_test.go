@@ -1932,3 +1932,105 @@ func TestPersistentStoreAtomicWrite(t *testing.T) {
 
 	realityProfileCache.Delete("persist.atomic|microsoft.com|h2")
 }
+
+// ============================================================================
+// P2: Background Refresh Tests
+// ============================================================================
+
+func TestBackgroundRefreshStartStop(t *testing.T) {
+	m := InitBackgroundRefresh(time.Second)
+
+	// Start refresh for a target
+	m.StartRefresh("example.com:443", "example.com")
+
+	// Verify target is tracked
+	active, _ := m.GetRefreshStats()
+	if active != 1 {
+		t.Errorf("active targets = %d, want 1", active)
+	}
+
+	// Start again — should be idempotent
+	m.StartRefresh("example.com:443", "example.com")
+	active, _ = m.GetRefreshStats()
+	if active != 1 {
+		t.Errorf("active targets = %d after duplicate start, want 1", active)
+	}
+
+	// Stop refresh
+	m.StopRefresh("example.com:443", "example.com")
+	active, _ = m.GetRefreshStats()
+	if active != 0 {
+		t.Errorf("active targets = %d after stop, want 0", active)
+	}
+}
+
+func TestBackgroundRefreshMultipleTargets(t *testing.T) {
+	m := InitBackgroundRefresh(time.Second)
+
+	targets := []struct{ dest, name string }{
+		{"microsoft.com:443", "microsoft.com"},
+		{"apple.com:443", "apple.com"},
+		{"tesla.com:443", "tesla.com"},
+	}
+
+	for _, tgt := range targets {
+		m.StartRefresh(tgt.dest, tgt.name)
+	}
+
+	active, _ := m.GetRefreshStats()
+	if active != 3 {
+		t.Errorf("active targets = %d, want 3", active)
+	}
+
+	// Stop one
+	m.StopRefresh("apple.com:443", "apple.com")
+	active, _ = m.GetRefreshStats()
+	if active != 2 {
+		t.Errorf("active targets = %d after stop, want 2", active)
+	}
+
+	// Cleanup
+	for _, tgt := range targets {
+		m.StopRefresh(tgt.dest, tgt.name)
+	}
+}
+
+func TestBackgroundRefreshConcurrent(t *testing.T) {
+	m := InitBackgroundRefresh(time.Second)
+
+	var wg sync.WaitGroup
+	const n = 50
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(id int) {
+			defer wg.Done()
+			dest := fmt.Sprintf("concurrent%d.example.com:443", id)
+			m.StartRefresh(dest, fmt.Sprintf("concurrent%d.example.com", id))
+		}(i)
+	}
+	wg.Wait()
+
+	active, _ := m.GetRefreshStats()
+	if active != n {
+		t.Errorf("active targets = %d, want %d", n, active)
+	}
+
+	// Cleanup
+	for i := 0; i < n; i++ {
+		m.StopRefresh(
+			fmt.Sprintf("concurrent%d.example.com:443", i),
+			fmt.Sprintf("concurrent%d.example.com", i),
+		)
+	}
+}
+
+func TestBackgroundRefreshFormatStats(t *testing.T) {
+	// Before initialization
+	refreshManager = nil
+	refreshManagerOnce = sync.Once{}
+
+	stats := FormatRefreshStats()
+	if stats == "" {
+		t.Error("stats should not be empty")
+	}
+}
