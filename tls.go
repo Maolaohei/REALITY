@@ -200,15 +200,6 @@ var (
 			return &buf
 		},
 	}
-
-	// postHandshakeBufPool reuses buffers for postHandshake record injection,
-	// avoiding per-connection allocation of maxPtLen-sized slices.
-	postHandshakeBufPool = sync.Pool{
-		New: func() any {
-			buf := make([]byte, 16*1024)
-			return &buf
-		},
-	}
 )
 
 // RealityProfile is the unified cache entry for REALITY handshake profiles.
@@ -836,59 +827,46 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			postHandshakeReady := false
 
-			if !postHandshakeReady {
-				for i := 0; i < 30; i++ {
-					key := config.Dest + " " + hs.clientHello.serverName
-					if len(hs.clientHello.alpnProtocols) == 0 {
-						key += " 0"
-					} else if hs.clientHello.alpnProtocols[0] == "h2" {
-						key += " 2"
-					} else {
-						key += " 1"
-					}
-					if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
-						if postHandshakeRecordsLens, ok := val.([]int); ok {
-							maxPtLen := 0
-							for _, length := range postHandshakeRecordsLens {
-								if ptLen := length - 16; ptLen > maxPtLen {
-									maxPtLen = ptLen
-								}
+			for i := 0; i < 30; i++ {
+				key := config.Dest + " " + hs.clientHello.serverName
+				if len(hs.clientHello.alpnProtocols) == 0 {
+					key += " 0"
+				} else if hs.clientHello.alpnProtocols[0] == "h2" {
+					key += " 2"
+				} else {
+					key += " 1"
+				}
+				if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
+					if postHandshakeRecordsLens, ok := val.([]int); ok {
+						maxPtLen := 0
+						for _, length := range postHandshakeRecordsLens {
+							if ptLen := length - 16; ptLen > maxPtLen {
+								maxPtLen = ptLen
 							}
-							bp := postHandshakeBufPool.Get().(*[]byte)
-							plainText := *bp
-							if cap(plainText) < maxPtLen {
-								plainText = make([]byte, maxPtLen)
-							} else {
-								plainText = plainText[:maxPtLen]
-							}
-							for i := range plainText {
-								plainText[i] = 0
-							}
-							for _, length := range postHandshakeRecordsLens {
-								pt := plainText[:length-16]
-								pt[0] = 23
-								pt[1] = 3
-								pt[2] = 3
-								pt[3] = byte((length - 5) >> 8)
-								pt[4] = byte((length - 5))
-								pt[5] = 23
-								postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
-								hs.c.out.incSeq()
-								hs.c.write(postHandshakeRecord)
-								if config.Show {
-									fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
-								}
-							}
-							*bp = plainText
-							postHandshakeBufPool.Put(bp)
-							postHandshakeReady = true
-							break
 						}
+						plainText := make([]byte, maxPtLen)
+						for _, length := range postHandshakeRecordsLens {
+							pt := plainText[:length-16]
+							pt[0] = 23
+							pt[1] = 3
+							pt[2] = 3
+							pt[3] = byte((length - 5) >> 8)
+							pt[4] = byte((length - 5))
+							pt[5] = 23
+							postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
+							hs.c.out.incSeq()
+							hs.c.write(postHandshakeRecord)
+							if config.Show {
+								fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
+							}
+						}
+						postHandshakeReady = true
+						break
 					}
-					time.Sleep(time.Second)
-					if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
-						hs.c.MaxUselessRecords = maxUseless.(int)
-					}
+				}
+				time.Sleep(time.Second)
+				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
+					hs.c.MaxUselessRecords = maxUseless.(int)
 				}
 			}
 			if !postHandshakeReady {
