@@ -951,6 +951,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				if profileStore != nil {
 					go profileStore.Save()
 				}
+				// Start background refresh for this target.
+				StartBackgroundRefreshForProfile(config.Dest, hs.clientHello.serverName)
 			}
 
 			// Also keep the target-based cache for ProbeTarget compatibility.
