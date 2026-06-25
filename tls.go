@@ -802,30 +802,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			start := time.Now()
 
-			// Override handshakeLen with cached REALITY output if available.
-			// This ensures encrypt() padding matches REALITY's actual output,
-			// not the target's record sizes which may differ.
-			var cachedLen [7]int
-			alpnOverride := ""
-			if len(hs.clientHello.alpnProtocols) > 0 {
-				alpnOverride = hs.clientHello.alpnProtocols[0]
-			}
-			profileKeyOverride := config.Dest + "|" + hs.clientHello.serverName + "|" + alpnOverride
-			if val, ok := realityProfileCache.Load(profileKeyOverride); ok {
-				profile := val.(*RealityProfile)
-				if !profile.IsExpired() {
-					cachedLen = profile.RecordLens
-					for i := range hs.c.out.handshakeLen {
-						if cachedLen[i] > 0 {
-							hs.c.out.handshakeLen[i] = cachedLen[i]
-						}
-					}
-					if config.Show {
-						fmt.Printf("REALITY remoteAddr: %v\tusing cached output lengths for %v\n", remoteAddr, config.Dest)
-					}
-				}
-			}
-
 			// Capture the handshakeLen values that encrypt() will use.
 			// encrypt() zeros these after use, so we must copy before hs.handshake().
 			var usedLen [7]int
@@ -859,179 +835,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				break
 			}
 			postHandshakeReady := false
-
-			// v2 Layout cache: if layout fingerprint matches, skip polling loop.
-			alpn := ""
-			if len(hs.clientHello.alpnProtocols) > 0 {
-				alpn = hs.clientHello.alpnProtocols[0]
-			}
-			profileKey := config.Dest + "|" + hs.clientHello.serverName + "|" + alpn
-			currentFP := computeFingerprint(hs.hello.cipherSuite, alpn, usedLen[0], usedLen[2])
-
-			// Check layout cache first (v2 fast path).
-			if val, ok := realityLayoutCache.Load(profileKey); ok {
-				layout := val.(*HandshakeLayout)
-				if layout.IsExpired() {
-					cacheStats.LayoutMiss.Add(1)
-					cacheStats.LayoutInvalidated.Add(1)
-					realityLayoutCache.Delete(profileKey)
-				} else if layout.Fingerprint == currentFP {
-					cacheStats.LayoutHit.Add(1)
-					cacheStats.PollingSkipped.Add(1)
-					if config.Show {
-						fmt.Printf("REALITY remoteAddr: %v\tlayout cache HIT — sh=%v ext=%v cert=%v fp=%v\n",
-							remoteAddr, layout.ServerHelloLen, layout.EncryptedExtensionsLen,
-							layout.CertificateLen, layout.Fingerprint)
-					}
-					// Use cached layout to inject post-handshake records.
-					alpnKey := "0"
-					if alpn == "h2" {
-						alpnKey = "2"
-					} else if alpn != "" {
-						alpnKey = "1"
-					}
-					if val, ok := GlobalPostHandshakeRecordsLens.Load(config.Dest+" "+hs.clientHello.serverName+" "+alpnKey); ok {
-						if postHandshakeRecordsLens, ok := val.([]int); ok {
-							maxPtLen := 0
-							for _, length := range postHandshakeRecordsLens {
-								if ptLen := length - 16; ptLen > maxPtLen {
-									maxPtLen = ptLen
-								}
-							}
-							bp := postHandshakeBufPool.Get().(*[]byte)
-							plainText := *bp
-							if cap(plainText) < maxPtLen {
-								plainText = make([]byte, maxPtLen)
-							} else {
-								plainText = plainText[:maxPtLen]
-							}
-							for i := range plainText {
-								plainText[i] = 0
-							}
-							for _, length := range postHandshakeRecordsLens {
-								pt := plainText[:length-16]
-								pt[0] = 23
-								pt[1] = 3
-								pt[2] = 3
-								pt[3] = byte((length - 5) >> 8)
-								pt[4] = byte((length - 5))
-								pt[5] = 23
-								postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
-								hs.c.out.incSeq()
-								hs.c.write(postHandshakeRecord)
-							}
-							*bp = plainText
-							postHandshakeBufPool.Put(bp)
-							postHandshakeReady = true
-						}
-					}
-					if config.Show {
-						fmt.Printf("REALITY remoteAddr: %v\tskipped polling loop (layout)\n", remoteAddr)
-					}
-				} else {
-					cacheStats.FingerprintChanged.Add(1)
-					cacheStats.LayoutMiss.Add(1)
-					if config.Show {
-						fmt.Printf("REALITY remoteAddr: %v\tlayout cache MISS — fp changed: cached=%v current=%v\n",
-							remoteAddr, layout.Fingerprint, currentFP)
-					}
-				}
-			} else {
-				cacheStats.LayoutMiss.Add(1)
-			}
-
-			// Fallback to profile cache if layout cache missed.
-			if !postHandshakeReady {
-				if val, ok := realityProfileCache.Load(profileKey); ok {
-					profile := val.(*RealityProfile)
-					if profile.IsExpired() {
-						cacheStats.OutputMiss.Add(1)
-						cacheStats.MetaMiss.Add(1)
-						if config.Show {
-							fmt.Printf("REALITY remoteAddr: %v\tprofile cache EXPIRED — cs=%v/%v alpn=%v/%v sh=%v/%v ext=%v/%v fp=%v/%v\n",
-								remoteAddr,
-								profile.CipherSuite, hs.hello.cipherSuite,
-						profile.ALPN, alpn,
-						profile.RecordLens[0], usedLen[0],
-						profile.RecordLens[2], usedLen[2],
-						profile.Fingerprint, currentFP)
-					}
-					cacheStats.ProfileInvalidated.Add(1)
-					realityProfileCache.Delete(profileKey)
-					} else if profile.Fingerprint == currentFP {
-						cacheStats.OutputHit.Add(1)
-						cacheStats.MetaHit.Add(1)
-						cacheStats.PollingSkipped.Add(1)
-						if config.Show {
-							fmt.Printf("REALITY remoteAddr: %v\tprofile cache HIT — cs=%v alpn=%v sh=%v ext=%v fp=%v\n",
-								remoteAddr,
-								profile.CipherSuite, alpn,
-								profile.RecordLens[0], profile.RecordLens[2],
-								profile.Fingerprint)
-						}
-						// Target unchanged — inject cached post-handshake records
-						// and skip the polling loop entirely.
-						alpnKey := "0"
-						if alpn == "h2" {
-							alpnKey = "2"
-						} else if alpn != "" {
-							alpnKey = "1"
-						}
-						if val, ok := GlobalPostHandshakeRecordsLens.Load(config.Dest+" "+hs.clientHello.serverName+" "+alpnKey); ok {
-							if postHandshakeRecordsLens, ok := val.([]int); ok {
-								maxPtLen := 0
-								for _, length := range postHandshakeRecordsLens {
-									if ptLen := length - 16; ptLen > maxPtLen {
-										maxPtLen = ptLen
-									}
-								}
-								bp := postHandshakeBufPool.Get().(*[]byte)
-								plainText := *bp
-								if cap(plainText) < maxPtLen {
-									plainText = make([]byte, maxPtLen)
-								} else {
-									plainText = plainText[:maxPtLen]
-								}
-								for i := range plainText {
-									plainText[i] = 0
-								}
-								for _, length := range postHandshakeRecordsLens {
-									pt := plainText[:length-16]
-									pt[0] = 23
-									pt[1] = 3
-									pt[2] = 3
-									pt[3] = byte((length - 5) >> 8)
-									pt[4] = byte((length - 5))
-									pt[5] = 23
-									postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
-									hs.c.out.incSeq()
-									hs.c.write(postHandshakeRecord)
-								}
-								*bp = plainText
-								postHandshakeBufPool.Put(bp)
-								postHandshakeReady = true
-							}
-						}
-						if config.Show {
-							fmt.Printf("REALITY remoteAddr: %v\tskipped polling loop\n", remoteAddr)
-						}
-					} else {
-						cacheStats.FingerprintChanged.Add(1)
-						cacheStats.MetaMiss.Add(1)
-						if config.Show {
-							fmt.Printf("REALITY remoteAddr: %v\tprofile cache MISS — fp changed: cached=%v current=%v cs=%v/%v alpn=%v/%v sh=%v/%v ext=%v/%v\n",
-								remoteAddr,
-								profile.Fingerprint, currentFP,
-								profile.CipherSuite, hs.hello.cipherSuite,
-								profile.ALPN, alpn,
-								profile.RecordLens[0], usedLen[0],
-								profile.RecordLens[2], usedLen[2])
-						}
-					}
-				} else {
-					cacheStats.MetaMiss.Add(1)
-				}
-			}
 
 			if !postHandshakeReady {
 				for i := 0; i < 30; i++ {
@@ -1093,12 +896,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			hs.c.isHandshakeComplete.Store(true)
 
-			// Cache the RealityProfile for future connections.
-			alpn = ""
+			// Cache the RealityProfile for future connections (READ-ONLY, after handshake).
+			alpn := ""
 			if len(hs.clientHello.alpnProtocols) > 0 {
 				alpn = hs.clientHello.alpnProtocols[0]
 			}
-			profileKey = config.Dest + "|" + hs.clientHello.serverName + "|" + alpn
+			profileKey := config.Dest + "|" + hs.clientHello.serverName + "|" + alpn
 			recordCount := 0
 			for _, l := range usedLen {
 				if l > 0 {
