@@ -25,7 +25,8 @@ type ProfileEntry struct {
 	NextRetry      time.Time
 	TTL            time.Duration
 	StabilityScore int
-	RefCount       int32 // pinned connections using this profile
+	RefCount       int32     // pinned connections using this profile
+	PendingSince   time.Time // when state became PendingDelete (fallback TTL)
 }
 
 // CacheManager manages all REALITY cache state.
@@ -211,6 +212,7 @@ func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
 		oldEntry := val.(*ProfileEntry)
 		if oldEntry != newEntry {
 			oldEntry.State = ProfilePendingDelete
+			oldEntry.PendingSince = time.Now()
 			// If nothing is using it, delete immediately.
 			if atomic.LoadInt32(&oldEntry.RefCount) <= 0 {
 				m.entries.CompareAndDelete(key, val)
@@ -275,6 +277,7 @@ func (m *CacheManager) InvalidateProfile(key string) {
 	} else {
 		// Connections still using it — defer deletion.
 		entry.State = ProfilePendingDelete
+		entry.PendingSince = time.Now()
 	}
 }
 
@@ -352,4 +355,40 @@ func (m *CacheManager) ClearDirty() {
 	m.dirty.Store(false)
 }
 
+// CleanupPending removes PendingDelete entries older than maxAge.
+// This is a safety net for leaked Pin/Unpin (e.g., panic without defer).
+// Should be called periodically (e.g., every 5 minutes).
+func (m *CacheManager) CleanupPending(maxAge time.Duration) {
+	now := time.Now()
+	m.entries.Range(func(key, val any) bool {
+		entry := val.(*ProfileEntry)
+		if entry.State == ProfilePendingDelete {
+			if now.Sub(entry.PendingSince) > maxAge {
+				// Force delete regardless of refCount (safety net).
+				if m.entries.CompareAndDelete(key, val) {
+					m.stats.ProfileInvalidated.Add(1)
+					m.dirty.Store(true)
+				}
+			}
+		}
+		return true
+	})
+}
+
+// startCleanupLoop runs CleanupPending every interval in the background.
+func (m *CacheManager) startCleanupLoop(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			m.CleanupPending(10 * time.Minute)
+		}
+	}()
+}
+
 var globalCacheManager = NewCacheManager()
+
+func init() {
+	// Start background cleanup for leaked Pin/Unpin.
+	globalCacheManager.startCleanupLoop(5 * time.Minute)
+}
