@@ -18,10 +18,9 @@ type PersistentProfileStore struct {
 
 // ProfileFile is the JSON structure for persistent storage.
 type ProfileFile struct {
-	Version   int                        `json:"version"`
-	SavedAt   time.Time                  `json:"saved_at"`
-	Profiles  map[string]*ProfileEntry   `json:"profiles"`
-	Layouts   map[string]*LayoutEntry    `json:"layouts"`
+	Version  int                       `json:"version"`
+	SavedAt  time.Time                 `json:"saved_at"`
+	Profiles map[string]*ProfileEntry  `json:"profiles"`
 }
 
 // ProfileEntry is the serialized form of RealityProfile.
@@ -32,19 +31,6 @@ type ProfileEntry struct {
 	ALPN        string   `json:"alpn"`
 	RecordCount int      `json:"record_count"`
 	CapturedAt  int64    `json:"captured_at"`
-}
-
-// LayoutEntry is the serialized form of HandshakeLayout.
-type LayoutEntry struct {
-	Fingerprint          uint64   `json:"fingerprint"`
-	ServerHelloLen       int      `json:"server_hello_len"`
-	EncryptedExtensionsLen int    `json:"encrypted_extensions_len"`
-	CertificateLen       int      `json:"certificate_len"`
-	CertificateVerifyLen int      `json:"certificate_verify_len"`
-	FinishedLen          int      `json:"finished_len"`
-	RecordLens           [7]int   `json:"record_lens"`
-	RecordCount          int      `json:"record_count"`
-	CapturedAt           int64    `json:"captured_at"`
 }
 
 var (
@@ -77,7 +63,6 @@ func (s *PersistentProfileStore) Save() {
 		Version:  1,
 		SavedAt:  time.Now(),
 		Profiles: make(map[string]*ProfileEntry),
-		Layouts:  make(map[string]*LayoutEntry),
 	}
 
 	// Collect profiles
@@ -90,23 +75,6 @@ func (s *PersistentProfileStore) Save() {
 			ALPN:        p.ALPN,
 			RecordCount: p.RecordCount,
 			CapturedAt:  p.CapturedAt.UnixNano(),
-		}
-		return true
-	})
-
-	// Collect layouts
-	realityLayoutCache.Range(func(key, val any) bool {
-		l := val.(*HandshakeLayout)
-		file.Layouts[key.(string)] = &LayoutEntry{
-			Fingerprint:            l.Fingerprint,
-			ServerHelloLen:         l.ServerHelloLen,
-			EncryptedExtensionsLen: l.EncryptedExtensionsLen,
-			CertificateLen:         l.CertificateLen,
-			CertificateVerifyLen:   l.CertificateVerifyLen,
-			FinishedLen:            l.FinishedLen,
-			RecordLens:             l.RecordLens,
-			RecordCount:            l.RecordCount,
-			CapturedAt:             l.CapturedAt.UnixNano(),
 		}
 		return true
 	})
@@ -153,26 +121,6 @@ func (s *PersistentProfileStore) load() {
 		}
 		realityProfileCache.Store(key, profile)
 		cacheStats.ProfileEntries.Add(1)
-	}
-
-	for key, entry := range file.Layouts {
-		capturedAt := time.Unix(0, entry.CapturedAt)
-		if now.Sub(capturedAt) > ProfileTTL {
-			continue
-		}
-		layout := &HandshakeLayout{
-			Fingerprint:            entry.Fingerprint,
-			ServerHelloLen:         entry.ServerHelloLen,
-			EncryptedExtensionsLen: entry.EncryptedExtensionsLen,
-			CertificateLen:         entry.CertificateLen,
-			CertificateVerifyLen:   entry.CertificateVerifyLen,
-			FinishedLen:            entry.FinishedLen,
-			RecordLens:             entry.RecordLens,
-			RecordCount:            entry.RecordCount,
-			CapturedAt:             capturedAt,
-		}
-		realityLayoutCache.Store(key, layout)
-		cacheStats.LayoutEntries.Add(1)
 	}
 }
 

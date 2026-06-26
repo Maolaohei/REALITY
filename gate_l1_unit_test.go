@@ -83,103 +83,6 @@ func TestL1_ProfileIsolation(t *testing.T) {
 	}
 }
 
-// --- Cache: Layout ---
-
-func TestL1_LayoutCaptureAndReuse(t *testing.T) {
-	cacheStats = CacheStats{}
-	key := "l1.lay|ms.com|h2"
-	fp := computeFingerprint(0x1301, "h2", 1215, 41)
-
-	l := &HandshakeLayout{
-		Fingerprint: fp, ServerHelloLen: 1215, EncryptedExtensionsLen: 41,
-		CertificateLen: 8273, CertificateVerifyLen: 286, FinishedLen: 74,
-		RecordLens: [7]int{1215, 6, 41, 8273, 286, 74, 0}, RecordCount: 5,
-		CapturedAt: time.Now(),
-	}
-
-	realityLayoutCache.Store(key, l)
-	defer realityLayoutCache.Delete(key)
-
-	val, ok := realityLayoutCache.Load(key)
-	if !ok {
-		t.Fatal("layout miss")
-	}
-	got := val.(*HandshakeLayout)
-	if got.ServerHelloLen != 1215 {
-		t.Errorf("ServerHelloLen = %d, want 1215", got.ServerHelloLen)
-	}
-	if got.CertificateLen != 8273 {
-		t.Errorf("CertificateLen = %d, want 8273", got.CertificateLen)
-	}
-}
-
-func TestL1_LayoutInvalidation(t *testing.T) {
-	cacheStats = CacheStats{}
-	key := "l1.linv|ms.com|h2"
-
-	realityLayoutCache.Store(key, &HandshakeLayout{
-		ServerHelloLen: 100, CapturedAt: time.Now(),
-	})
-	realityLayoutCache.Delete(key)
-	if _, ok := realityLayoutCache.Load(key); ok {
-		t.Fatal("should be deleted")
-	}
-}
-
-// --- Variant ---
-
-func TestL1_VariantAddAndFindBest(t *testing.T) {
-	set := NewProfileVariantSet(4)
-
-	v1 := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
-	v1.HitCount = 70
-	v1.MissCount = 30
-
-	v2 := set.AddOrHit(200, [7]int{200}, 0x1302, "h2")
-	v2.HitCount = 25
-	v2.MissCount = 5
-
-	best := set.FindBest()
-	if best == nil || best.Fingerprint != 200 {
-		t.Errorf("best = %v, want fp=200 (highest weight)", best)
-	}
-}
-
-func TestL1_VariantEvictLowest(t *testing.T) {
-	set := NewProfileVariantSet(2)
-
-	v1 := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
-	v1.HitCount = 100
-	v1.MissCount = 0
-
-	v2 := set.AddOrHit(200, [7]int{200}, 0x1302, "h2")
-	v2.HitCount = 1
-	v2.MissCount = 100
-
-	set.AddOrHit(300, [7]int{300}, 0x1301, "h2")
-
-	if set.FindByFingerprint(200) != nil {
-		t.Error("v2 (lowest weight) should be evicted")
-	}
-	if set.FindByFingerprint(100) == nil {
-		t.Error("v1 (highest weight) should survive")
-	}
-}
-
-func TestL1_VariantCleanExpired(t *testing.T) {
-	set := NewProfileVariantSet(4)
-	v := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
-	v.CapturedAt = time.Now().Add(-ProfileTTL - time.Minute)
-
-	removed := set.CleanExpired()
-	if removed != 1 {
-		t.Errorf("removed = %d, want 1", removed)
-	}
-	if set.Len() != 0 {
-		t.Errorf("len = %d, want 0", set.Len())
-	}
-}
-
 // --- Fingerprint ---
 
 func TestL1_FingerprintDeterministic(t *testing.T) {
@@ -261,12 +164,10 @@ func TestL1_ConcurrentCacheAccess(t *testing.T) {
 
 func TestL1_CacheReport(t *testing.T) {
 	cacheStats = CacheStats{}
-	cacheStats.LayoutHit.Add(10)
-	cacheStats.LayoutMiss.Add(2)
+	cacheStats.OutputHit.Add(10)
 	cacheStats.MetaHit.Add(8)
 	cacheStats.MetaMiss.Add(3)
-	cacheStats.VariantHit.Add(5)
-	cacheStats.VariantMiss.Add(1)
+	cacheStats.FingerprintChanged.Add(4)
 
 	report := cacheStats.CacheReport()
 	if len(report) == 0 {

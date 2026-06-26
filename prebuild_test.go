@@ -1489,325 +1489,6 @@ func BenchmarkRealityFullCycle(b *testing.B) {
 }
 
 // ============================================================================
-// v2: HandshakeLayout Cache Tests
-// ============================================================================
-
-func TestLayoutCacheCapture(t *testing.T) {
-	cacheStats = CacheStats{}
-
-	key := "layout.capture|microsoft.com|h2"
-	fp := computeFingerprint(0x1301, "h2", 1215, 41)
-
-	layout := &HandshakeLayout{
-		Fingerprint:            fp,
-		ServerHelloLen:         1215,
-		EncryptedExtensionsLen: 41,
-		CertificateLen:         8273,
-		CertificateVerifyLen:   286,
-		FinishedLen:            74,
-		RecordLens:             [7]int{1215, 6, 41, 8273, 286, 74, 0},
-		RecordCount:            5,
-		CapturedAt:             time.Now(),
-	}
-	realityLayoutCache.Store(key, layout)
-
-	val, ok := realityLayoutCache.Load(key)
-	if !ok {
-		t.Fatal("layout not found in cache")
-	}
-	l := val.(*HandshakeLayout)
-	if l.ServerHelloLen != 1215 {
-		t.Errorf("ServerHelloLen = %d, want 1215", l.ServerHelloLen)
-	}
-	if l.EncryptedExtensionsLen != 41 {
-		t.Errorf("EncryptedExtensionsLen = %d, want 41", l.EncryptedExtensionsLen)
-	}
-	if l.CertificateLen != 8273 {
-		t.Errorf("CertificateLen = %d, want 8273", l.CertificateLen)
-	}
-	if l.Fingerprint != fp {
-		t.Errorf("Fingerprint = %d, want %d", l.Fingerprint, fp)
-	}
-
-	realityLayoutCache.Delete(key)
-}
-
-func TestLayoutCacheReuse(t *testing.T) {
-	cacheStats = CacheStats{}
-
-	key := "layout.reuse|apple.com|h2"
-	fp := computeFingerprint(0x1301, "h2", 127, 41)
-
-	layout := &HandshakeLayout{
-		Fingerprint:            fp,
-		ServerHelloLen:         127,
-		EncryptedExtensionsLen: 41,
-		CertificateLen:         8273,
-		CertificateVerifyLen:   286,
-		FinishedLen:            74,
-		RecordLens:             [7]int{127, 6, 41, 8273, 286, 74, 0},
-		RecordCount:            5,
-		CapturedAt:             time.Now(),
-	}
-	realityLayoutCache.Store(key, layout)
-
-	// Simulate connection 2: same fingerprint → HIT
-	val, _ := realityLayoutCache.Load(key)
-	l := val.(*HandshakeLayout)
-	currentFP := computeFingerprint(0x1301, "h2", 127, 41)
-	if l.Fingerprint != currentFP {
-		t.Fatalf("fingerprint mismatch: cached=%d current=%d", l.Fingerprint, currentFP)
-	}
-	cacheStats.LayoutHit.Add(1)
-	cacheStats.PollingSkipped.Add(1)
-
-	// Simulate connection 3: same → HIT again
-	val2, _ := realityLayoutCache.Load(key)
-	l2 := val2.(*HandshakeLayout)
-	if l2.Fingerprint != currentFP {
-		t.Fatal("fingerprint should match on second reuse")
-	}
-	cacheStats.LayoutHit.Add(1)
-	cacheStats.PollingSkipped.Add(1)
-
-	if cacheStats.LayoutHit.Load() != 2 {
-		t.Errorf("LayoutHit = %d, want 2", cacheStats.LayoutHit.Load())
-	}
-	if cacheStats.PollingSkipped.Load() != 2 {
-		t.Errorf("PollingSkipped = %d, want 2", cacheStats.PollingSkipped.Load())
-	}
-
-	realityLayoutCache.Delete(key)
-}
-
-func TestLayoutCacheInvalidation(t *testing.T) {
-	cacheStats = CacheStats{}
-
-	key := "layout.inval|tesla.com|h2"
-	fp1 := computeFingerprint(0x1301, "h2", 127, 51)
-
-	layout := &HandshakeLayout{
-		Fingerprint:            fp1,
-		ServerHelloLen:         127,
-		EncryptedExtensionsLen: 51,
-		CertificateLen:         8273,
-		CertificateVerifyLen:   286,
-		FinishedLen:            74,
-		RecordLens:             [7]int{127, 6, 51, 8273, 286, 74, 0},
-		RecordCount:            5,
-		CapturedAt:             time.Now(),
-	}
-	realityLayoutCache.Store(key, layout)
-
-	// Target changes CipherSuite → fingerprint changes
-	fp2 := computeFingerprint(0x1302, "h2", 127, 51)
-	if fp1 == fp2 {
-		t.Fatal("different CipherSuite should produce different fingerprint")
-	}
-
-	val, _ := realityLayoutCache.Load(key)
-	l := val.(*HandshakeLayout)
-	if l.Fingerprint == fp2 {
-		t.Fatal("old layout should NOT match new fingerprint")
-	}
-	cacheStats.FingerprintChanged.Add(1)
-	cacheStats.LayoutMiss.Add(1)
-
-	// Re-learn
-	newLayout := &HandshakeLayout{
-		Fingerprint:            fp2,
-		ServerHelloLen:         127,
-		EncryptedExtensionsLen: 51,
-		CertificateLen:         8273,
-		CertificateVerifyLen:   286,
-		FinishedLen:            74,
-		RecordLens:             [7]int{127, 6, 51, 8273, 286, 74, 0},
-		RecordCount:            5,
-		CapturedAt:             time.Now(),
-	}
-	realityLayoutCache.Store(key, newLayout)
-
-	// HIT with new fingerprint
-	val2, _ := realityLayoutCache.Load(key)
-	l2 := val2.(*HandshakeLayout)
-	if l2.Fingerprint != fp2 {
-		t.Fatal("new layout should match current fingerprint")
-	}
-	cacheStats.LayoutHit.Add(1)
-
-	if cacheStats.FingerprintChanged.Load() != 1 {
-		t.Errorf("FingerprintChanged = %d, want 1", cacheStats.FingerprintChanged.Load())
-	}
-	if cacheStats.LayoutHit.Load() != 1 {
-		t.Errorf("LayoutHit = %d, want 1", cacheStats.LayoutHit.Load())
-	}
-
-	realityLayoutCache.Delete(key)
-}
-
-func TestLayoutCacheExpiry(t *testing.T) {
-	key := "layout.expiry|microsoft.com|h2"
-	fp := computeFingerprint(0x1301, "h2", 1215, 41)
-
-	// Store expired layout
-	layout := &HandshakeLayout{
-		Fingerprint: fp, ServerHelloLen: 1215, EncryptedExtensionsLen: 41,
-		CertificateLen: 8273, CertificateVerifyLen: 286, FinishedLen: 74,
-		RecordLens: [7]int{1215, 6, 41, 8273, 286, 74, 0}, RecordCount: 5,
-		CapturedAt: time.Now().Add(-31 * time.Minute),
-	}
-	realityLayoutCache.Store(key, layout)
-
-	val, _ := realityLayoutCache.Load(key)
-	l := val.(*HandshakeLayout)
-	if !l.IsExpired() {
-		t.Error("layout should be expired")
-	}
-
-	// Store fresh layout
-	fresh := &HandshakeLayout{
-		Fingerprint: fp, ServerHelloLen: 1215, EncryptedExtensionsLen: 41,
-		CertificateLen: 8273, CertificateVerifyLen: 286, FinishedLen: 74,
-		RecordLens: [7]int{1215, 6, 41, 8273, 286, 74, 0}, RecordCount: 5,
-		CapturedAt: time.Now(),
-	}
-	realityLayoutCache.Store(key, fresh)
-
-	val2, _ := realityLayoutCache.Load(key)
-	l2 := val2.(*HandshakeLayout)
-	if l2.IsExpired() {
-		t.Error("fresh layout should NOT be expired")
-	}
-
-	realityLayoutCache.Delete(key)
-}
-
-func TestLayoutCacheIsolation(t *testing.T) {
-	microsoftKey := "layout.iso|microsoft.com|h2"
-	appleKey := "layout.iso|apple.com|h2"
-	teslaKey := "layout.iso|tesla.com|h2"
-
-	fpMS := computeFingerprint(0x1301, "h2", 1215, 41)
-	fpApple := computeFingerprint(0x1301, "h2", 127, 41)
-	fpTesla := computeFingerprint(0x1302, "h2", 127, 51)
-
-	realityLayoutCache.Store(microsoftKey, &HandshakeLayout{
-		Fingerprint: fpMS, ServerHelloLen: 1215, EncryptedExtensionsLen: 41,
-		RecordLens: [7]int{1215}, CapturedAt: time.Now(),
-	})
-	realityLayoutCache.Store(appleKey, &HandshakeLayout{
-		Fingerprint: fpApple, ServerHelloLen: 127, EncryptedExtensionsLen: 41,
-		RecordLens: [7]int{127}, CapturedAt: time.Now(),
-	})
-	realityLayoutCache.Store(teslaKey, &HandshakeLayout{
-		Fingerprint: fpTesla, ServerHelloLen: 127, EncryptedExtensionsLen: 51,
-		RecordLens: [7]int{127}, CapturedAt: time.Now(),
-	})
-
-	valMS, _ := realityLayoutCache.Load(microsoftKey)
-	valApple, _ := realityLayoutCache.Load(appleKey)
-	valTesla, _ := realityLayoutCache.Load(teslaKey)
-
-	lMS := valMS.(*HandshakeLayout)
-	lApple := valApple.(*HandshakeLayout)
-	lTesla := valTesla.(*HandshakeLayout)
-
-	if lMS.Fingerprint == lApple.Fingerprint {
-		t.Error("microsoft and apple should have different fingerprints")
-	}
-	if lMS.ServerHelloLen != 1215 {
-		t.Errorf("microsoft ServerHelloLen = %d, want 1215", lMS.ServerHelloLen)
-	}
-	if lApple.ServerHelloLen != 127 {
-		t.Errorf("apple ServerHelloLen = %d, want 127", lApple.ServerHelloLen)
-	}
-	if lTesla.EncryptedExtensionsLen != 51 {
-		t.Errorf("tesla EncryptedExtensionsLen = %d, want 51", lTesla.EncryptedExtensionsLen)
-	}
-
-	realityLayoutCache.Delete(microsoftKey)
-	realityLayoutCache.Delete(appleKey)
-	realityLayoutCache.Delete(teslaKey)
-}
-
-func TestLayoutCacheSoak(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping soak test in short mode")
-	}
-
-	const totalConnections = 1000
-	const uniqueDests = 20
-
-	var mBefore runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&mBefore)
-	allocBefore := mBefore.TotalAlloc
-
-	for i := 0; i < totalConnections; i++ {
-		destIdx := i % uniqueDests
-		dest := fmt.Sprintf("layout.soak%d.example.com|layout.soak%d.example.com|h2", destIdx, destIdx)
-		fp := computeFingerprint(0x1301, "h2", 1200+destIdx, 40+destIdx)
-
-		val, ok := realityLayoutCache.Load(dest)
-		if ok {
-			l := val.(*HandshakeLayout)
-			if l.Fingerprint != fp {
-				t.Fatalf("connection %d: fp mismatch", i)
-			}
-		} else {
-			realityLayoutCache.Store(dest, &HandshakeLayout{
-				Fingerprint: fp, ServerHelloLen: 1200 + destIdx,
-				EncryptedExtensionsLen: 40 + destIdx,
-				RecordLens: [7]int{1200 + destIdx, 6, 40 + destIdx},
-				CapturedAt: time.Now(),
-			})
-		}
-	}
-
-	var mAfter runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&mAfter)
-
-	allocDelta := mAfter.TotalAlloc - allocBefore
-	t.Logf("Layout soak: %d connections, alloc delta: %d bytes (%.2f KB)",
-		totalConnections, allocDelta, float64(allocDelta)/1024)
-
-	if allocDelta > 50*1024*1024 {
-		t.Errorf("alloc delta too high: %.2f MB", float64(allocDelta)/1024/1024)
-	}
-
-	for i := 0; i < uniqueDests; i++ {
-		realityLayoutCache.Delete(fmt.Sprintf("layout.soak%d.example.com|layout.soak%d.example.com|h2", i, i))
-	}
-}
-
-func BenchmarkLayoutCacheHit(b *testing.B) {
-	key := "bench.layout.hit|example.com|h2"
-	fp := computeFingerprint(0x1301, "h2", 1215, 41)
-	realityLayoutCache.Store(key, &HandshakeLayout{
-		Fingerprint: fp, ServerHelloLen: 1215, EncryptedExtensionsLen: 41,
-		RecordLens: [7]int{1215, 6, 41}, CapturedAt: time.Now(),
-	})
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		val, ok := realityLayoutCache.Load(key)
-		if ok {
-			l := val.(*HandshakeLayout)
-			_ = l.Fingerprint == fp
-		}
-	}
-	b.StopTimer()
-	realityLayoutCache.Delete(key)
-}
-
-func BenchmarkLayoutCacheMiss(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = realityLayoutCache.Load("bench.layout.miss|nonexistent.com|h2")
-	}
-}
-
-// ============================================================================
 // P1: Persistent Profile Cache Tests
 // ============================================================================
 
@@ -1821,12 +1502,6 @@ func TestPersistentStoreSaveLoad(t *testing.T) {
 		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp1,
 		CipherSuite: 0x1301, ALPN: "h2", RecordCount: 5, CapturedAt: time.Now(),
 	})
-	realityLayoutCache.Store("persist.test|microsoft.com|h2", &HandshakeLayout{
-		Fingerprint: fp1, ServerHelloLen: 1215, EncryptedExtensionsLen: 41,
-		CertificateLen: 8273, CertificateVerifyLen: 286, FinishedLen: 74,
-		RecordLens: [7]int{1215, 6, 41, 8273, 286, 74, 0}, RecordCount: 5,
-		CapturedAt: time.Now(),
-	})
 
 	// Save
 	store.Save()
@@ -1838,7 +1513,6 @@ func TestPersistentStoreSaveLoad(t *testing.T) {
 
 	// Clear caches
 	realityProfileCache.Delete("persist.test|microsoft.com|h2")
-	realityLayoutCache.Delete("persist.test|microsoft.com|h2")
 
 	// Reset loadOnce to simulate fresh startup
 	loadOnce = sync.Once{}
@@ -1858,21 +1532,8 @@ func TestPersistentStoreSaveLoad(t *testing.T) {
 		t.Errorf("CipherSuite = %d, want 0x1301", p.CipherSuite)
 	}
 
-	val2, ok2 := realityLayoutCache.Load("persist.test|microsoft.com|h2")
-	if !ok2 {
-		t.Fatal("layout not loaded from disk")
-	}
-	l := val2.(*HandshakeLayout)
-	if l.ServerHelloLen != 1215 {
-		t.Errorf("ServerHelloLen = %d, want 1215", l.ServerHelloLen)
-	}
-	if l.CertificateLen != 8273 {
-		t.Errorf("CertificateLen = %d, want 8273", l.CertificateLen)
-	}
-
 	// Cleanup
 	realityProfileCache.Delete("persist.test|microsoft.com|h2")
-	realityLayoutCache.Delete("persist.test|microsoft.com|h2")
 }
 
 func TestPersistentStoreSkipsExpired(t *testing.T) {
@@ -1953,34 +1614,34 @@ func TestPersistentStoreAtomicWrite(t *testing.T) {
 // ============================================================================
 
 func TestBackgroundRefreshStartStop(t *testing.T) {
-	m := InitBackgroundRefresh(time.Second)
+	m := InitBackgroundRefresh()
 
 	// Start refresh for a target
 	m.StartRefresh("example.com:443", "example.com")
 
 	// Verify target is tracked
-	active, _ := m.GetRefreshStats()
+	active := m.GetRefreshStats()
 	if active != 1 {
 		t.Errorf("active targets = %d, want 1", active)
 	}
 
 	// Start again — should be idempotent
 	m.StartRefresh("example.com:443", "example.com")
-	active, _ = m.GetRefreshStats()
+	active = m.GetRefreshStats()
 	if active != 1 {
 		t.Errorf("active targets = %d after duplicate start, want 1", active)
 	}
 
 	// Stop refresh
 	m.StopRefresh("example.com:443", "example.com")
-	active, _ = m.GetRefreshStats()
+	active = m.GetRefreshStats()
 	if active != 0 {
 		t.Errorf("active targets = %d after stop, want 0", active)
 	}
 }
 
 func TestBackgroundRefreshMultipleTargets(t *testing.T) {
-	m := InitBackgroundRefresh(time.Second)
+	m := InitBackgroundRefresh()
 
 	targets := []struct{ dest, name string }{
 		{"microsoft.com:443", "microsoft.com"},
@@ -1992,14 +1653,14 @@ func TestBackgroundRefreshMultipleTargets(t *testing.T) {
 		m.StartRefresh(tgt.dest, tgt.name)
 	}
 
-	active, _ := m.GetRefreshStats()
+	active := m.GetRefreshStats()
 	if active != 3 {
 		t.Errorf("active targets = %d, want 3", active)
 	}
 
 	// Stop one
 	m.StopRefresh("apple.com:443", "apple.com")
-	active, _ = m.GetRefreshStats()
+	active = m.GetRefreshStats()
 	if active != 2 {
 		t.Errorf("active targets = %d after stop, want 2", active)
 	}
@@ -2011,7 +1672,7 @@ func TestBackgroundRefreshMultipleTargets(t *testing.T) {
 }
 
 func TestBackgroundRefreshConcurrent(t *testing.T) {
-	m := InitBackgroundRefresh(time.Second)
+	m := InitBackgroundRefresh()
 
 	var wg sync.WaitGroup
 	const n = 50
@@ -2025,7 +1686,7 @@ func TestBackgroundRefreshConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	active, _ := m.GetRefreshStats()
+	active := m.GetRefreshStats()
 	if active != n {
 		t.Errorf("active targets = %d, want %d", n, active)
 	}
@@ -2050,130 +1711,4 @@ func TestBackgroundRefreshFormatStats(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// P3: Multi-Version Profile Tests
-// ============================================================================
 
-func TestProfileVariantBasic(t *testing.T) {
-	v := &ProfileVariant{
-		Fingerprint: 12345,
-		RecordLens:  [7]int{100, 6, 200, 300, 100, 50, 0},
-		CipherSuite: 0x1301,
-		ALPN:        "h2",
-		CapturedAt:  time.Now(),
-		HitCount:    10,
-		MissCount:   2,
-	}
-	if v.Weight() != 0.8333333333333334 {
-		t.Errorf("Weight = %v, want ~0.833", v.Weight())
-	}
-	if v.IsExpired() {
-		t.Error("variant should not be expired")
-	}
-}
-
-func TestProfileVariantSetFindBest(t *testing.T) {
-	set := NewProfileVariantSet(4)
-
-	// Add variants with different weights
-	v1 := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
-	v1.HitCount = 5
-	v1.MissCount = 5 // weight 0.5
-
-	v2 := set.AddOrHit(200, [7]int{200}, 0x1302, "h2")
-	v2.HitCount = 9
-	v2.MissCount = 1 // weight 0.9
-
-	v3 := set.AddOrHit(300, [7]int{300}, 0x1301, "http/1.1")
-	v3.HitCount = 3
-	v3.MissCount = 7 // weight 0.3
-
-	best := set.FindBest()
-	if best == nil {
-		t.Fatal("FindBest returned nil")
-	}
-	if best.Fingerprint != 200 {
-		t.Errorf("best fingerprint = %d, want 200 (highest weight)", best.Fingerprint)
-	}
-}
-
-func TestProfileVariantSetEviction(t *testing.T) {
-	set := NewProfileVariantSet(2) // max 2 variants
-
-	set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
-	set.AddOrHit(200, [7]int{200}, 0x1302, "h2")
-
-	if set.Len() != 2 {
-		t.Fatalf("Len = %d, want 2", set.Len())
-	}
-
-	// Add third — should evict lowest
-	set.AddOrHit(300, [7]int{300}, 0x1301, "h2")
-
-	if set.Len() != 2 {
-		t.Fatalf("Len = %d after eviction, want 2", set.Len())
-	}
-
-	// 100 should be evicted (lowest weight: 1 hit / 1 total = 1.0, but 200 also 1.0)
-	// Actually all have equal weight (1 hit, 0 miss), so first added (100) gets evicted
-	v := set.FindByFingerprint(100)
-	if v != nil {
-		t.Error("variant 100 should have been evicted")
-	}
-}
-
-func TestProfileVariantSetMiss(t *testing.T) {
-	set := NewProfileVariantSet(4)
-	v := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
-
-	if v.MissCount != 0 {
-		t.Errorf("MissCount = %d, want 0", v.MissCount)
-	}
-
-	set.Miss(100)
-	if v.MissCount != 1 {
-		t.Errorf("MissCount = %d after Miss, want 1", v.MissCount)
-	}
-
-	set.Miss(999) // non-existent — should be no-op
-}
-
-func TestProfileVariantSetCleanExpired(t *testing.T) {
-	set := NewProfileVariantSet(4)
-
-	v := set.AddOrHit(100, [7]int{100}, 0x1301, "h2")
-	v.CapturedAt = time.Now().Add(-31 * time.Minute) // expired
-
-	set.AddOrHit(200, [7]int{200}, 0x1302, "h2") // fresh
-
-	removed := set.CleanExpired()
-	if removed != 1 {
-		t.Errorf("CleanExpired removed %d, want 1", removed)
-	}
-	if set.Len() != 1 {
-		t.Errorf("Len = %d after clean, want 1", set.Len())
-	}
-}
-
-func TestProfileVariantSetConcurrent(t *testing.T) {
-	set := NewProfileVariantSet(8)
-
-	var wg sync.WaitGroup
-	const n = 100
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func(id int) {
-			defer wg.Done()
-			fp := uint64(id % 10) // 10 unique fingerprints
-			set.AddOrHit(fp, [7]int{id}, 0x1301, "h2")
-			set.FindByFingerprint(fp)
-			set.FindBest()
-			set.Len()
-		}(i)
-	}
-	wg.Wait()
-
-	if set.Len() > 8 {
-		t.Errorf("Len = %d, exceeds max 8", set.Len())
-	}
-}

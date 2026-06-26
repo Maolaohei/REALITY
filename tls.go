@@ -46,7 +46,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -168,10 +167,6 @@ var (
 		"New Session Ticket",
 	}
 
-	// defaultPrebuildCache is the package-level cache for pre-built target
-	// profiles. Entries expire after 30 minutes, max 64 entries with LRU eviction.
-	defaultPrebuildCache = NewPrebuildCache(30*time.Minute, 64)
-
 	// realityProfileCache is the unified cache for REALITY handshake profiles.
 	// Stores record lengths, fingerprint, and metadata. TTL-based invalidation.
 	realityProfileCache sync.Map // map[string]*RealityProfile
@@ -179,15 +174,6 @@ var (
 	// targetFingerprintCache stores target TLS capabilities. Updated in
 	// background to reduce synchronous ProbeTarget frequency.
 	targetFingerprint sync.Map // map[string]*targetFingerprintCache
-
-	// realityLayoutCache caches TLS handshake layout for fast path.
-	realityLayoutCache sync.Map // map[string]*HandshakeLayout
-
-	// realityVariantCache caches multiple profile variants per target.
-	realityVariantCache sync.Map // map[string]*ProfileVariantSet
-
-	// MaxVariantsPerTarget is the maximum number of profile variants per target.
-	MaxVariantsPerTarget = 4
 
 	// Cache statistics for diagnostics.
 	cacheStats CacheStats
@@ -218,196 +204,6 @@ func (p *RealityProfile) IsExpired() bool {
 	return time.Since(p.CapturedAt) > ProfileTTL
 }
 
-// HandshakeLayout caches the TLS handshake record layout for a target.
-// After first connection, subsequent connections can skip record analysis
-// and directly use the cached layout for output construction.
-type HandshakeLayout struct {
-	Fingerprint          uint64
-	ServerHelloLen       int
-	EncryptedExtensionsLen int
-	CertificateLen       int
-	CertificateVerifyLen int
-	FinishedLen          int
-	RecordLens           [7]int
-	RecordCount          int
-	CapturedAt           time.Time
-}
-
-// IsExpired checks if the layout has exceeded the TTL.
-func (l *HandshakeLayout) IsExpired() bool {
-	return time.Since(l.CapturedAt) > ProfileTTL
-}
-
-// ProfileVariant represents one possible TLS behavior for a target.
-// Multiple variants can exist for the same target when it exhibits
-// different TLS profiles (e.g., certificate rotation, ALPN negotiation changes).
-type ProfileVariant struct {
-	Fingerprint uint64
-	RecordLens  [7]int
-	CipherSuite uint16
-	ALPN        string
-	RecordCount int
-	CapturedAt  time.Time
-	LastHit     time.Time
-	HitCount    uint64
-	MissCount   uint64
-}
-
-// Weight returns the hit ratio for this variant.
-func (v *ProfileVariant) Weight() float64 {
-	total := v.HitCount + v.MissCount
-	if total == 0 {
-		return 0
-	}
-	return float64(v.HitCount) / float64(total)
-}
-
-// IsExpired checks if the variant has exceeded the TTL.
-func (v *ProfileVariant) IsExpired() bool {
-	return time.Since(v.CapturedAt) > ProfileTTL
-}
-
-// ProfileVariantSet manages multiple variants for a single target.
-type ProfileVariantSet struct {
-	mu       sync.RWMutex
-	variants []*ProfileVariant
-	maxSize  int
-}
-
-// NewProfileVariantSet creates a new variant set with a maximum size.
-func NewProfileVariantSet(maxSize int) *ProfileVariantSet {
-	return &ProfileVariantSet{
-		variants: make([]*ProfileVariant, 0, maxSize),
-		maxSize:  maxSize,
-	}
-}
-
-// FindByFingerprint returns the variant matching the given fingerprint.
-func (s *ProfileVariantSet) FindByFingerprint(fp uint64) *ProfileVariant {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, v := range s.variants {
-		if v.Fingerprint == fp {
-			return v
-		}
-	}
-	return nil
-}
-
-// FindBest returns the highest-weight variant that is not expired.
-func (s *ProfileVariantSet) FindBest() *ProfileVariant {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var best *ProfileVariant
-	for _, v := range s.variants {
-		if v.IsExpired() {
-			continue
-		}
-		if best == nil || v.Weight() > best.Weight() {
-			best = v
-		}
-	}
-	return best
-}
-
-// AddOrHit adds a new variant or increments hit count for an existing one.
-func (s *ProfileVariantSet) AddOrHit(fp uint64, recordLens [7]int, cipherSuite uint16, alpn string) *ProfileVariant {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Check if variant exists
-	for _, v := range s.variants {
-		if v.Fingerprint == fp {
-			v.HitCount++
-			v.LastHit = time.Now()
-			return v
-		}
-	}
-
-	// New variant — add if space available
-	if len(s.variants) >= s.maxSize {
-		// Evict lowest weight variant
-		s.evictLowest()
-	}
-
-	v := &ProfileVariant{
-		Fingerprint: fp,
-		RecordLens:  recordLens,
-		CipherSuite: cipherSuite,
-		ALPN:        alpn,
-		RecordCount: countNonZero(recordLens),
-		CapturedAt:  time.Now(),
-		LastHit:     time.Now(),
-		HitCount:    1,
-	}
-	s.variants = append(s.variants, v)
-	return v
-}
-
-// Miss increments miss count for the variant with matching fingerprint.
-func (s *ProfileVariantSet) Miss(fp uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, v := range s.variants {
-		if v.Fingerprint == fp {
-			v.MissCount++
-			return
-		}
-	}
-}
-
-// evictLowest removes the variant with the lowest weight.
-func (s *ProfileVariantSet) evictLowest() {
-	if len(s.variants) == 0 {
-		return
-	}
-	lowestIdx := 0
-	lowestWeight := s.variants[0].Weight()
-	for i, v := range s.variants[1:] {
-		if v.Weight() < lowestWeight {
-			lowestWeight = v.Weight()
-			lowestIdx = i + 1
-		}
-	}
-	s.variants = append(s.variants[:lowestIdx], s.variants[lowestIdx+1:]...)
-}
-
-// Len returns the number of variants.
-func (s *ProfileVariantSet) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.variants)
-}
-
-// CleanExpired removes expired variants.
-func (s *ProfileVariantSet) CleanExpired() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	before := len(s.variants)
-	s.variants = slices.DeleteFunc(s.variants, func(v *ProfileVariant) bool {
-		return v.IsExpired()
-	})
-	return before - len(s.variants)
-}
-
-// IsEmpty returns true if no variants exist.
-func (s *ProfileVariantSet) IsEmpty() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.variants) == 0
-}
-
-// countNonZero counts non-zero elements in an array.
-func countNonZero(arr [7]int) int {
-	n := 0
-	for _, v := range arr {
-		if v > 0 {
-			n++
-		}
-	}
-	return n
-}
-
 // targetFingerprintCache caches the target server's TLS capabilities.
 // Updated in background; reduces synchronous ProbeTarget frequency.
 type targetFingerprintCache struct {
@@ -427,68 +223,40 @@ type CacheStats struct {
 	MetaMiss           atomic.Uint64
 	FingerprintChanged atomic.Uint64
 	PollingSkipped     atomic.Uint64
-	LayoutHit          atomic.Uint64
-	LayoutMiss         atomic.Uint64
-	LayoutInvalidated  atomic.Uint64
 	ProfileInvalidated atomic.Uint64
 	ProfileEntries     atomic.Int64
-	LayoutEntries      atomic.Int64
-	VariantHit         atomic.Uint64
-	VariantMiss        atomic.Uint64
-	VariantEvicted     atomic.Uint64
 }
 
 // CacheReport generates a human-readable cache diagnostics report.
 func (s *CacheStats) CacheReport() string {
 	outputTotal := s.OutputHit.Load() + s.OutputMiss.Load()
 	metaTotal := s.MetaHit.Load() + s.MetaMiss.Load()
-	layoutTotal := s.LayoutHit.Load() + s.LayoutMiss.Load()
-	variantTotal := s.VariantHit.Load() + s.VariantMiss.Load()
 
-	var outputRate, metaRate, layoutRate, variantRate float64
+	var outputRate, metaRate float64
 	if outputTotal > 0 {
 		outputRate = float64(s.OutputHit.Load()) / float64(outputTotal) * 100
 	}
 	if metaTotal > 0 {
 		metaRate = float64(s.MetaHit.Load()) / float64(metaTotal) * 100
 	}
-	if layoutTotal > 0 {
-		layoutRate = float64(s.LayoutHit.Load()) / float64(layoutTotal) * 100
-	}
-	if variantTotal > 0 {
-		variantRate = float64(s.VariantHit.Load()) / float64(variantTotal) * 100
-	}
 
 	return fmt.Sprintf(`REALITY cache report:
-  layout:
-    hit:            %d
-    miss:           %d
-    hit rate:       %.1f%%
-    invalidated:    %d
   profile:
     hit:            %d
     miss:           %d
     hit rate:       %.1f%%
     invalidated:    %d
-  variant:
-    hit:            %d
-    miss:           %d
-    hit rate:       %.1f%%
-    evicted:        %d
   output:
     hit:            %d
     miss:           %d
     hit rate:       %.1f%%
   fingerprint changed: %d
   polling skipped:     %d
-  active profiles:     %d
-  active layouts:      %d`,
-		s.LayoutHit.Load(), s.LayoutMiss.Load(), layoutRate, s.LayoutInvalidated.Load(),
+  active profiles:     %d`,
 		s.MetaHit.Load(), s.MetaMiss.Load(), metaRate, s.ProfileInvalidated.Load(),
-		s.VariantHit.Load(), s.VariantMiss.Load(), variantRate, s.VariantEvicted.Load(),
 		s.OutputHit.Load(), s.OutputMiss.Load(), outputRate,
 		s.FingerprintChanged.Load(), s.PollingSkipped.Load(),
-		s.ProfileEntries.Load(), s.LayoutEntries.Load())
+		s.ProfileEntries.Load())
 }
 
 // bigEndianUint16 decodes a big-endian 16-bit unsigned integer from b.
@@ -710,18 +478,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		s2cSaved := (*s2cSavedPtr)[:0]
 		handshakeLen := 0
 
-		// Check pre-build cache first. If we have a cached profile for this
-		// target, we can skip reading from the target and use cached lengths.
-		// This eliminates the target connection latency for the handshake.
-		//
-		// NOTE: Server-side prebuild cache is intentionally disabled.
-		// The cached handshake lengths from the target don't reliably match
-		// the fake certificate sizes generated by hs.handshake(), causing
-		// negative padding in encrypt(). Always read from the target for
-		// server-side connections.
-		_ = defaultPrebuildCache
-
-		// No cached profile — read from target as usual and cache the result.
+		// Read from target and cache the result.
 	f:
 		for {
 			n, err := target.Read(buf)
@@ -899,25 +656,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				if config.Show {
 					fmt.Printf("REALITY remoteAddr: %v\tcached profile for %v\n", remoteAddr, config.Dest)
 				}
-			}
-
-			// v2: Cache handshake layout for fast path.
-			layout := &HandshakeLayout{
-				Fingerprint:            profile.Fingerprint,
-				ServerHelloLen:         usedLen[0],
-				EncryptedExtensionsLen: usedLen[2],
-				CertificateLen:         usedLen[3],
-				CertificateVerifyLen:   usedLen[4],
-				FinishedLen:            usedLen[5],
-				RecordLens:             usedLen,
-				RecordCount:            recordCount,
-				CapturedAt:             time.Now(),
-			}
-			if _, loaded := realityLayoutCache.LoadOrStore(profileKey, layout); !loaded {
-				cacheStats.LayoutEntries.Add(1)
-				if config.Show {
-					fmt.Printf("REALITY remoteAddr: %v\tcached layout for %v\n", remoteAddr, config.Dest)
-				}
 				// Persist new profile to disk.
 				if profileStore != nil {
 					go profileStore.Save()
@@ -926,19 +664,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				StartBackgroundRefreshForProfile(config.Dest, hs.clientHello.serverName)
 			}
 
-			// Also keep the target-based cache for ProbeTarget compatibility.
-			if hs.hello != nil {
-				tp := &TargetProfile{
-					HandshakeLen: hs.c.out.handshakeLen,
-					CipherSuite:  hs.hello.cipherSuite,
-					KeyGroup:     hs.hello.serverShare.group,
-					CapturedAt:   time.Now(),
-					TTL:          ProfileTTL,
-				}
-				defaultPrebuildCache.Store(config.Dest, tp)
-			}
-
-			// Phase 3: Cache target fingerprint for background updates.
+			// Cache target fingerprint for background updates.
 			fpKey := config.Dest + "|" + hs.clientHello.serverName
 			fp := &targetFingerprintCache{
 				CipherSuite:       hs.hello.cipherSuite,

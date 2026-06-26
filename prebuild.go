@@ -192,9 +192,9 @@ func ProbeTarget(ctx context.Context, config *Config) error {
 		}
 	}
 
-	if recordIndex > 0 {
-		defaultPrebuildCache.Store(config.Dest, profile)
-	}
+	// Store the result for later use by Server().
+	// Note: ProbeTarget is called for background probing; the actual profile
+	// caching happens in Server() after a successful handshake.
 	return nil
 }
 
