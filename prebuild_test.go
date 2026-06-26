@@ -280,6 +280,8 @@ func TestPersistentStoreAtomicWrite(t *testing.T) {
 }
 
 func TestBackgroundRefreshStartStop(t *testing.T) {
+	ResetGlobalRefreshManagerForTesting()
+	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	m := GetRefreshManager()
 	m.AddTarget("example.com:443", "example.com")
 	if m.GetStats() != 1 {
@@ -296,6 +298,8 @@ func TestBackgroundRefreshStartStop(t *testing.T) {
 }
 
 func TestBackgroundRefreshMultipleTargets(t *testing.T) {
+	ResetGlobalRefreshManagerForTesting()
+	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	m := GetRefreshManager()
 	for _, t := range []string{"a.com:443", "b.com:443", "c.com:443"} {
 		m.AddTarget(t, t)
@@ -309,6 +313,8 @@ func TestBackgroundRefreshMultipleTargets(t *testing.T) {
 }
 
 func TestBackgroundRefreshConcurrent(t *testing.T) {
+	ResetGlobalRefreshManagerForTesting()
+	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	m := GetRefreshManager()
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
@@ -319,16 +325,11 @@ func TestBackgroundRefreshConcurrent(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	m.mu.Lock()
-	for key := range m.targets {
-		m.targets[key].timer.Stop()
-		close(m.targets[key].stopCh)
-		delete(m.targets, key)
-	}
-	m.mu.Unlock()
 }
 
 func TestBackgroundRefreshFormatStats(t *testing.T) {
+	ResetGlobalRefreshManagerForTesting()
+	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	if s := FormatRefreshStats(); s == "" {
 		t.Error("empty")
 	}

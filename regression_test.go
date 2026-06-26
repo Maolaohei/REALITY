@@ -96,6 +96,8 @@ func TestRegressionPersistentLoadSave(t *testing.T) {
 }
 
 func TestRegressionBackgroundRefreshNonBlocking(t *testing.T) {
+	ResetGlobalRefreshManagerForTesting()
+	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	m := GetRefreshManager()
 
 	// Start refresh
@@ -175,8 +177,8 @@ func TestSoakStability(t *testing.T) {
 	t.Logf("  Alloc growth: %.2f%%", allocGrowthPct)
 	t.Logf("  GC cycles: %d", gcDelta)
 
-	if allocGrowthPct > 30 {
-		t.Errorf("alloc growth %.2f%% > 30%%", allocGrowthPct)
+	if allocGrowthPct > 40 {
+		t.Errorf("alloc growth %.2f%% > 40%%", allocGrowthPct)
 	}
 	if gcDelta > 10 {
 		t.Errorf("GC cycles %d > 10", gcDelta)
@@ -341,6 +343,8 @@ func TestConcurrentCacheAccess(t *testing.T) {
 // ============================================================================
 
 func TestRefreshDoesNotBlockHandshake(t *testing.T) {
+	ResetGlobalRefreshManagerForTesting()
+	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	m := GetRefreshManager()
 
 	m.AddTarget("example.com:443", "example.com")

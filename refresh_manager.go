@@ -346,3 +346,43 @@ func FormatRefreshStats() string {
 	}
 	return globalRefreshManager.FormatStats()
 }
+
+// ResetForTesting clears all internal state for unit test isolation.
+// Must only be called from test code.
+func (m *RefreshManager) ResetForTesting() {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.mu.Unlock()
+	m.wg.Wait()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, entry := range m.targets {
+		if entry.timer != nil {
+			entry.timer.Stop()
+		}
+		select {
+		case <-entry.stopCh:
+		default:
+			close(entry.stopCh)
+		}
+	}
+	m.targets = make(map[string]*refreshEntry)
+	m.started = false
+
+	for len(m.sem) > 0 {
+		<-m.sem
+	}
+}
+
+// ResetGlobalRefreshManagerForTesting resets the package-level singleton
+// so each test gets a fresh manager. Only for use in tests.
+func ResetGlobalRefreshManagerForTesting() {
+	if globalRefreshManager != nil {
+		globalRefreshManager.ResetForTesting()
+	}
+}
