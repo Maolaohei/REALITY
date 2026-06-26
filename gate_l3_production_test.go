@@ -134,7 +134,7 @@ func TestL3_Production_FallbackPath(t *testing.T) {
 	}
 
 	// 清空所有缓存
-	realityProfileCache = sync.Map{}
+	globalCacheManager = NewCacheManager()
 
 	t.Log("Caches cleared, testing cold-start fallback")
 

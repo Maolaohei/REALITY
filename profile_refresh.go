@@ -179,12 +179,11 @@ func (m *BackgroundRefreshManager) probeTarget(dest, serverName string) {
 
 	// Compare against cached profile.
 	key := dest + "|" + serverName
-	if val, ok := realityProfileCache.Load(key); ok {
-		profile := val.(*RealityProfile)
+	if profile := globalCacheManager.GetProfile(key); profile != nil {
 		if !profile.IsExpired() && profile.CipherSuite != hello.cipherSuite {
 			// Cipher suite changed — invalidate.
-			invalidateCache(dest, serverName)
-			cacheStats.FingerprintChanged.Add(1)
+			globalCacheManager.InvalidateProfile(key)
+			globalCacheManager.InvalidateFingerprint()
 			return
 		}
 	}
@@ -198,9 +197,7 @@ func (m *BackgroundRefreshManager) probeTarget(dest, serverName string) {
 // invalidateCache removes cached profiles for a target.
 func invalidateCache(dest, serverName string) {
 	profileKey := dest + "|" + serverName
-	if _, loaded := realityProfileCache.LoadAndDelete(profileKey); loaded {
-		cacheStats.ProfileInvalidated.Add(1)
-	}
+	globalCacheManager.InvalidateProfile(profileKey)
 }
 
 // GetRefreshStats returns statistics about background refresh.

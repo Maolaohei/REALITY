@@ -48,7 +48,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/juju/ratelimit"
@@ -167,17 +166,6 @@ var (
 		"New Session Ticket",
 	}
 
-	// realityProfileCache is the unified cache for REALITY handshake profiles.
-	// Stores record lengths, fingerprint, and metadata. TTL-based invalidation.
-	realityProfileCache sync.Map // map[string]*RealityProfile
-
-	// targetFingerprintCache stores target TLS capabilities. Updated in
-	// background to reduce synchronous ProbeTarget frequency.
-	targetFingerprint sync.Map // map[string]*targetFingerprintCache
-
-	// Cache statistics for diagnostics.
-	cacheStats CacheStats
-
 	// recordBufPool reuses 64 KiB buffers for Server() handshake reads,
 	// avoiding per-connection allocation of two 64 KiB slices.
 	recordBufPool = sync.Pool{
@@ -215,50 +203,6 @@ type targetFingerprintCache struct {
 	LastUpdated       time.Time
 }
 
-// CacheStats tracks cache hit/miss rates for diagnostics.
-type CacheStats struct {
-	OutputHit          atomic.Uint64
-	OutputMiss         atomic.Uint64
-	MetaHit            atomic.Uint64
-	MetaMiss           atomic.Uint64
-	FingerprintChanged atomic.Uint64
-	PollingSkipped     atomic.Uint64
-	ProfileInvalidated atomic.Uint64
-	ProfileEntries     atomic.Int64
-}
-
-// CacheReport generates a human-readable cache diagnostics report.
-func (s *CacheStats) CacheReport() string {
-	outputTotal := s.OutputHit.Load() + s.OutputMiss.Load()
-	metaTotal := s.MetaHit.Load() + s.MetaMiss.Load()
-
-	var outputRate, metaRate float64
-	if outputTotal > 0 {
-		outputRate = float64(s.OutputHit.Load()) / float64(outputTotal) * 100
-	}
-	if metaTotal > 0 {
-		metaRate = float64(s.MetaHit.Load()) / float64(metaTotal) * 100
-	}
-
-	return fmt.Sprintf(`REALITY cache report:
-  profile:
-    hit:            %d
-    miss:           %d
-    hit rate:       %.1f%%
-    invalidated:    %d
-  output:
-    hit:            %d
-    miss:           %d
-    hit rate:       %.1f%%
-  fingerprint changed: %d
-  polling skipped:     %d
-  active profiles:     %d`,
-		s.MetaHit.Load(), s.MetaMiss.Load(), metaRate, s.ProfileInvalidated.Load(),
-		s.OutputHit.Load(), s.OutputMiss.Load(), outputRate,
-		s.FingerprintChanged.Load(), s.PollingSkipped.Load(),
-		s.ProfileEntries.Load())
-}
-
 // bigEndianUint16 decodes a big-endian 16-bit unsigned integer from b.
 // This is equivalent to the previous Value() helper for 2-byte slices,
 // but uses the optimized encoding/binary path.
@@ -274,12 +218,8 @@ func verifyTargetUnchanged(dest, serverName string, hello *serverHelloMsg, clien
 		alpn = clientHello.alpnProtocols[0]
 	}
 	key := dest + "|" + serverName + "|" + alpn
-	val, ok := realityProfileCache.Load(key)
-	if !ok {
-		return false
-	}
-	profile := val.(*RealityProfile)
-	if profile.IsExpired() {
+	profile := globalCacheManager.GetProfile(key)
+	if profile == nil {
 		return false
 	}
 	if profile.CipherSuite != hello.cipherSuite {
@@ -651,8 +591,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				RecordCount:  recordCount,
 				CapturedAt:   time.Now(),
 			}
-			if _, loaded := realityProfileCache.LoadOrStore(profileKey, profile); !loaded {
-				cacheStats.ProfileEntries.Add(1)
+			if globalCacheManager.StoreProfile(profileKey, profile) {
 				if config.Show {
 					fmt.Printf("REALITY remoteAddr: %v\tcached profile for %v\n", remoteAddr, config.Dest)
 				}
@@ -674,11 +613,11 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				SignatureSchemes:  hs.clientHello.supportedSignatureAlgorithms,
 				LastUpdated:       time.Now(),
 			}
-			targetFingerprint.Store(fpKey, fp)
+			globalCacheManager.StoreFingerprint(fpKey, fp)
 
 			// Print cache statistics for diagnostics.
 			if config.Show {
-				fmt.Println(cacheStats.CacheReport())
+				fmt.Println(globalCacheManager.CacheReport())
 			}
 			break
 		}

@@ -171,27 +171,25 @@ func TestL6_ReleaseGate(t *testing.T) {
 	// --- L1: 单元测试 ---
 	t.Run("L1_Unit", func(t *testing.T) {
 		totalTests++
-		// 基本缓存逻辑
-		cacheStats = CacheStats{}
 		fp := computeFingerprint(0x1301, "h2", 100, 50)
 		key := "gate|test|h2"
 
-		realityProfileCache.Store(key, &RealityProfile{
+		globalCacheManager.StoreProfile(key, &RealityProfile{
 			RecordLens: [7]int{100, 6, 50}, Fingerprint: fp,
 			CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 		})
 
-		val, ok := realityProfileCache.Load(key)
-		if !ok {
+		p := globalCacheManager.GetProfile(key)
+		if p == nil {
 			t.Error("cache miss")
 			return
 		}
-		if val.(*RealityProfile).Fingerprint != fp {
+		if p.Fingerprint != fp {
 			t.Error("fingerprint mismatch")
 			return
 		}
 
-		realityProfileCache.Delete(key)
+		globalCacheManager.InvalidateProfile(key)
 		passedTests++
 		t.Log("  L1 PASS")
 	})
@@ -419,22 +417,19 @@ func TestL6_NoCacheInHandshakePath(t *testing.T) {
 
 // TestL6_DataPlaneIntegrityAfterCacheLoad 验证 cache 加载后数据面仍正常
 func TestL6_DataPlaneIntegrityAfterCacheLoad(t *testing.T) {
-	// 预填充 cache（模拟缓存命中场景）
 	key := "regression|microsoft.com|h2"
 	fp := computeFingerprint(0x1301, "h2", 127, 51)
 
-	realityProfileCache.Store(key, &RealityProfile{
+	globalCacheManager.StoreProfile(key, &RealityProfile{
 		RecordLens: [7]int{127, 6, 51}, Fingerprint: fp,
 		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
-	defer realityProfileCache.Delete(key)
+	defer globalCacheManager.InvalidateProfile(key)
 
-	// 验证 cache 存在
-	val, ok := realityProfileCache.Load(key)
-	if !ok {
+	p := globalCacheManager.GetProfile(key)
+	if p == nil {
 		t.Fatal("cache miss")
 	}
-	_ = val.(*RealityProfile)
 
 	// 连接并传输数据 — cache 不应影响数据流
 	ln, addr := newTestServer(t, echoHandler)
@@ -473,7 +468,7 @@ func TestL6_CacheEvictionDoesNotCorruptData(t *testing.T) {
 		// 写入 cache
 		key := fmt.Sprintf("evict|%d.example.com|h2", i%20)
 		fp := computeFingerprint(0x1301, "h2", 100+i, 50+i)
-		realityProfileCache.Store(key, &RealityProfile{
+		globalCacheManager.StoreProfile(key, &RealityProfile{
 			RecordLens: [7]int{100 + i, 6, 50 + i}, Fingerprint: fp,
 			CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 		})
@@ -499,6 +494,6 @@ func TestL6_CacheEvictionDoesNotCorruptData(t *testing.T) {
 	// 清理
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("evict|%d.example.com|h2", i)
-		realityProfileCache.Delete(key)
+		globalCacheManager.InvalidateProfile(key)
 	}
 }

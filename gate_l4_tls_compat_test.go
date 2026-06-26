@@ -120,33 +120,29 @@ func TestL4_SessionResumptionNoPostHandshake(t *testing.T) {
 
 // TestL4_CertRotation 等效证书轮换 — 不同 fingerprint 的 profile
 func TestL4_CertRotation(t *testing.T) {
-	cacheStats = CacheStats{}
-
 	key := "l4.rot|ms.com|h2"
 	fp1 := computeFingerprint(0x1301, "h2", 127, 51)
 
-	realityProfileCache.Store(key, &RealityProfile{
+	globalCacheManager.StoreProfile(key, &RealityProfile{
 		RecordLens: [7]int{127, 6, 51}, Fingerprint: fp1,
 		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
-	defer realityProfileCache.Delete(key)
+	defer globalCacheManager.InvalidateProfile(key)
 
-	// 证书轮换 → fingerprint 变化
-	fp2 := computeFingerprint(0x1301, "h2", 127, 60) // ext changed
+	fp2 := computeFingerprint(0x1301, "h2", 127, 60)
 
-	val, _ := realityProfileCache.Load(key)
-	if val.(*RealityProfile).Fingerprint == fp2 {
+	val := globalCacheManager.GetProfile(key)
+	if val.Fingerprint == fp2 {
 		t.Fatal("old profile should not match new fingerprint")
 	}
 
-	// 重新学习
-	realityProfileCache.Store(key, &RealityProfile{
+	globalCacheManager.StoreProfile(key, &RealityProfile{
 		RecordLens: [7]int{127, 6, 60}, Fingerprint: fp2,
 		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
 
-	val2, _ := realityProfileCache.Load(key)
-	if val2.(*RealityProfile).Fingerprint != fp2 {
+	val2 := globalCacheManager.GetProfile(key)
+	if val2.Fingerprint != fp2 {
 		t.Fatal("new profile should match")
 	}
 }

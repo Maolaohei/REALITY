@@ -16,21 +16,19 @@ import (
 // --- Cache: Profile ---
 
 func TestL1_ProfileStoreAndGet(t *testing.T) {
-	cacheStats = CacheStats{}
 	key := "l1|ms.com|h2"
 	fp := computeFingerprint(0x1301, "h2", 100, 50)
 
-	realityProfileCache.Store(key, &RealityProfile{
+	globalCacheManager.StoreProfile(key, &RealityProfile{
 		RecordLens: [7]int{100, 6, 50}, Fingerprint: fp,
 		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
-	defer realityProfileCache.Delete(key)
+	defer globalCacheManager.InvalidateProfile(key)
 
-	val, ok := realityProfileCache.Load(key)
-	if !ok {
+	p := globalCacheManager.GetProfile(key)
+	if p == nil {
 		t.Fatal("cache miss")
 	}
-	p := val.(*RealityProfile)
 	if p.Fingerprint != fp {
 		t.Errorf("fp = %d, want %d", p.Fingerprint, fp)
 	}
@@ -52,33 +50,31 @@ func TestL1_ProfileExpiry(t *testing.T) {
 }
 
 func TestL1_ProfileInvalidation(t *testing.T) {
-	cacheStats = CacheStats{}
 	key := "l1.inv|ms.com|h2"
 
-	realityProfileCache.Store(key, &RealityProfile{
+	globalCacheManager.StoreProfile(key, &RealityProfile{
 		RecordLens: [7]int{100, 6, 50}, Fingerprint: 111,
 		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
 
-	realityProfileCache.Delete(key)
-	if _, ok := realityProfileCache.Load(key); ok {
+	globalCacheManager.InvalidateProfile(key)
+	if globalCacheManager.GetProfile(key) != nil {
 		t.Fatal("should be deleted")
 	}
 }
 
 func TestL1_ProfileIsolation(t *testing.T) {
-	cacheStats = CacheStats{}
 	k1 := "l1.iso|ms.com|h2"
 	k2 := "l1.iso|apple.com|h2"
 
-	realityProfileCache.Store(k1, &RealityProfile{Fingerprint: 100, CapturedAt: time.Now()})
-	realityProfileCache.Store(k2, &RealityProfile{Fingerprint: 200, CapturedAt: time.Now()})
-	defer realityProfileCache.Delete(k1)
-	defer realityProfileCache.Delete(k2)
+	globalCacheManager.StoreProfile(k1, &RealityProfile{Fingerprint: 100, CapturedAt: time.Now()})
+	globalCacheManager.StoreProfile(k2, &RealityProfile{Fingerprint: 200, CapturedAt: time.Now()})
+	defer globalCacheManager.InvalidateProfile(k1)
+	defer globalCacheManager.InvalidateProfile(k2)
 
-	v1, _ := realityProfileCache.Load(k1)
-	v2, _ := realityProfileCache.Load(k2)
-	if v1.(*RealityProfile).Fingerprint == v2.(*RealityProfile).Fingerprint {
+	v1 := globalCacheManager.GetProfile(k1)
+	v2 := globalCacheManager.GetProfile(k2)
+	if v1.Fingerprint == v2.Fingerprint {
 		t.Fatal("profiles should be isolated")
 	}
 }
@@ -138,12 +134,12 @@ func TestL1_ConcurrentCacheAccess(t *testing.T) {
 				key := "l1.c." + string(rune('A'+id%10)) + "|" + string(rune('0'+j%10)) + "|h2"
 				fp := computeFingerprint(0x1301, "h2", 1200+id%10, 40+j%10)
 
-				realityProfileCache.LoadOrStore(key, &RealityProfile{
+				globalCacheManager.StoreProfile(key, &RealityProfile{
 					RecordLens: [7]int{1200 + id%10, 6, 40 + j%10},
 					Fingerprint: fp, CipherSuite: 0x1301, ALPN: "h2",
 					CapturedAt: time.Now(),
 				})
-				realityProfileCache.Delete(key)
+				globalCacheManager.InvalidateProfile(key)
 			}
 		}(i)
 	}
@@ -156,20 +152,14 @@ func TestL1_ConcurrentCacheAccess(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		key := "l1.c." + string(rune('A'+i)) + "|0|h2"
-		realityProfileCache.Delete(key)
+		globalCacheManager.InvalidateProfile(key)
 	}
 }
 
 // --- Cache Report ---
 
 func TestL1_CacheReport(t *testing.T) {
-	cacheStats = CacheStats{}
-	cacheStats.OutputHit.Add(10)
-	cacheStats.MetaHit.Add(8)
-	cacheStats.MetaMiss.Add(3)
-	cacheStats.FingerprintChanged.Add(4)
-
-	report := cacheStats.CacheReport()
+	report := globalCacheManager.CacheReport()
 	if len(report) == 0 {
 		t.Fatal("report should not be empty")
 	}

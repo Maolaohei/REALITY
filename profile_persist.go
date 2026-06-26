@@ -66,9 +66,8 @@ func (s *PersistentProfileStore) Save() {
 	}
 
 	// Collect profiles
-	realityProfileCache.Range(func(key, val any) bool {
-		p := val.(*RealityProfile)
-		file.Profiles[key.(string)] = &ProfileEntry{
+	globalCacheManager.RangeProfiles(func(key string, p *RealityProfile) bool {
+		file.Profiles[key] = &ProfileEntry{
 			RecordLens:  p.RecordLens,
 			Fingerprint: p.Fingerprint,
 			CipherSuite: p.CipherSuite,
@@ -119,8 +118,7 @@ func (s *PersistentProfileStore) load() {
 			RecordCount: entry.RecordCount,
 			CapturedAt:  capturedAt,
 		}
-		realityProfileCache.Store(key, profile)
-		cacheStats.ProfileEntries.Add(1)
+		globalCacheManager.StoreProfile(key, profile)
 	}
 }
 
