@@ -38,7 +38,7 @@ func TestRegressionProfileReuse(t *testing.T) {
 		}
 
 		for i := 0; i < 10; i++ {
-			p := globalCacheManager.GetProfile(tgt.key)
+			p, _ := globalCacheManager.GetProfile(tgt.key)
 			if p == nil {
 				t.Fatalf("%s connection %d: cache miss", tgt.key, i+2)
 			}
@@ -49,7 +49,7 @@ func TestRegressionProfileReuse(t *testing.T) {
 	}
 
 	for _, tgt := range targets {
-		p := globalCacheManager.GetProfile(tgt.key)
+		p, _ := globalCacheManager.GetProfile(tgt.key)
 		if p == nil {
 			t.Errorf("%s: entry not found", tgt.key)
 			continue
@@ -84,7 +84,7 @@ func TestRegressionPersistentLoadSave(t *testing.T) {
 	profileStore = nil
 	InitPersistentStore(dir)
 
-	p := globalCacheManager.GetProfile("regress.persist|microsoft.com|h2")
+	p, _ := globalCacheManager.GetProfile("regress.persist|microsoft.com|h2")
 	if p == nil {
 		t.Fatal("profile not loaded after restart")
 	}
@@ -147,7 +147,7 @@ func TestSoakStability(t *testing.T) {
 		key := fmt.Sprintf("soak.stability%d.example.com|soak.stability%d.example.com|h2", targetIdx, targetIdx)
 		fp := computeFingerprint(0x1301, "h2", 1200+targetIdx, 40+targetIdx)
 
-		p := globalCacheManager.GetProfile(key)
+		p, _ := globalCacheManager.GetProfile(key)
 		if p != nil {
 			if p.Fingerprint != fp {
 				t.Fatalf("connection %d: fp mismatch", i)
@@ -202,7 +202,7 @@ func TestDriftCipherSuiteChange(t *testing.T) {
 
 	currentFP := computeFingerprint(0x1302, "h2", 127, 51)
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p.Fingerprint == currentFP {
 		t.Fatal("old profile should not match new CipherSuite")
 	}
@@ -214,7 +214,7 @@ func TestDriftCipherSuiteChange(t *testing.T) {
 		CipherSuite:  0x1302, ALPN: "h2", CapturedAt: time.Now(),
 	})
 
-	p2 := globalCacheManager.GetProfile(key)
+	p2, _ := globalCacheManager.GetProfile(key)
 	if p2.Fingerprint != currentFP {
 		t.Fatal("new profile should match")
 	}
@@ -234,7 +234,7 @@ func TestDriftCertRotation(t *testing.T) {
 	fp2 := computeFingerprint(0x1301, "h2", 127, 50)
 	currentFP := fp2
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p.Fingerprint == currentFP {
 		t.Fatal("old profile should not match after cert rotation")
 	}
@@ -246,7 +246,7 @@ func TestDriftCertRotation(t *testing.T) {
 		CipherSuite:  0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
 
-	p2 := globalCacheManager.GetProfile(key)
+	p2, _ := globalCacheManager.GetProfile(key)
 	if p2.Fingerprint != currentFP {
 		t.Fatal("re-learned profile should match")
 	}
@@ -265,7 +265,7 @@ func TestDriftALPNChange(t *testing.T) {
 
 	fp2 := computeFingerprint(0x1301, "http/1.1", 127, 51)
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p.Fingerprint == fp2 {
 		t.Fatal("old profile should not match after ALPN change")
 	}
@@ -277,7 +277,7 @@ func TestDriftALPNChange(t *testing.T) {
 		CipherSuite:  0x1301, ALPN: "http/1.1", CapturedAt: time.Now(),
 	})
 
-	p2 := globalCacheManager.GetProfile(key)
+	p2, _ := globalCacheManager.GetProfile(key)
 	if p2.Fingerprint != fp2 {
 		t.Fatal("re-learned profile should match")
 	}
@@ -312,7 +312,7 @@ func TestConcurrentCacheAccess(t *testing.T) {
 				fp := computeFingerprint(0x1301, "h2", 1200+id%10, 40+id%10)
 
 				// Concurrent read/write
-				val := globalCacheManager.GetProfile(key)
+				val, _ := globalCacheManager.GetProfile(key)
 				if val == nil {
 					globalCacheManager.StoreProfile(key, &RealityProfile{
 						RecordLens:   [7]int{1200 + id%10, 6, 40 + id%10},
@@ -372,7 +372,7 @@ func TestFailSafeTimeoutRecovery(t *testing.T) {
 		CipherSuite:  0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p == nil {
 		t.Fatal("cache miss on existing profile")
 	}

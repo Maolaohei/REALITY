@@ -179,6 +179,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", dest)
 	if err != nil {
+		globalCacheManager.MarkNegative(dest)
 		return false
 	}
 	defer conn.Close()
@@ -190,33 +191,39 @@ func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
 	if err != nil {
+		globalCacheManager.MarkNegative(dest)
 		return false
 	}
 	s2cSaved = append(s2cSaved, buf[:n]...)
 
 	// Validate ServerHello record.
 	if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 {
+		globalCacheManager.MarkNegative(dest)
 		return false
 	}
 	if recordType(s2cSaved[0]) != recordTypeHandshake || s2cSaved[5] != typeServerHello {
+		globalCacheManager.MarkNegative(dest)
 		return false
 	}
 	serverHelloLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
 	if serverHelloLen > maxTLSRecordPayload || serverHelloLen > len(s2cSaved) {
+		globalCacheManager.MarkNegative(dest)
 		return false
 	}
 
 	hello := new(serverHelloMsg)
 	if !hello.unmarshal(s2cSaved[recordHeaderLen:serverHelloLen]) {
+		globalCacheManager.MarkNegative(dest)
 		return false
 	}
 
 	// Quick check: compare cipherSuite only.
 	key := dest
-	profile := globalCacheManager.GetProfile(key)
+	profile, _ := globalCacheManager.GetProfile(key)
 	if profile != nil && !profile.IsExpired() {
 		if profile.CipherSuite == hello.cipherSuite {
 			// CipherSuite unchanged — skip Phase B (fast path).
+			globalCacheManager.MarkStale(key)
 			return true
 		}
 		// CipherSuite changed — need Phase B to confirm.
@@ -232,6 +239,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 		for recordIndex < 7 && len(s2cSaved) > recordHeaderLen {
 			handshakeLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
 			if handshakeLen > maxTLSRecordPayload {
+				globalCacheManager.MarkNegative(key)
 				return false
 			}
 			if len(s2cSaved) < handshakeLen {
@@ -257,14 +265,17 @@ func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 		if profile.CipherSuite != hello.cipherSuite {
 			globalCacheManager.InvalidateProfile(key)
 			globalCacheManager.InvalidateFingerprint()
+			globalCacheManager.MarkNegative(key)
 			return true
 		}
 		if !recordLensMatch(profile.RecordLens, recordLens) {
 			globalCacheManager.InvalidateProfile(key)
+			globalCacheManager.MarkNegative(key)
 			return true
 		}
 	}
 
+	globalCacheManager.MarkStale(key)
 	return true
 }
 

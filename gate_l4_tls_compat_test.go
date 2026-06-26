@@ -131,7 +131,7 @@ func TestL4_CertRotation(t *testing.T) {
 
 	fp2 := computeFingerprint(0x1301, "h2", 127, 60)
 
-	val := globalCacheManager.GetProfile(key)
+	val, _ := globalCacheManager.GetProfile(key)
 	if val.Fingerprint == fp2 {
 		t.Fatal("old profile should not match new fingerprint")
 	}
@@ -141,7 +141,7 @@ func TestL4_CertRotation(t *testing.T) {
 		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
 
-	val2 := globalCacheManager.GetProfile(key)
+	val2, _ := globalCacheManager.GetProfile(key)
 	if val2.Fingerprint != fp2 {
 		t.Fatal("new profile should match")
 	}

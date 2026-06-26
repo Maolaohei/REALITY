@@ -179,7 +179,7 @@ func TestL6_ReleaseGate(t *testing.T) {
 			CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 		})
 
-		p := globalCacheManager.GetProfile(key)
+		p, _ := globalCacheManager.GetProfile(key)
 		if p == nil {
 			t.Error("cache miss")
 			return
@@ -426,7 +426,7 @@ func TestL6_DataPlaneIntegrityAfterCacheLoad(t *testing.T) {
 	})
 	defer globalCacheManager.InvalidateProfile(key)
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p == nil {
 		t.Fatal("cache miss")
 	}

@@ -365,7 +365,7 @@ func TestPrebuildCache_LRUAccessUpdates(t *testing.T) {
 	// Access "a" to make it recently used
 	cache.Get("a")
 
-	// Add "d" — should evict "b" (least recently accessed), not "a"
+	// Add "d" 鈥?should evict "b" (least recently accessed), not "a"
 	cache.Store("d", &TargetProfile{HandshakeLen: [7]int{4}, CapturedAt: time.Now(), TTL: time.Minute})
 
 	if got := cache.Get("a"); got == nil {
@@ -388,7 +388,7 @@ func TestPrebuildCache_ReplaceDoesNotEvict(t *testing.T) {
 	cache.Store("a", &TargetProfile{HandshakeLen: [7]int{1}, CapturedAt: time.Now(), TTL: time.Minute})
 	cache.Store("b", &TargetProfile{HandshakeLen: [7]int{2}, CapturedAt: time.Now(), TTL: time.Minute})
 
-	// Replace "a" — should NOT trigger eviction since key already exists
+	// Replace "a" 鈥?should NOT trigger eviction since key already exists
 	cache.Store("a", &TargetProfile{HandshakeLen: [7]int{10}, CapturedAt: time.Now(), TTL: time.Minute})
 
 	if cache.Len() != 2 {
@@ -551,7 +551,7 @@ func TestEnsureAutoProbe_Idempotent(t *testing.T) {
 		Dest:        "127.0.0.1:19998",
 	}
 
-	// Call twice — should only create one entry
+	// Call twice 鈥?should only create one entry
 	ensureAutoProbe(config)
 	ensureAutoProbe(config)
 
@@ -700,7 +700,7 @@ func TestRealityProfileCacheHit(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, profile)
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p == nil {
 		t.Fatal("expected profile in cache")
 	}
@@ -728,7 +728,7 @@ func TestRealityProfileCacheMiss(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, profile)
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p == nil {
 		t.Fatal("expected profile in cache")
 	}
@@ -772,7 +772,7 @@ func TestRealityProfileExpiry(t *testing.T) {
 
 	// Simulate cache with expired entry
 	globalCacheManager.StoreProfile(key, profile)
-	stored := globalCacheManager.GetProfile(key)
+	stored, _ := globalCacheManager.GetProfile(key)
 	if stored != nil {
 		t.Error("expired profile should not be returned by GetProfile")
 	}
@@ -843,9 +843,9 @@ func TestProfileIsolation(t *testing.T) {
 		RecordLens: [7]int{1400}, Fingerprint: fpGH, CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
 
-	pMS := globalCacheManager.GetProfile(microsoftKey)
-	pGoogle := globalCacheManager.GetProfile(googleKey)
-	pGH := globalCacheManager.GetProfile(githubKey)
+	pMS, _ := globalCacheManager.GetProfile(microsoftKey)
+	pGoogle, _ := globalCacheManager.GetProfile(googleKey)
+	pGH, _ := globalCacheManager.GetProfile(githubKey)
 
 	if pMS.Fingerprint == pGoogle.Fingerprint {
 		t.Error("microsoft and google should have different fingerprints")
@@ -891,7 +891,7 @@ func TestRealityProfileCacheConcurrentHit(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				p := globalCacheManager.GetProfile(key)
+				p, _ := globalCacheManager.GetProfile(key)
 				if p == nil {
 					t.Errorf("goroutine %d iteration %d: key not found", id, j)
 					return
@@ -920,7 +920,7 @@ func TestTargetChangeInvalidation(t *testing.T) {
 
 	currentFP := computeFingerprint(0x1302, "h2", 1215, 41)
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p.Fingerprint == currentFP {
 		t.Error("fingerprints should NOT match after target change")
 	}
@@ -933,7 +933,7 @@ func TestTargetChangeInvalidation(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, newProfile)
 
-	p2 := globalCacheManager.GetProfile(key)
+	p2, _ := globalCacheManager.GetProfile(key)
 	if p2.Fingerprint != currentFP {
 		t.Error("new profile should match current fingerprint")
 	}
@@ -951,7 +951,7 @@ func BenchmarkRealityProfileCacheHit(b *testing.B) {
 	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p := globalCacheManager.GetProfile(key)
+		p, _ := globalCacheManager.GetProfile(key)
 		if p != nil {
 			_ = p.Fingerprint == fp
 		}
@@ -963,7 +963,7 @@ func BenchmarkRealityProfileCacheHit(b *testing.B) {
 func BenchmarkRealityProfileCacheMiss(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = globalCacheManager.GetProfile("nonexistent.nonexistent.nonexistent")
+		_, _ = globalCacheManager.GetProfile("nonexistent.nonexistent.nonexistent")
 	}
 }
 
@@ -991,7 +991,7 @@ func TestReality24HourSimulation(t *testing.T) {
 		fp := computeFingerprint(0x1301, "h2", 1200+destIdx, 40+destIdx)
 
 		if i > uniqueDests && i%5 != 0 {
-			p := globalCacheManager.GetProfile(dest)
+			p, _ := globalCacheManager.GetProfile(dest)
 			if p != nil {
 				if p.Fingerprint != fp {
 					t.Errorf("connection %d: fingerprint mismatch for %s", i, dest)
@@ -1032,7 +1032,7 @@ func TestRealityProfileInvalidation(t *testing.T) {
 	key := "invalidation.test|microsoft.com|h2"
 	fingerprintA := computeFingerprint(0x1301, "h2", 1215, 41)
 
-	stored := globalCacheManager.GetProfile(key)
+	stored, _ := globalCacheManager.GetProfile(key)
 	if stored != nil {
 		t.Fatal("expected no cache entry before first connection")
 	}
@@ -1047,7 +1047,7 @@ func TestRealityProfileInvalidation(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, profile)
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	currentFP := computeFingerprint(0x1301, "h2", 1215, 41)
 	if p.Fingerprint != currentFP {
 		t.Fatalf("fingerprint mismatch: cached=%d current=%d", p.Fingerprint, currentFP)
@@ -1055,7 +1055,7 @@ func TestRealityProfileInvalidation(t *testing.T) {
 
 	p.Fingerprint = computeFingerprint(0x1302, "h2", 1215, 41)
 
-	val2 := globalCacheManager.GetProfile(key)
+	val2, _ := globalCacheManager.GetProfile(key)
 	changedFP := computeFingerprint(0x1301, "h2", 1215, 41)
 	if val2.Fingerprint == changedFP {
 		t.Fatal("fingerprint should NOT match after target change")
@@ -1073,7 +1073,7 @@ func TestRealityProfileInvalidation(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, newProfile)
 
-	p3 := globalCacheManager.GetProfile(key)
+	p3, _ := globalCacheManager.GetProfile(key)
 	if p3.Fingerprint != changedFP {
 		t.Fatalf("fingerprint mismatch after re-learn: cached=%d current=%d", p3.Fingerprint, changedFP)
 	}
@@ -1094,13 +1094,13 @@ func TestRealityProfileInvalidationByExpiry(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, expiredProfile)
 
-	val := globalCacheManager.GetProfile(key)
+	val, _ := globalCacheManager.GetProfile(key)
 	if val != nil {
 		t.Fatal("expired profile should be auto-deleted by GetProfile")
 	}
 	globalCacheManager.InvalidateProfile(key)
 
-	val2 := globalCacheManager.GetProfile(key)
+	val2, _ := globalCacheManager.GetProfile(key)
 	if val2 != nil {
 		t.Fatal("expired entry should have been deleted")
 	}
@@ -1114,7 +1114,7 @@ func TestRealityProfileInvalidationByExpiry(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, freshProfile)
 
-	p3 := globalCacheManager.GetProfile(key)
+	p3, _ := globalCacheManager.GetProfile(key)
 	if p3.IsExpired() {
 		t.Fatal("fresh profile should NOT be expired")
 	}
@@ -1148,7 +1148,7 @@ func TestRealityProfileInvalidationByCipherSuiteChange(t *testing.T) {
 		t.Fatal("different CipherSuite should produce different fingerprint")
 	}
 
-	val := globalCacheManager.GetProfile(key)
+	val, _ := globalCacheManager.GetProfile(key)
 	if val.Fingerprint == currentFP2 {
 		t.Fatal("old profile fingerprint should NOT match new CipherSuite")
 	}
@@ -1164,7 +1164,7 @@ func TestRealityProfileInvalidationByCipherSuiteChange(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, newProfile)
 
-	p2 := globalCacheManager.GetProfile(key)
+	p2, _ := globalCacheManager.GetProfile(key)
 	if p2.Fingerprint != currentFP2 {
 		t.Fatal("new profile should match current fingerprint")
 	}
@@ -1173,7 +1173,7 @@ func TestRealityProfileInvalidationByCipherSuiteChange(t *testing.T) {
 }
 
 // ============================================================================
-// A3: Soak Test — 1000 connections, memory stability
+// A3: Soak Test 鈥?1000 connections, memory stability
 // ============================================================================
 
 func TestRealityProfileSoak(t *testing.T) {
@@ -1198,7 +1198,7 @@ func TestRealityProfileSoak(t *testing.T) {
 		dest := fmt.Sprintf("soak%d.example.com|soak%d.example.com|h2", destIdx, destIdx)
 		fp := computeFingerprint(0x1301, "h2", 1200+destIdx, 40+destIdx)
 
-		p := globalCacheManager.GetProfile(dest)
+		p, _ := globalCacheManager.GetProfile(dest)
 		if p != nil {
 			if p.Fingerprint != fp {
 				t.Fatalf("connection %d: fingerprint mismatch for %s", i, dest)
@@ -1245,7 +1245,7 @@ func TestRealityProfileSoak(t *testing.T) {
 }
 
 // ============================================================================
-// A4: Benchmark — Cache Hit vs Miss
+// A4: Benchmark 鈥?Cache Hit vs Miss
 // ============================================================================
 
 func BenchmarkRealityCacheHit(b *testing.B) {
@@ -1257,7 +1257,7 @@ func BenchmarkRealityCacheHit(b *testing.B) {
 	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p := globalCacheManager.GetProfile(key)
+		p, _ := globalCacheManager.GetProfile(key)
 		if p != nil {
 			_ = p.Fingerprint == fp
 		}
@@ -1269,7 +1269,7 @@ func BenchmarkRealityCacheHit(b *testing.B) {
 func BenchmarkRealityCacheMiss(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = globalCacheManager.GetProfile("bench.miss.nonexistent|nonexistent.com|h2")
+		_, _ = globalCacheManager.GetProfile("bench.miss.nonexistent|nonexistent.com|h2")
 	}
 }
 
@@ -1291,7 +1291,7 @@ func BenchmarkRealityFullCycle(b *testing.B) {
 				CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 			})
 			b.StartTimer()
-			p := globalCacheManager.GetProfile(key)
+			p, _ := globalCacheManager.GetProfile(key)
 			if p != nil {
 				currentFP := computeFingerprint(p.CipherSuite, p.ALPN, p.RecordLens[0], p.RecordLens[2])
 				_ = p.Fingerprint == currentFP
@@ -1305,7 +1305,7 @@ func BenchmarkRealityFullCycle(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			key := fmt.Sprintf("bench.miss.%d|example.com|h2", i)
 			fp := computeFingerprint(0x1301, "h2", 1215, 41)
-			p := globalCacheManager.GetProfile(key)
+			p, _ := globalCacheManager.GetProfile(key)
 			if p == nil {
 				globalCacheManager.StoreProfile(key, &RealityProfile{
 					RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
@@ -1345,7 +1345,7 @@ func TestPersistentStoreSaveLoad(t *testing.T) {
 	profileStore = nil
 	InitPersistentStore(dir)
 
-	p := globalCacheManager.GetProfile("persist.test|microsoft.com|h2")
+	p, _ := globalCacheManager.GetProfile("persist.test|microsoft.com|h2")
 	if p == nil {
 		t.Fatal("profile not loaded from disk")
 	}
@@ -1383,7 +1383,7 @@ func TestPersistentStoreSkipsExpired(t *testing.T) {
 	InitPersistentStore(dir)
 
 	// Should NOT be loaded (expired)
-	if globalCacheManager.GetProfile("persist.expired|microsoft.com|h2") != nil {
+	if p, _ := globalCacheManager.GetProfile("persist.expired|microsoft.com|h2"); p != nil {
 		t.Error("expired profile should not be loaded from disk")
 	}
 
@@ -1447,7 +1447,7 @@ func TestBackgroundRefreshStartStop(t *testing.T) {
 		t.Errorf("active targets = %d, want 1", active)
 	}
 
-	// Start again — should be idempotent
+	// Start again 鈥?should be idempotent
 	m.AddTarget("example.com:443", "example.com")
 	active = m.GetStats()
 	if active != 1 {

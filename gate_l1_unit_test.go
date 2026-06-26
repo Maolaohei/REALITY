@@ -25,7 +25,7 @@ func TestL1_ProfileStoreAndGet(t *testing.T) {
 	})
 	defer globalCacheManager.InvalidateProfile(key)
 
-	p := globalCacheManager.GetProfile(key)
+	p, _ := globalCacheManager.GetProfile(key)
 	if p == nil {
 		t.Fatal("cache miss")
 	}
@@ -58,7 +58,7 @@ func TestL1_ProfileInvalidation(t *testing.T) {
 	})
 
 	globalCacheManager.InvalidateProfile(key)
-	if globalCacheManager.GetProfile(key) != nil {
+	if p, _ := globalCacheManager.GetProfile(key); p != nil {
 		t.Fatal("should be deleted")
 	}
 }
@@ -72,8 +72,8 @@ func TestL1_ProfileIsolation(t *testing.T) {
 	defer globalCacheManager.InvalidateProfile(k1)
 	defer globalCacheManager.InvalidateProfile(k2)
 
-	v1 := globalCacheManager.GetProfile(k1)
-	v2 := globalCacheManager.GetProfile(k2)
+	v1, _ := globalCacheManager.GetProfile(k1)
+	v2, _ := globalCacheManager.GetProfile(k2)
 	if v1.Fingerprint == v2.Fingerprint {
 		t.Fatal("profiles should be isolated")
 	}

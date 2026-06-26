@@ -18,13 +18,13 @@ type PersistentProfileStore struct {
 
 // ProfileFile is the JSON structure for persistent storage.
 type ProfileFile struct {
-	Version  int                       `json:"version"`
-	SavedAt  time.Time                 `json:"saved_at"`
-	Profiles map[string]*ProfileEntry  `json:"profiles"`
+	Version  int                                  `json:"version"`
+	SavedAt  time.Time                            `json:"saved_at"`
+	Profiles map[string]*PersistProfileEntry      `json:"profiles"`
 }
 
-// ProfileEntry is the serialized form of RealityProfile.
-type ProfileEntry struct {
+// PersistProfileEntry is the serialized form of RealityProfile for disk storage.
+type PersistProfileEntry struct {
 	RecordLens  [7]int   `json:"record_lens"`
 	Fingerprint uint64   `json:"fingerprint"`
 	CipherSuite uint16   `json:"cipher_suite"`
@@ -66,13 +66,13 @@ func (s *PersistentProfileStore) Save() {
 	file := ProfileFile{
 		Version:  1,
 		SavedAt:  time.Now(),
-		Profiles: make(map[string]*ProfileEntry),
+		Profiles: make(map[string]*PersistProfileEntry),
 	}
 
 	// Take a snapshot for consistent serialization.
 	snapshot := globalCacheManager.SnapshotProfiles()
 	for key, p := range snapshot {
-		file.Profiles[key] = &ProfileEntry{
+		file.Profiles[key] = &PersistProfileEntry{
 			RecordLens:  p.RecordLens,
 			Fingerprint: p.Fingerprint,
 			CipherSuite: p.CipherSuite,

@@ -218,7 +218,7 @@ func verifyTargetUnchanged(dest, serverName string, hello *serverHelloMsg, clien
 		alpn = clientHello.alpnProtocols[0]
 	}
 	key := dest + "|" + serverName + "|" + alpn
-	profile := globalCacheManager.GetProfile(key)
+	profile, _ := globalCacheManager.GetProfile(key)
 	if profile == nil {
 		return false
 	}
