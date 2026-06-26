@@ -2,9 +2,7 @@ package reality
 
 import (
 	"context"
-	"fmt"
 	"math"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -206,22 +204,7 @@ var (
 	// probeOnces tracks per-destination sync.Once to ensure the initial
 	// probe runs exactly once.
 	probeOnces sync.Map // map[string]*sync.Once
-	// probeStops tracks cancel functions for background refresh goroutines.
-	probeStops sync.Map // map[string]context.CancelFunc
-	// probeRefreshMin/Max define the random range for refresh intervals.
-	// Randomized to avoid predictable timing patterns that could be
-	// detected by traffic analysis. Must stay within the 30-min TTL.
-	probeRefreshMin = 20 * time.Minute
-	probeRefreshMax = 30 * time.Minute
-	// probeTimeout is the maximum time for a single probe operation.
-	probeTimeout = 10 * time.Second
 )
-
-// probeRefreshInterval returns a random duration between probeRefreshMin
-// and probeRefreshMax. Each call produces a different value.
-func probeRefreshInterval() time.Duration {
-	return probeRefreshMin + time.Duration(rand.Int63n(int64(probeRefreshMax-probeRefreshMin)))
-}
 
 // probeConfig holds the values needed to probe a target, copied from
 // Config to avoid retaining a pointer to the caller's mutable Config.
@@ -242,77 +225,31 @@ func newProbeConfig(config *Config) probeConfig {
 }
 
 // ensureAutoProbe ensures that the target is probed on first connection
-// and a background refresh goroutine is running. Called from Server().
+// and registered with the background refresh manager. Called from Server().
 func ensureAutoProbe(config *Config) {
 	dest := config.Dest
 	if dest == "" {
-		return // skip auto-probe for empty destinations
+		return
 	}
-
-	// Copy config values to avoid capturing a mutable pointer.
-	pc := newProbeConfig(config)
 
 	onceVal, _ := probeOnces.LoadOrStore(dest, &sync.Once{})
 	once := onceVal.(*sync.Once)
 
 	once.Do(func() {
-		// Synchronous initial probe — the first connection benefits
-		// immediately from the cache without waiting for a goroutine.
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-			defer cancel()
-			if err := ProbeTarget(ctx, &Config{
-				DialContext: pc.dialContext,
-				Show:        pc.show,
-				Dest:        pc.dest,
-				Type:        pc.typ,
-			}); err != nil && pc.show {
-				fmt.Printf("REALITY prebuild: initial probe for %v failed: %v\n", pc.dest, err)
-			}
-		}()
-
-		// Start background refresh goroutine.
-		ctx, cancel := context.WithCancel(context.Background())
-		probeStops.Store(dest, cancel)
-		go func() {
-			defer func() {
-				// Clean up sync.Map entries to prevent memory leak.
-				probeStops.Delete(dest)
-				probeOnces.Delete(dest)
-			}()
-			// Use manual timer with random intervals to avoid
-			// predictable timing patterns.
-			timer := time.NewTimer(probeRefreshInterval())
-			defer timer.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-timer.C:
-					probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
-					if err := ProbeTarget(probeCtx, &Config{
-						DialContext: pc.dialContext,
-						Show:        pc.show,
-						Dest:        pc.dest,
-						Type:        pc.typ,
-					}); err != nil && pc.show {
-						fmt.Printf("REALITY prebuild: refresh probe for %v failed: %v\n", pc.dest, err)
-					}
-					probeCancel()
-					// Reset with a new random interval.
-					timer.Reset(probeRefreshInterval())
-				}
-			}
-		}()
+		// Register with the unified refresh manager.
+		m := GetRefreshManager()
+		if !m.started {
+			m.Start()
+		}
+		m.AddTarget(dest, "")
 	})
 }
 
-// StopAutoProbe cancels the background refresh goroutine for the given
-// destination. Useful for graceful shutdown.
+// StopAutoProbe cancels the background refresh for the given destination.
 func StopAutoProbe(dest string) {
-	if cancel, ok := probeStops.Load(dest); ok {
-		cancel.(context.CancelFunc)()
-		probeStops.Delete(dest)
-		probeOnces.Delete(dest)
+	if globalRefreshManager != nil {
+		// RemoveTarget needs serverName; use empty string as fallback.
+		globalRefreshManager.RemoveTarget(dest, "")
 	}
+	probeOnces.Delete(dest)
 }

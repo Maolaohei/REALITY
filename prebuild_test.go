@@ -539,9 +539,6 @@ func TestEnsureAutoProbe_CopiesConfig(t *testing.T) {
 	if _, ok := probeOnces.Load("127.0.0.1:19999"); !ok {
 		t.Error("expected probeOnces entry for dest")
 	}
-	if _, ok := probeStops.Load("127.0.0.1:19999"); !ok {
-		t.Error("expected probeStops entry for dest")
-	}
 
 	// Clean up
 	StopAutoProbe("127.0.0.1:19999")
@@ -585,18 +582,12 @@ func TestStopAutoProbe_CleansUp(t *testing.T) {
 	if _, ok := probeOnces.Load("127.0.0.1:19997"); !ok {
 		t.Error("expected probeOnces entry before stop")
 	}
-	if _, ok := probeStops.Load("127.0.0.1:19997"); !ok {
-		t.Error("expected probeStops entry before stop")
-	}
 
 	StopAutoProbe("127.0.0.1:19997")
 
 	// Verify entries cleaned up
 	if _, ok := probeOnces.Load("127.0.0.1:19997"); ok {
 		t.Error("expected probeOnces entry cleaned up after stop")
-	}
-	if _, ok := probeStops.Load("127.0.0.1:19997"); ok {
-		t.Error("expected probeStops entry cleaned up after stop")
 	}
 }
 
@@ -1445,34 +1436,34 @@ func TestPersistentStoreAtomicWrite(t *testing.T) {
 // ============================================================================
 
 func TestBackgroundRefreshStartStop(t *testing.T) {
-	m := InitBackgroundRefresh()
+	m := GetRefreshManager()
 
 	// Start refresh for a target
-	m.StartRefresh("example.com:443", "example.com")
+	m.AddTarget("example.com:443", "example.com")
 
 	// Verify target is tracked
-	active := m.GetRefreshStats()
+	active := m.GetStats()
 	if active != 1 {
 		t.Errorf("active targets = %d, want 1", active)
 	}
 
 	// Start again — should be idempotent
-	m.StartRefresh("example.com:443", "example.com")
-	active = m.GetRefreshStats()
+	m.AddTarget("example.com:443", "example.com")
+	active = m.GetStats()
 	if active != 1 {
 		t.Errorf("active targets = %d after duplicate start, want 1", active)
 	}
 
 	// Stop refresh
-	m.StopRefresh("example.com:443", "example.com")
-	active = m.GetRefreshStats()
+	m.RemoveTarget("example.com:443", "example.com")
+	active = m.GetStats()
 	if active != 0 {
 		t.Errorf("active targets = %d after stop, want 0", active)
 	}
 }
 
 func TestBackgroundRefreshMultipleTargets(t *testing.T) {
-	m := InitBackgroundRefresh()
+	m := GetRefreshManager()
 
 	targets := []struct{ dest, name string }{
 		{"microsoft.com:443", "microsoft.com"},
@@ -1481,29 +1472,29 @@ func TestBackgroundRefreshMultipleTargets(t *testing.T) {
 	}
 
 	for _, tgt := range targets {
-		m.StartRefresh(tgt.dest, tgt.name)
+		m.AddTarget(tgt.dest, tgt.name)
 	}
 
-	active := m.GetRefreshStats()
+	active := m.GetStats()
 	if active != 3 {
 		t.Errorf("active targets = %d, want 3", active)
 	}
 
 	// Stop one
-	m.StopRefresh("apple.com:443", "apple.com")
-	active = m.GetRefreshStats()
+	m.RemoveTarget("apple.com:443", "apple.com")
+	active = m.GetStats()
 	if active != 2 {
 		t.Errorf("active targets = %d after stop, want 2", active)
 	}
 
 	// Cleanup
 	for _, tgt := range targets {
-		m.StopRefresh(tgt.dest, tgt.name)
+		m.RemoveTarget(tgt.dest, tgt.name)
 	}
 }
 
 func TestBackgroundRefreshConcurrent(t *testing.T) {
-	m := InitBackgroundRefresh()
+	m := GetRefreshManager()
 
 	var wg sync.WaitGroup
 	const n = 50
@@ -1512,19 +1503,19 @@ func TestBackgroundRefreshConcurrent(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			dest := fmt.Sprintf("concurrent%d.example.com:443", id)
-			m.StartRefresh(dest, fmt.Sprintf("concurrent%d.example.com", id))
+			m.AddTarget(dest, fmt.Sprintf("concurrent%d.example.com", id))
 		}(i)
 	}
 	wg.Wait()
 
-	active := m.GetRefreshStats()
+	active := m.GetStats()
 	if active != n {
 		t.Errorf("active targets = %d, want %d", n, active)
 	}
 
 	// Cleanup
 	for i := 0; i < n; i++ {
-		m.StopRefresh(
+		m.RemoveTarget(
 			fmt.Sprintf("concurrent%d.example.com:443", i),
 			fmt.Sprintf("concurrent%d.example.com", i),
 		)
@@ -1532,10 +1523,6 @@ func TestBackgroundRefreshConcurrent(t *testing.T) {
 }
 
 func TestBackgroundRefreshFormatStats(t *testing.T) {
-	// Before initialization
-	refreshManager = nil
-	refreshManagerOnce = sync.Once{}
-
 	stats := FormatRefreshStats()
 	if stats == "" {
 		t.Error("stats should not be empty")

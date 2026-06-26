@@ -96,13 +96,13 @@ func TestRegressionPersistentLoadSave(t *testing.T) {
 }
 
 func TestRegressionBackgroundRefreshNonBlocking(t *testing.T) {
-	m := InitBackgroundRefresh()
+	m := GetRefreshManager()
 
 	// Start refresh
-	m.StartRefresh("example.com:443", "example.com")
+	m.AddTarget("example.com:443", "example.com")
 
 	// Verify it's running
-	active := m.GetRefreshStats()
+	active := m.GetStats()
 	if active != 1 {
 		t.Errorf("active = %d, want 1", active)
 	}
@@ -110,7 +110,7 @@ func TestRegressionBackgroundRefreshNonBlocking(t *testing.T) {
 	// Stop — should not block
 	done := make(chan struct{})
 	go func() {
-		m.StopRefresh("example.com:443", "example.com")
+		m.RemoveTarget("example.com:443", "example.com")
 		close(done)
 	}()
 
@@ -341,14 +341,14 @@ func TestConcurrentCacheAccess(t *testing.T) {
 // ============================================================================
 
 func TestRefreshDoesNotBlockHandshake(t *testing.T) {
-	m := InitBackgroundRefresh()
+	m := GetRefreshManager()
 
-	m.StartRefresh("example.com:443", "example.com")
+	m.AddTarget("example.com:443", "example.com")
 
 	// Stop should be non-blocking
 	done := make(chan struct{})
 	go func() {
-		m.StopRefresh("example.com:443", "example.com")
+		m.RemoveTarget("example.com:443", "example.com")
 		close(done)
 	}()
 
