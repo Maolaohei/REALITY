@@ -51,9 +51,13 @@ func InitPersistentStore(dir string) *PersistentProfileStore {
 	return profileStore
 }
 
-// Save persists current cache state to disk.
+// Save persists current cache state to disk. Skips write if cache is clean.
 func (s *PersistentProfileStore) Save() {
 	if !s.enabled.Load() {
+		return
+	}
+	// Skip write if nothing has changed.
+	if !globalCacheManager.IsDirty() {
 		return
 	}
 	s.mu.Lock()
@@ -89,6 +93,9 @@ func (s *PersistentProfileStore) Save() {
 		return
 	}
 	os.Rename(tmpPath, s.filePath)
+
+	// Clear dirty flag after successful write.
+	globalCacheManager.ClearDirty()
 }
 
 // load reads profiles from disk and populates caches.

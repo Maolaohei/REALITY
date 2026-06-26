@@ -9,9 +9,10 @@ import (
 // CacheManager manages all REALITY cache state.
 // It is a pure observer — it never modifies TLS connection state.
 type CacheManager struct {
-	profiles  sync.Map // map[string]*RealityProfile
+	profiles     sync.Map // map[string]*RealityProfile
 	fingerprints sync.Map // map[string]*targetFingerprintCache
-	stats     CacheManagerStats
+	stats        CacheManagerStats
+	dirty        atomic.Bool // true when cache has unsaved changes
 }
 
 // CacheManagerStats tracks cache hit/miss rates for diagnostics.
@@ -31,6 +32,7 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 	_, loaded := m.profiles.LoadOrStore(key, profile)
 	if !loaded {
 		m.stats.ProfileEntries.Add(1)
+		m.dirty.Store(true)
 	}
 	return !loaded
 }
@@ -53,6 +55,7 @@ func (m *CacheManager) GetProfile(key string) *RealityProfile {
 func (m *CacheManager) InvalidateProfile(key string) {
 	if _, loaded := m.profiles.LoadAndDelete(key); loaded {
 		m.stats.ProfileInvalidated.Add(1)
+		m.dirty.Store(true)
 	}
 }
 
@@ -83,6 +86,16 @@ func (m *CacheManager) RangeProfiles(fn func(key string, profile *RealityProfile
 	m.profiles.Range(func(key, val any) bool {
 		return fn(key.(string), val.(*RealityProfile))
 	})
+}
+
+// IsDirty returns true if the cache has unsaved changes.
+func (m *CacheManager) IsDirty() bool {
+	return m.dirty.Load()
+}
+
+// ClearDirty resets the dirty flag after a successful save.
+func (m *CacheManager) ClearDirty() {
+	m.dirty.Store(false)
 }
 
 // Global cache manager instance.
