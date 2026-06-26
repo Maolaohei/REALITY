@@ -770,11 +770,15 @@ func TestRealityProfileExpiry(t *testing.T) {
 		t.Error("fresh profile should NOT be expired")
 	}
 
-	// Simulate cache with expired entry
+	// Simulate cache with expired entry — stale-while-revalidate means
+	// expired profiles are returned as stale (second return value = true).
 	globalCacheManager.StoreProfile(key, profile)
-	stored, _ := globalCacheManager.GetProfile(key)
-	if stored != nil {
-		t.Error("expired profile should not be returned by GetProfile")
+	stored, stale := globalCacheManager.GetProfile(key)
+	if stored == nil {
+		t.Error("expired profile should be returned as stale")
+	}
+	if !stale {
+		t.Error("expired profile should be marked stale")
 	}
 }
 
@@ -1094,10 +1098,15 @@ func TestRealityProfileInvalidationByExpiry(t *testing.T) {
 	}
 	globalCacheManager.StoreProfile(key, expiredProfile)
 
-	val, _ := globalCacheManager.GetProfile(key)
-	if val != nil {
-		t.Fatal("expired profile should be auto-deleted by GetProfile")
+	// With stale-while-revalidate, expired profiles are returned as stale.
+	val, stale := globalCacheManager.GetProfile(key)
+	if val == nil {
+		t.Fatal("expired profile should be returned as stale")
 	}
+	if !stale {
+		t.Fatal("expired profile should be marked stale")
+	}
+	// Manually invalidate to test explicit deletion.
 	globalCacheManager.InvalidateProfile(key)
 
 	val2, _ := globalCacheManager.GetProfile(key)
@@ -1392,6 +1401,12 @@ func TestPersistentStoreSkipsExpired(t *testing.T) {
 
 func TestPersistentStoreAtomicWrite(t *testing.T) {
 	dir := t.TempDir()
+
+	// Clear any leftover profiles from previous tests.
+	globalCacheManager.entries.Range(func(key, val any) bool {
+		globalCacheManager.entries.Delete(key)
+		return true
+	})
 
 	loadOnce = sync.Once{}
 	profileStore = nil
