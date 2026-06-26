@@ -43,6 +43,9 @@ var (
 // Call this once at startup. filePath is where profiles.json will be stored.
 func InitPersistentStore(dir string) *PersistentProfileStore {
 	loadOnce.Do(func() {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return
+		}
 		profileStore = &PersistentProfileStore{
 			filePath: filepath.Join(dir, "profiles.json"),
 		}

@@ -319,12 +319,17 @@ func (m *CacheManager) evictIfFull() {
 
 func (m *CacheManager) SnapshotProfiles() map[string]*RealityProfile {
 	snap := make(map[string]*RealityProfile)
+	now := time.Now()
 	m.entries.Range(func(key, val any) bool {
 		entry := val.(*ProfileEntry)
-		if entry.State != ProfileNegative && entry.State != ProfilePendingDelete {
-			cp := *entry.Profile
-			snap[key.(string)] = &cp
+		if entry.State == ProfileNegative || entry.State == ProfilePendingDelete {
+			return true
 		}
+		if now.Sub(entry.Profile.CapturedAt) > entry.TTL {
+			return true
+		}
+		cp := *entry.Profile
+		snap[key.(string)] = &cp
 		return true
 	})
 	return snap

@@ -46,6 +46,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -142,6 +143,16 @@ func NewRatelimitedConn(conn net.Conn, limit *LimitFallback) net.Conn {
 
 // ProfileTTL is the time-to-live for cached RealityProfile entries.
 const ProfileTTL = 30 * time.Minute
+
+// DefaultCacheDir returns the platform-appropriate default directory for
+// persistent profile storage. Returns empty string if the user cache dir
+// cannot be determined.
+func DefaultCacheDir() string {
+	if d, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(d, "REALITY")
+	}
+	return ""
+}
 
 var (
 	// maxRecordSize is the buffer size for reading TLS handshake records from
@@ -271,13 +282,19 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	}
 
 	// Initialize event handlers and persistent store on first call.
-	if profileStore == nil && config.CacheDir != "" {
-		store := InitPersistentStore(config.CacheDir)
-		store.StartPeriodicSave(5 * time.Minute)
-		// Register event handlers for cache/persist/refresh.
-		RegisterAllHandlers(config.Show)
-		// Warmup: proactively probe all known targets in background.
-		WarmupProfiles(config.CacheDir)
+	if profileStore == nil {
+		cacheDir := config.CacheDir
+		if cacheDir == "" {
+			cacheDir = DefaultCacheDir()
+		}
+		if cacheDir != "" {
+			store := InitPersistentStore(cacheDir)
+			store.StartPeriodicSave(5 * time.Minute)
+			// Register event handlers for cache/persist/refresh.
+			RegisterAllHandlers(config.Show)
+			// Warmup: proactively probe all known targets in background.
+			WarmupProfiles(cacheDir)
+		}
 	}
 
 	// Trigger automatic pre-build probe on first connection.
@@ -529,7 +546,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			postHandshakeReady := false
 
-			for i := 0; i < 30; i++ {
+			{
 				key := config.Dest + " " + hs.clientHello.serverName
 				if len(hs.clientHello.alpnProtocols) == 0 {
 					key += " 0"
@@ -539,7 +556,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					key += " 1"
 				}
 				if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
-					if postHandshakeRecordsLens, ok := val.([]int); ok {
+					if postHandshakeRecordsLens, ok := val.([]int); ok && len(postHandshakeRecordsLens) > 0 {
 						maxPtLen := 0
 						for _, length := range postHandshakeRecordsLens {
 							if ptLen := length - 16; ptLen > maxPtLen {
@@ -563,10 +580,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 							}
 						}
 						postHandshakeReady = true
-						break
 					}
 				}
-				time.Sleep(time.Second)
 				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
 					hs.c.MaxUselessRecords = maxUseless.(int)
 				}
