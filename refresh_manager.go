@@ -2,7 +2,6 @@ package reality
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
@@ -151,8 +150,9 @@ func (m *RefreshManager) probeAndReschedule(entry *refreshEntry) {
 	}
 }
 
-// probeTarget connects to the target, reads its ServerHello, and compares
-// against the cached profile. Invalidates cache if the target changed.
+// probeTarget connects to the target, reads its full TLS handshake
+// (all 7 records), and compares against the cached profile.
+// Invalidates cache if the target changed (cipher suite, record lengths, etc.).
 func (m *RefreshManager) probeTarget(dest, serverName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 	defer cancel()
@@ -165,45 +165,93 @@ func (m *RefreshManager) probeTarget(dest, serverName string) {
 	}
 	defer conn.Close()
 
-	// Read ServerHello to capture TLS record length.
+	// Read the target's full TLS handshake to capture record lengths.
 	buf := make([]byte, maxRecordSize)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
-	if err != nil {
-		invalidateCache(dest, serverName)
-		return
+	s2cSaved := make([]byte, 0, maxRecordSize)
+	handshakeLen := 0
+	var recordLens [7]int
+	var cipherSuite uint16
+
+	recordIndex := 0
+	for recordIndex < 7 {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
+		if err != nil {
+			break
+		}
+		s2cSaved = append(s2cSaved, buf[:n]...)
+
+		for recordIndex < 7 && len(s2cSaved) > recordHeaderLen {
+			if handshakeLen == 0 {
+				if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 {
+					invalidateCache(dest, serverName)
+					return
+				}
+				rt := recordType(s2cSaved[0])
+				switch recordIndex {
+				case 0: // ServerHello
+					if rt != recordTypeHandshake || s2cSaved[5] != typeServerHello {
+						invalidateCache(dest, serverName)
+						return
+					}
+				case 1: // ChangeCipherSpec
+					if rt != recordTypeChangeCipherSpec || s2cSaved[5] != 1 {
+						invalidateCache(dest, serverName)
+						return
+					}
+				default: // ApplicationData records
+					if rt != recordTypeApplicationData {
+						invalidateCache(dest, serverName)
+						return
+					}
+				}
+				handshakeLen = recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
+			}
+			if handshakeLen > maxTLSRecordPayload {
+				invalidateCache(dest, serverName)
+				return
+			}
+			if len(s2cSaved) < handshakeLen {
+				break // need more data
+			}
+			recordLens[recordIndex] = handshakeLen
+
+			// Parse ServerHello to extract cipher suite.
+			if recordIndex == 0 {
+				hello := new(serverHelloMsg)
+				if !hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) {
+					invalidateCache(dest, serverName)
+					return
+				}
+				cipherSuite = hello.cipherSuite
+			}
+
+			s2cSaved = s2cSaved[handshakeLen:]
+			handshakeLen = 0
+			recordIndex++
+		}
 	}
 
-	// Validate record header.
-	if recordType(buf[0]) != recordTypeHandshake || buf[5] != typeServerHello {
-		invalidateCache(dest, serverName)
-		return
-	}
-	if bigEndianUint16(buf[1:3]) != VersionTLS12 {
-		invalidateCache(dest, serverName)
-		return
-	}
-	serverHelloLen := recordHeaderLen + int(binary.BigEndian.Uint16(buf[3:5]))
-	if serverHelloLen > maxTLSRecordPayload || serverHelloLen > n {
-		invalidateCache(dest, serverName)
-		return
-	}
-
-	// Parse ServerHello to extract cipher suite.
-	hello := new(serverHelloMsg)
-	if !hello.unmarshal(buf[recordHeaderLen:serverHelloLen]) {
+	if recordIndex == 0 {
 		invalidateCache(dest, serverName)
 		return
 	}
 
 	// Compare against cached profile.
-	// Use dest as key (serverName may be empty at probe time).
 	key := dest
 	if profile := globalCacheManager.GetProfile(key); profile != nil {
-		if !profile.IsExpired() && profile.CipherSuite != hello.cipherSuite {
-			globalCacheManager.InvalidateProfile(key)
-			globalCacheManager.InvalidateFingerprint()
-			return
+		if !profile.IsExpired() {
+			// Check if cipher suite or record lengths changed.
+			if profile.CipherSuite != cipherSuite {
+				globalCacheManager.InvalidateProfile(key)
+				globalCacheManager.InvalidateFingerprint()
+				return
+			}
+			// Check if record lengths differ (target may have changed certificates).
+			if profile.RecordLens != recordLens {
+				globalCacheManager.InvalidateProfile(key)
+				return
+			}
 		}
 	}
 
