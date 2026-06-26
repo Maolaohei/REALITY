@@ -182,7 +182,8 @@ type halfConn struct {
 	mac     hash.Hash
 	seq     [8]byte // 64-bit sequence number
 
-	scratchBuf [13]byte // to avoid allocs; interface method args escape
+	scratchBuf    [13]byte // to avoid allocs; interface method args escape
+	additionalBuf []byte   // reusable additionalData buffer for decrypt
 
 	nextCipher any       // next encryption state
 	nextMac    hash.Hash // next MAC algorithm
@@ -378,10 +379,13 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 			if hc.version == VersionTLS13 {
 				additionalData = record[:recordHeaderLen]
 			} else {
-				additionalData = append(hc.scratchBuf[:0], hc.seq[:]...)
+				// Reuse pre-allocated buffer for additionalData (13 bytes max).
+				additionalData = hc.additionalBuf[:0]
+				additionalData = append(additionalData, hc.seq[:]...)
 				additionalData = append(additionalData, record[:3]...)
 				n := len(payload) - c.Overhead()
 				additionalData = append(additionalData, byte(n>>8), byte(n))
+				hc.additionalBuf = additionalData
 			}
 
 			var err error
@@ -1011,6 +1015,15 @@ func (c *Conn) flush() (int, error) {
 var outBufPool = sync.Pool{
 	New: func() any {
 		return new([]byte)
+	},
+}
+
+// additionalBufPool pools the 13-byte additionalData buffers for decrypt.
+// This avoids heap allocation in the hot decrypt path.
+var additionalBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 13) // seq(8) + version(3) + length(2) = 13 bytes max
+		return &buf
 	},
 }
 
