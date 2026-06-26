@@ -18,11 +18,12 @@ const (
 
 // ProfileEntry wraps a RealityProfile with state metadata.
 type ProfileEntry struct {
-	Profile   *RealityProfile
-	State     ProfileState
-	FailCount int
-	NextRetry time.Time
-	TTL       time.Duration // dynamic TTL based on stability
+	Profile        *RealityProfile
+	State          ProfileState
+	FailCount      int
+	NextRetry      time.Time
+	TTL            time.Duration // dynamic TTL based on stability
+	StabilityScore int           // consecutive successful probes (max 4)
 }
 
 // CacheManager manages all REALITY cache state.
@@ -155,6 +156,13 @@ func (m *CacheManager) MarkStale(key string) {
 	if val, ok := m.entries.Load(key); ok {
 		entry := val.(*ProfileEntry)
 		entry.State = ProfileStale
+		// Increase stability score — probe succeeded.
+		if entry.StabilityScore < 4 {
+			entry.StabilityScore++
+			// Adaptive TTL: baseTTL * (1 + stabilityScore).
+			// Score 0: 1x, Score 1: 2x, Score 2: 3x, Score 3: 4x, Score 4: 4x
+			entry.TTL = m.baseTTL * time.Duration(1+entry.StabilityScore)
+		}
 	}
 }
 
@@ -175,6 +183,7 @@ func (m *CacheManager) MarkNegative(key string) {
 	}
 	entry := val.(*ProfileEntry)
 	entry.FailCount++
+	entry.StabilityScore = 0 // Reset stability on failure.
 	// Exponential backoff: 1min, 2min, 4min, 8min, max 30min.
 	backoff := time.Duration(1<<min(entry.FailCount-1, 4)) * time.Minute
 	if backoff > 30*time.Minute {

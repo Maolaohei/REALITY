@@ -2,8 +2,11 @@ package reality
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -204,7 +207,59 @@ var (
 	// probeOnces tracks per-destination sync.Once to ensure the initial
 	// probe runs exactly once.
 	probeOnces sync.Map // map[string]*sync.Once
+	// warmupOnce ensures warmup runs only once.
+	warmupOnce sync.Once
 )
+
+// WarmupProfiles proactively probes all known targets from profiles.json.
+// Called once at startup to ensure fresh profiles before first connection.
+// Uses a worker pool (5 concurrent probes) to avoid overwhelming the network.
+func WarmupProfiles(dir string) {
+	warmupOnce.Do(func() {
+		go func() {
+			// Wait for profile store to be initialized.
+			if profileStore == nil {
+				return
+			}
+			// Read all known keys from cache (loaded from profiles.json).
+			var keys []string
+			globalCacheManager.entries.Range(func(key, val any) bool {
+				keys = append(keys, key.(string))
+				return true
+			})
+			if len(keys) == 0 {
+				return
+			}
+
+			// Worker pool: 5 concurrent probes.
+			sem := make(chan struct{}, 5)
+			var wg sync.WaitGroup
+			for _, key := range keys {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(k string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+
+					// Extract dest from key (format: "dest|serverName|alpn").
+					dest := k
+					if idx := strings.Index(k, "|"); idx > 0 {
+						dest = k[:idx]
+					}
+					if dest == "" {
+						return
+					}
+
+					// Probe with singleflight — skip if already in-flight.
+					globalCacheManager.DoProbe(dest, func() (*RealityProfile, error) {
+						return probeTargetRaw(dest)
+					})
+				}(key)
+			}
+			wg.Wait()
+		}()
+	})
+}
 
 // probeConfig holds the values needed to probe a target, copied from
 // Config to avoid retaining a pointer to the caller's mutable Config.
@@ -252,4 +307,93 @@ func StopAutoProbe(dest string) {
 		globalRefreshManager.RemoveTarget(dest, "")
 	}
 	probeOnces.Delete(dest)
+}
+
+// probeTargetRaw connects to the target and returns a RealityProfile.
+// Used by warmup and singleflight. Returns nil on error.
+func probeTargetRaw(dest string) (*RealityProfile, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", dest)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	buf := make([]byte, maxRecordSize)
+	s2cSaved := make([]byte, 0, maxRecordSize)
+
+	// Read ServerHello.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
+	if err != nil {
+		return nil, err
+	}
+	s2cSaved = append(s2cSaved, buf[:n]...)
+
+	// Validate.
+	if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 {
+		return nil, fmt.Errorf("invalid TLS version")
+	}
+	if recordType(s2cSaved[0]) != recordTypeHandshake || s2cSaved[5] != typeServerHello {
+		return nil, fmt.Errorf("not ServerHello")
+	}
+	serverHelloLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
+	if serverHelloLen > maxTLSRecordPayload || serverHelloLen > len(s2cSaved) {
+		return nil, fmt.Errorf("invalid ServerHello length")
+	}
+
+	hello := new(serverHelloMsg)
+	if !hello.unmarshal(s2cSaved[recordHeaderLen:serverHelloLen]) {
+		return nil, fmt.Errorf("failed to unmarshal ServerHello")
+	}
+
+	// Read remaining records.
+	var recordLens [7]int
+	recordLens[0] = serverHelloLen
+	recordIndex := 1
+	s2cSaved = s2cSaved[serverHelloLen:]
+
+	for recordIndex < 7 {
+		for recordIndex < 7 && len(s2cSaved) > recordHeaderLen {
+			handshakeLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
+			if handshakeLen > maxTLSRecordPayload {
+				break
+			}
+			if len(s2cSaved) < handshakeLen {
+				break
+			}
+			recordLens[recordIndex] = handshakeLen
+			s2cSaved = s2cSaved[handshakeLen:]
+			recordIndex++
+		}
+		if recordIndex >= 7 {
+			break
+		}
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
+		if err != nil {
+			break
+		}
+		s2cSaved = append(s2cSaved, buf[:n]...)
+	}
+
+	alpn := ""
+	profile := &RealityProfile{
+		RecordLens:   recordLens,
+		Fingerprint:  computeFingerprint(hello.cipherSuite, alpn, recordLens[0], recordLens[2]),
+		CipherSuite:  hello.cipherSuite,
+		ALPN:         alpn,
+		RecordCount:  0,
+		CapturedAt:   time.Now(),
+	}
+	for _, l := range recordLens {
+		if l > 0 {
+			profile.RecordCount++
+		}
+	}
+
+	return profile, nil
 }

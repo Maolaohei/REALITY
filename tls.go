@@ -273,6 +273,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	if profileStore == nil && config.CacheDir != "" {
 		store := InitPersistentStore(config.CacheDir)
 		store.StartPeriodicSave(5 * time.Minute)
+		// Warmup: proactively probe all known targets in background.
+		WarmupProfiles(config.CacheDir)
 	}
 
 	// Trigger automatic pre-build probe on first connection.
