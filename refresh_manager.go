@@ -262,15 +262,24 @@ func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 
 	// Compare full profile.
 	if profile != nil && !profile.IsExpired() {
-		if profile.CipherSuite != hello.cipherSuite {
-			globalCacheManager.InvalidateProfile(key)
+		if profile.CipherSuite != hello.cipherSuite || !recordLensMatch(profile.RecordLens, recordLens) {
+			// Target changed — hot-swap: new profile for new connections,
+			// old profile kept for pinned connections.
+			newProfile := &RealityProfile{
+				RecordLens:   recordLens,
+				Fingerprint:  computeFingerprint(hello.cipherSuite, "", recordLens[0], recordLens[2]),
+				CipherSuite:  hello.cipherSuite,
+				ALPN:         "",
+				RecordCount:  0,
+				CapturedAt:   time.Now(),
+			}
+			for _, l := range recordLens {
+				if l > 0 {
+					newProfile.RecordCount++
+				}
+			}
+			globalCacheManager.HotSwapProfile(key, newProfile)
 			globalCacheManager.InvalidateFingerprint()
-			globalCacheManager.MarkNegative(key)
-			return true
-		}
-		if !recordLensMatch(profile.RecordLens, recordLens) {
-			globalCacheManager.InvalidateProfile(key)
-			globalCacheManager.MarkNegative(key)
 			return true
 		}
 	}
