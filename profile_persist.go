@@ -82,16 +82,28 @@ func (s *PersistentProfileStore) Save() {
 		return true
 	})
 
-	data, err := json.MarshalIndent(file, "", "  ")
+	data, err := json.Marshal(file)
 	if err != nil {
 		return
 	}
 
-	// Atomic write: write to temp file, then rename.
+	// Atomic write: write to temp file → fsync → rename.
 	tmpPath := s.filePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	f, err := os.Create(tmpPath)
+	if err != nil {
 		return
 	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return
+	}
+	f.Close()
 	os.Rename(tmpPath, s.filePath)
 
 	// Clear dirty flag after successful write.

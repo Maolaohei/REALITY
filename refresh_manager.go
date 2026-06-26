@@ -19,6 +19,7 @@ type RefreshManager struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	started bool
+	sem     chan struct{} // concurrency limiter for probes
 }
 
 // refreshEntry tracks refresh state for a single target.
@@ -27,6 +28,7 @@ type refreshEntry struct {
 	serverName string
 	timer      *time.Timer
 	stopCh     chan struct{}
+	failCount  int // consecutive probe failures
 }
 
 var (
@@ -54,6 +56,7 @@ func GetRefreshManager() *RefreshManager {
 	globalRefreshManagerOnce.Do(func() {
 		globalRefreshManager = &RefreshManager{
 			targets: make(map[string]*refreshEntry),
+			sem:     make(chan struct{}, 8), // max 8 concurrent probes
 		}
 	})
 	return globalRefreshManager
@@ -139,29 +142,46 @@ func (m *RefreshManager) probeAndReschedule(entry *refreshEntry) {
 	default:
 	}
 
-	m.probeTarget(entry.dest, entry.serverName)
+	// Acquire semaphore to limit concurrent probes.
+	m.sem <- struct{}{}
+	defer func() { <-m.sem }()
 
-	// Reschedule with a new random interval.
+	success := m.probeTarget(entry.dest, entry.serverName)
+
+	// Reschedule with adaptive interval.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := entry.dest
 	if _, exists := m.targets[key]; exists {
-		entry.timer.Reset(randomRefreshInterval())
+		if success {
+			entry.failCount = 0
+			entry.timer.Reset(randomRefreshInterval())
+		} else {
+			entry.failCount++
+			// Exponential backoff: 1min, 2min, 4min, max 10min
+			backoff := time.Duration(1<<min(entry.failCount-1, 3)) * time.Minute
+			if backoff > 10*time.Minute {
+				backoff = 10 * time.Minute
+			}
+			entry.timer.Reset(backoff)
+		}
 	}
 }
 
 // probeTarget connects to the target, reads its full TLS handshake
 // (all 7 records), and compares against the cached profile.
-// Invalidates cache if the target changed (cipher suite, record lengths, etc.).
-func (m *RefreshManager) probeTarget(dest, serverName string) {
+// Returns true if probe succeeded, false on error.
+// Only invalidates cache on successful probe that detects changes,
+// or after 3+ consecutive failures (network unreachable).
+func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 	defer cancel()
 
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", dest)
 	if err != nil {
-		invalidateCache(dest, serverName)
-		return
+		// Network failure — don't invalidate, let failCount handle it.
+		return false
 	}
 	defer conn.Close()
 
@@ -184,32 +204,27 @@ func (m *RefreshManager) probeTarget(dest, serverName string) {
 		for recordIndex < 7 && len(s2cSaved) > recordHeaderLen {
 			if handshakeLen == 0 {
 				if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 {
-					invalidateCache(dest, serverName)
-					return
+					return false
 				}
 				rt := recordType(s2cSaved[0])
 				switch recordIndex {
 				case 0: // ServerHello
 					if rt != recordTypeHandshake || s2cSaved[5] != typeServerHello {
-						invalidateCache(dest, serverName)
-						return
+						return false
 					}
 				case 1: // ChangeCipherSpec
 					if rt != recordTypeChangeCipherSpec || s2cSaved[5] != 1 {
-						invalidateCache(dest, serverName)
-						return
+						return false
 					}
 				default: // ApplicationData records
 					if rt != recordTypeApplicationData {
-						invalidateCache(dest, serverName)
-						return
+						return false
 					}
 				}
 				handshakeLen = recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
 			}
 			if handshakeLen > maxTLSRecordPayload {
-				invalidateCache(dest, serverName)
-				return
+				return false
 			}
 			if len(s2cSaved) < handshakeLen {
 				break // need more data
@@ -220,8 +235,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string) {
 			if recordIndex == 0 {
 				hello := new(serverHelloMsg)
 				if !hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) {
-					invalidateCache(dest, serverName)
-					return
+					return false
 				}
 				cipherSuite = hello.cipherSuite
 			}
@@ -233,32 +247,29 @@ func (m *RefreshManager) probeTarget(dest, serverName string) {
 	}
 
 	if recordIndex == 0 {
-		invalidateCache(dest, serverName)
-		return
+		return false
 	}
 
-	// Compare against cached profile.
+	// Probe succeeded — compare against cached profile.
 	key := dest
 	if profile := globalCacheManager.GetProfile(key); profile != nil {
 		if !profile.IsExpired() {
-			// Check if cipher suite or record lengths changed.
+			// Check if cipher suite changed.
 			if profile.CipherSuite != cipherSuite {
 				globalCacheManager.InvalidateProfile(key)
 				globalCacheManager.InvalidateFingerprint()
-				return
+				return true
 			}
-			// Check if record lengths differ (target may have changed certificates).
-			if profile.RecordLens != recordLens {
+			// Check if record lengths differ (with tolerance for record[6]).
+			if !recordLensMatch(profile.RecordLens, recordLens) {
 				globalCacheManager.InvalidateProfile(key)
-				return
+				return true
 			}
 		}
 	}
 
-	// Target alive and unchanged — save cache.
-	if profileStore != nil {
-		go profileStore.Save()
-	}
+	// Target alive and unchanged.
+	return true
 }
 
 // GetStats returns statistics about the refresh manager.
@@ -278,6 +289,22 @@ func (m *RefreshManager) FormatStats() string {
 func invalidateCache(dest, serverName string) {
 	profileKey := dest + "|" + serverName
 	globalCacheManager.InvalidateProfile(profileKey)
+}
+
+// recordLensMatch compares two record lens arrays with tolerance for record[6]
+// (NewSessionTicket), which can vary between connections.
+func recordLensMatch(a, b [7]int) bool {
+	for i := 0; i < 6; i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	// record[6] (NewSessionTicket) — allow ±64 bytes tolerance.
+	diff := a[6] - b[6]
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= 64
 }
 
 // StartBackgroundRefreshForProfile is called when a new profile is cached.
