@@ -29,6 +29,11 @@ type refreshEntry struct {
 	timer      *time.Timer
 	stopCh     chan struct{}
 	failCount  int // consecutive probe failures
+
+	// Debouncing: only HotSwap after consecutive identical probe results.
+	lastProbeLens      [7]int
+	lastProbeCipherSuite uint16
+	stableCount        int
 }
 
 var (
@@ -146,7 +151,7 @@ func (m *RefreshManager) probeAndReschedule(entry *refreshEntry) {
 	m.sem <- struct{}{}
 	defer func() { <-m.sem }()
 
-	success := m.probeTarget(entry.dest, entry.serverName)
+	success := m.probeTarget(entry.dest, entry.serverName, entry)
 
 	// Reschedule with adaptive interval.
 	m.mu.Lock()
@@ -172,7 +177,8 @@ func (m *RefreshManager) probeAndReschedule(entry *refreshEntry) {
 // Two-phase approach: Phase A reads only ServerHello (fast path),
 // Phase B reads all 7 records only if Phase A detects changes.
 // Returns true if probe succeeded, false on error.
-func (m *RefreshManager) probeTarget(dest, serverName string) bool {
+// Debouncing: requires 2 consecutive identical probe results before triggering HotSwap.
+func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntry) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 	defer cancel()
 
@@ -263,26 +269,41 @@ func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 	// Compare full profile.
 	if profile != nil && !profile.IsExpired() {
 		if profile.CipherSuite != hello.cipherSuite || !recordLensMatch(profile.RecordLens, recordLens) {
-			// Target changed — hot-swap: new profile for new connections,
-			// old profile kept for pinned connections.
-			newProfile := &RealityProfile{
-				RecordLens:   recordLens,
-				Fingerprint:  computeFingerprint(hello.cipherSuite, "", recordLens[0], recordLens[2]),
-				CipherSuite:  hello.cipherSuite,
-				ALPN:         "",
-				RecordCount:  0,
-				CapturedAt:   time.Now(),
+			// Target appears to have changed. Apply debouncing: only
+			// HotSwap after 2 consecutive identical probe results to
+			// filter out transient network抖动.
+			if entry.lastProbeCipherSuite == hello.cipherSuite && entry.lastProbeLens == recordLens {
+				entry.stableCount++
+			} else {
+				entry.stableCount = 1
+				entry.lastProbeCipherSuite = hello.cipherSuite
+				entry.lastProbeLens = recordLens
 			}
-			for _, l := range recordLens {
-				if l > 0 {
-					newProfile.RecordCount++
+			if entry.stableCount >= 2 {
+				// Confirmed stable change — safe to swap.
+				entry.stableCount = 0
+				newProfile := &RealityProfile{
+					RecordLens:   recordLens,
+					Fingerprint:  computeFingerprint(hello.cipherSuite, "", recordLens[0], recordLens[2]),
+					CipherSuite:  hello.cipherSuite,
+					ALPN:         "",
+					RecordCount:  0,
+					CapturedAt:   time.Now(),
 				}
+				for _, l := range recordLens {
+					if l > 0 {
+						newProfile.RecordCount++
+					}
+				}
+				globalCacheManager.HotSwapProfile(key, newProfile)
+				globalCacheManager.InvalidateFingerprint()
 			}
-			globalCacheManager.HotSwapProfile(key, newProfile)
-			globalCacheManager.InvalidateFingerprint()
 			return true
 		}
 	}
+
+	// Profile unchanged — reset debouncing state.
+	entry.stableCount = 0
 
 	globalCacheManager.MarkStale(key)
 	return true
