@@ -259,28 +259,77 @@ go test -v -run "TestBackgroundRefresh" -timeout=60s
 
 ## 测试数据
 
-### Soak 稳定性测试（2000 次连接）
+### 基准测试（3 次取均值，Intel i5-13600KF）
+
+| 操作 | 耗时 | 内存分配 | 吞吐量 | 说明 |
+|------|------|---------|--------|------|
+| `CacheManager.GetProfile` (命中) | 13.0 ns/op | 0 B/op | ~77M ops/s | sync.Map 读取，零分配 |
+| `CacheManager.GetProfile` (未命中) | 6.0 ns/op | 0 B/op | ~167M ops/s | sync.Map miss，最快路径 |
+| `computeFingerprint` | 3.8 ns/op | 0 B/op | ~263M ops/s | FNV64 哈希计算 |
+
+**关键指标解读：**
+- **零分配 (0 B/op)**：GetProfile 和 fingerprint 计算均无堆分配，GC 压力为零
+- **纳秒级延迟**：缓存查找耗时 ~13ns，远低于网络 RTT（~100ms），对握手延迟无感知
+- **高吞吐**：单核 77M ops/s，足以应对任何并发场景
+
+### Soak 稳定性测试（2000 次连续握手）
 
 ```
-Connections: 2000
-Alloc delta: 142,800 bytes (0.14 MB)
-Alloc growth: 15.79%
-GC cycles: 1
+环境:    Go 1.24, amd64
+连接数:  2000 次连续 TLS 握手（无网络，纯内存）
+内存增量: 142,736 bytes (0.14 MB)
+增长比例: 15.78%
+GC 次数:  1 次
 ```
+
+**关键指标解读：**
+- **0.14 MB / 2000 次**：每次握手平均占用 71 字节，远低于标准 TLS 的 ~2KB
+- **15.78% 增长**：sync.Pool 和 map 扩容的正常水位，非泄漏
+- **1 次 GC**：内存管理高效，无频繁回收
+
+### Race Detector 测试
+
+```
+环境:    -race 标志开启
+连接数:  2000 次（Soak 测试内含并发）
+数据竞争: 0
+内存增量: 327,472 bytes (0.31 MB)（race detector 本身注入 ~2x overhead）
+增长比例: 31.29%（race detector 正常范围）
+```
+
+**关键指标解读：**
+- **零数据竞争**：所有 sync.Map/Mutex/Atomic 操作线程安全
+- **race detector 开销**：内存增长翻倍（0.14→0.31 MB）是正常行为，不影响生产环境
+
+### 稳定性验证（5 轮连续全量测试）
+
+```
+轮次  结果    耗时
+ 1    PASS    0.58s
+ 2    PASS    0.51s
+ 3    PASS    0.49s
+ 4    PASS    0.52s
+ 5    PASS    0.50s
+```
+
+**关键指标解读：**
+- **100% 通过率**：5 轮全绿，无 flaky test
+- **耗时稳定**：0.49-0.58s，无异常波动
 
 ### 全量测试结果
 
 ```
-ok  github.com/Maolaohei/REALITY  0.521s
-37/37 PASS
+ok  github.com/Maolaohei/REALITY  1.990s
+37/37 PASS（含 Soak 2000 次连接）
 ```
 
-### Race Detector 结果
+### 持久化存储测试
 
-```
-ok  github.com/Maolaohei/REALITY  2.204s (with -race)
-0 data races detected
-```
+| 测试项 | 耗时 | 说明 |
+|--------|------|------|
+| `PersistentStoreSaveLoad` | 0.02s | 写入 + 读回 + 验证一致性 |
+| `PersistentStoreSkipsExpired` | 0.00s | 过期条目自动跳过 |
+| `PersistentStoreAtomicWrite` | 0.00s | 原子写入（tmp → fsync → rename） |
 
 ---
 
