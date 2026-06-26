@@ -381,19 +381,35 @@ func (m *CacheManager) CleanupPending(maxAge time.Duration) {
 }
 
 // startCleanupLoop runs CleanupPending every interval in the background.
-func (m *CacheManager) startCleanupLoop(interval time.Duration) {
+func (m *CacheManager) startCleanupLoop(interval time.Duration, stop <-chan struct{}) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for range ticker.C {
-			m.CleanupPending(10 * time.Minute)
+		for {
+			select {
+			case <-ticker.C:
+				m.CleanupPending(10 * time.Minute)
+			case <-stop:
+				return
+			}
 		}
 	}()
 }
 
 var globalCacheManager = NewCacheManager()
 
+var cleanupStop = make(chan struct{})
+
 func init() {
 	// Start background cleanup for leaked Pin/Unpin.
-	globalCacheManager.startCleanupLoop(5 * time.Minute)
+	globalCacheManager.startCleanupLoop(5*time.Minute, cleanupStop)
+}
+
+// StopCleanupLoop stops the background cleanup goroutine. For test cleanup.
+func StopCleanupLoop() {
+	select {
+	case <-cleanupStop:
+	default:
+		close(cleanupStop)
+	}
 }
