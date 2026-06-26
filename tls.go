@@ -269,10 +269,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		fmt.Printf("REALITY remoteAddr: %v\n", remoteAddr)
 	}
 
-	// Initialize persistent store on first call.
+	// Initialize event handlers and persistent store on first call.
 	if profileStore == nil && config.CacheDir != "" {
 		store := InitPersistentStore(config.CacheDir)
 		store.StartPeriodicSave(5 * time.Minute)
+		// Register event handlers for cache/persist/refresh.
+		RegisterAllHandlers(config.Show)
 		// Warmup: proactively probe all known targets in background.
 		WarmupProfiles(config.CacheDir)
 	}
@@ -578,7 +580,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			if len(hs.clientHello.alpnProtocols) > 0 {
 				alpn = hs.clientHello.alpnProtocols[0]
 			}
-			profileKey := config.Dest + "|" + hs.clientHello.serverName + "|" + alpn
 			recordCount := 0
 			for _, l := range usedLen {
 				if l > 0 {
@@ -593,20 +594,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				RecordCount:  recordCount,
 				CapturedAt:   time.Now(),
 			}
-			if globalCacheManager.StoreProfile(profileKey, profile) {
-				if config.Show {
-					fmt.Printf("REALITY remoteAddr: %v\tcached profile for %v\n", remoteAddr, config.Dest)
-				}
-				// Persist new profile to disk.
-				if profileStore != nil {
-					go profileStore.Save()
-				}
-				// Start background refresh for this target.
-				StartBackgroundRefreshForProfile(config.Dest, hs.clientHello.serverName)
-			}
 
-			// Cache target fingerprint for background updates.
-			fpKey := config.Dest + "|" + hs.clientHello.serverName
+			// Build fingerprint for cache.
 			fp := &targetFingerprintCache{
 				CipherSuite:       hs.hello.cipherSuite,
 				ALPN:              alpn,
@@ -615,12 +604,16 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				SignatureSchemes:  hs.clientHello.supportedSignatureAlgorithms,
 				LastUpdated:       time.Now(),
 			}
-			globalCacheManager.StoreFingerprint(fpKey, fp)
 
-			// Print cache statistics for diagnostics.
-			if config.Show {
-				fmt.Println(globalCacheManager.CacheReport())
-			}
+			// Emit event — cache/persist/refresh handlers process it.
+			globalEventBus.Emit(Event{
+				Type:        EventHandshakeComplete,
+				Dest:        config.Dest,
+				ServerName:  hs.clientHello.serverName,
+				ALPN:        alpn,
+				Profile:     profile,
+				Fingerprint: fp,
+			})
 			break
 		}
 		mutex.Unlock()
