@@ -998,6 +998,8 @@ func (c *Conn) flush() (int, error) {
 		return 0, nil
 	}
 
+	// sendBuf is already a contiguous []byte built by append.
+	// Single Write syscall — optimal for this use case.
 	n, err := c.conn.Write(c.sendBuf)
 	c.bytesSent += int64(n)
 	c.sendBuf = nil
