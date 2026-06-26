@@ -183,6 +183,7 @@ type RealityProfile struct {
 	Fingerprint   uint64
 	CipherSuite   uint16
 	ALPN          string
+	TLSVersion    uint16 // TLS 1.2 or 1.3 — different versions have different record layouts
 	RecordCount   int
 	CapturedAt    time.Time
 }
@@ -217,7 +218,7 @@ func verifyTargetUnchanged(dest, serverName string, hello *serverHelloMsg, clien
 	if len(clientHello.alpnProtocols) > 0 {
 		alpn = clientHello.alpnProtocols[0]
 	}
-	key := dest + "|" + serverName + "|" + alpn
+	key := CacheKey(dest, serverName, alpn, VersionTLS13)
 	profile, _ := globalCacheManager.GetProfile(key)
 	if profile == nil {
 		return false
@@ -591,6 +592,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				Fingerprint:  computeFingerprint(hs.hello.cipherSuite, alpn, usedLen[0], usedLen[2]),
 				CipherSuite:  hs.hello.cipherSuite,
 				ALPN:         alpn,
+				TLSVersion:   hs.c.vers,
 				RecordCount:  recordCount,
 				CapturedAt:   time.Now(),
 			}
@@ -611,6 +613,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				Dest:        config.Dest,
 				ServerName:  hs.clientHello.serverName,
 				ALPN:        alpn,
+				TLSVersion:  hs.c.vers,
 				Profile:     profile,
 				Fingerprint: fp,
 			})

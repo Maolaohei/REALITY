@@ -29,6 +29,7 @@ type PersistProfileEntry struct {
 	Fingerprint uint64   `json:"fingerprint"`
 	CipherSuite uint16   `json:"cipher_suite"`
 	ALPN        string   `json:"alpn"`
+	TLSVersion  uint16   `json:"tls_version"`
 	RecordCount int      `json:"record_count"`
 	CapturedAt  int64    `json:"captured_at"`
 }
@@ -77,6 +78,7 @@ func (s *PersistentProfileStore) Save() {
 			Fingerprint: p.Fingerprint,
 			CipherSuite: p.CipherSuite,
 			ALPN:        p.ALPN,
+			TLSVersion:  p.TLSVersion,
 			RecordCount: p.RecordCount,
 			CapturedAt:  p.CapturedAt.UnixNano(),
 		}
@@ -134,6 +136,7 @@ func (s *PersistentProfileStore) load() {
 			Fingerprint: entry.Fingerprint,
 			CipherSuite: entry.CipherSuite,
 			ALPN:        entry.ALPN,
+			TLSVersion:  entry.TLSVersion,
 			RecordCount: entry.RecordCount,
 			CapturedAt:  capturedAt,
 		}

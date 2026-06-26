@@ -12,11 +12,12 @@ const (
 
 // Event represents a handshake lifecycle event.
 type Event struct {
-	Type     EventType
-	Dest     string
-	ServerName string
-	ALPN     string
-	Profile  *RealityProfile
+	Type        EventType
+	Dest        string
+	ServerName  string
+	ALPN        string
+	TLSVersion  uint16 // TLS 1.2 or 1.3
+	Profile     *RealityProfile
 	Fingerprint *targetFingerprintCache
 }
 
