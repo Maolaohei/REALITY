@@ -1,6 +1,6 @@
 module github.com/Maolaohei/REALITY
 
-go 1.24.0
+go 1.26.4
 
 require (
 	github.com/cloudflare/circl v1.6.3

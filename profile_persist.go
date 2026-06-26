@@ -14,6 +14,7 @@ type PersistentProfileStore struct {
 	mu       sync.Mutex
 	filePath string
 	enabled  atomic.Bool
+	quit     chan struct{}
 }
 
 // ProfileFile is the JSON structure for persistent storage.
@@ -149,13 +150,30 @@ func (s *PersistentProfileStore) load() {
 
 // StartPeriodicSave starts a goroutine that saves cache every interval.
 func (s *PersistentProfileStore) StartPeriodicSave(interval time.Duration) {
+	s.quit = make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for range ticker.C {
-			s.Save()
+		for {
+			select {
+			case <-ticker.C:
+				s.Save()
+			case <-s.quit:
+				return
+			}
 		}
 	}()
+}
+
+// StopPeriodicSave stops the periodic save goroutine.
+func (s *PersistentProfileStore) StopPeriodicSave() {
+	if s.quit != nil {
+		select {
+		case <-s.quit:
+		default:
+			close(s.quit)
+		}
+	}
 }
 
 // SaveOnShutdown should be called via defer or signal handler.
