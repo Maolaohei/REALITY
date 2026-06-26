@@ -1544,4 +1544,103 @@ func TestBackgroundRefreshFormatStats(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// Pin Fallback TTL Tests
+// ============================================================================
+
+func TestPinFallbackTTL_CleanupDeletesExpired(t *testing.T) {
+	key := "pin.fallback.test|microsoft.com|h2"
+	fp := computeFingerprint(0x1301, "h2", 1215, 41)
+
+	// Store a profile.
+	globalCacheManager.StoreProfile(key, &RealityProfile{
+		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
+		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
+	})
+
+	// Pin it (simulating active connection).
+	profile, ok := globalCacheManager.Pin(key)
+	if !ok || profile == nil {
+		t.Fatal("Pin should succeed")
+	}
+
+	// Invalidate — should mark PendingDelete (not actual delete because refCount=1).
+	globalCacheManager.InvalidateProfile(key)
+	val, ok := globalCacheManager.entries.Load(key)
+	if !ok {
+		t.Fatal("entry should still exist (pinned)")
+	}
+	entry := val.(*ProfileEntry)
+	if entry.State != ProfilePendingDelete {
+		t.Fatalf("state = %v, want PendingDelete", entry.State)
+	}
+
+	// Simulate time passing by backdating PendingSince.
+	entry.PendingSince = time.Now().Add(-15 * time.Minute)
+
+	// Run cleanup with 10min maxAge — should force delete.
+	globalCacheManager.CleanupPending(10 * time.Minute)
+
+	// Entry should be gone now.
+	_, ok = globalCacheManager.entries.Load(key)
+	if ok {
+		t.Fatal("entry should be deleted after cleanup")
+	}
+
+	// Unpin should be safe (no-op on missing entry).
+	globalCacheManager.Unpin(key)
+}
+
+func TestPinFallbackTTL_KeepsRecentEntries(t *testing.T) {
+	key := "pin.fallback.recent|microsoft.com|h2"
+	fp := computeFingerprint(0x1301, "h2", 1215, 41)
+
+	globalCacheManager.StoreProfile(key, &RealityProfile{
+		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
+		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
+	})
+
+	globalCacheManager.Pin(key)
+	globalCacheManager.InvalidateProfile(key)
+
+	// PendingSince is recent (now) — cleanup should NOT delete.
+	globalCacheManager.CleanupPending(10 * time.Minute)
+
+	_, ok := globalCacheManager.entries.Load(key)
+	if !ok {
+		t.Fatal("recent PendingDelete entry should NOT be cleaned up")
+	}
+
+	// Cleanup.
+	globalCacheManager.Unpin(key)
+	globalCacheManager.InvalidateProfile(key)
+}
+
+func TestPinFallbackTTL_SafetyNetForLeak(t *testing.T) {
+	key := "pin.fallback.leak|microsoft.com|h2"
+	fp := computeFingerprint(0x1301, "h2", 1215, 41)
+
+	globalCacheManager.StoreProfile(key, &RealityProfile{
+		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
+		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
+	})
+
+	// Simulate a leak: Pin but never Unpin.
+	globalCacheManager.Pin(key)
+	globalCacheManager.InvalidateProfile(key)
+
+	// Force PendingSince to 15 minutes ago (simulating time passing).
+	val, _ := globalCacheManager.entries.Load(key)
+	entry := val.(*ProfileEntry)
+	entry.PendingSince = time.Now().Add(-15 * time.Minute)
+
+	// Even though refCount > 0, cleanup should force delete (safety net).
+	globalCacheManager.CleanupPending(10 * time.Minute)
+
+	_, ok := globalCacheManager.entries.Load(key)
+	if ok {
+		t.Fatal("leaked entry should be force-deleted by cleanup")
+	}
+}
+
 
