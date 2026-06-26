@@ -69,8 +69,9 @@ func (s *PersistentProfileStore) Save() {
 		Profiles: make(map[string]*ProfileEntry),
 	}
 
-	// Collect profiles
-	globalCacheManager.RangeProfiles(func(key string, p *RealityProfile) bool {
+	// Take a snapshot for consistent serialization.
+	snapshot := globalCacheManager.SnapshotProfiles()
+	for key, p := range snapshot {
 		file.Profiles[key] = &ProfileEntry{
 			RecordLens:  p.RecordLens,
 			Fingerprint: p.Fingerprint,
@@ -79,8 +80,7 @@ func (s *PersistentProfileStore) Save() {
 			RecordCount: p.RecordCount,
 			CapturedAt:  p.CapturedAt.UnixNano(),
 		}
-		return true
-	})
+	}
 
 	data, err := json.Marshal(file)
 	if err != nil {

@@ -168,11 +168,10 @@ func (m *RefreshManager) probeAndReschedule(entry *refreshEntry) {
 	}
 }
 
-// probeTarget connects to the target, reads its full TLS handshake
-// (all 7 records), and compares against the cached profile.
+// probeTarget connects to the target and compares against cached profile.
+// Two-phase approach: Phase A reads only ServerHello (fast path),
+// Phase B reads all 7 records only if Phase A detects changes.
 // Returns true if probe succeeded, false on error.
-// Only invalidates cache on successful probe that detects changes,
-// or after 3+ consecutive failures (network unreachable).
 func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 	defer cancel()
@@ -180,95 +179,92 @@ func (m *RefreshManager) probeTarget(dest, serverName string) bool {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", dest)
 	if err != nil {
-		// Network failure — don't invalidate, let failCount handle it.
 		return false
 	}
 	defer conn.Close()
 
-	// Read the target's full TLS handshake to capture record lengths.
 	buf := make([]byte, maxRecordSize)
 	s2cSaved := make([]byte, 0, maxRecordSize)
-	handshakeLen := 0
-	var recordLens [7]int
-	var cipherSuite uint16
 
-	recordIndex := 0
+	// Phase A: Read only ServerHello.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
+	if err != nil {
+		return false
+	}
+	s2cSaved = append(s2cSaved, buf[:n]...)
+
+	// Validate ServerHello record.
+	if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 {
+		return false
+	}
+	if recordType(s2cSaved[0]) != recordTypeHandshake || s2cSaved[5] != typeServerHello {
+		return false
+	}
+	serverHelloLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
+	if serverHelloLen > maxTLSRecordPayload || serverHelloLen > len(s2cSaved) {
+		return false
+	}
+
+	hello := new(serverHelloMsg)
+	if !hello.unmarshal(s2cSaved[recordHeaderLen:serverHelloLen]) {
+		return false
+	}
+
+	// Quick check: compare cipherSuite only.
+	key := dest
+	profile := globalCacheManager.GetProfile(key)
+	if profile != nil && !profile.IsExpired() {
+		if profile.CipherSuite == hello.cipherSuite {
+			// CipherSuite unchanged — skip Phase B (fast path).
+			return true
+		}
+		// CipherSuite changed — need Phase B to confirm.
+	}
+
+	// Phase B: Read remaining records to get full record lengths.
+	var recordLens [7]int
+	recordLens[0] = serverHelloLen
+	recordIndex := 1
+	s2cSaved = s2cSaved[serverHelloLen:]
+
 	for recordIndex < 7 {
+		for recordIndex < 7 && len(s2cSaved) > recordHeaderLen {
+			handshakeLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
+			if handshakeLen > maxTLSRecordPayload {
+				return false
+			}
+			if len(s2cSaved) < handshakeLen {
+				break
+			}
+			recordLens[recordIndex] = handshakeLen
+			s2cSaved = s2cSaved[handshakeLen:]
+			recordIndex++
+		}
+		if recordIndex >= 7 {
+			break
+		}
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
 		if err != nil {
 			break
 		}
 		s2cSaved = append(s2cSaved, buf[:n]...)
+	}
 
-		for recordIndex < 7 && len(s2cSaved) > recordHeaderLen {
-			if handshakeLen == 0 {
-				if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 {
-					return false
-				}
-				rt := recordType(s2cSaved[0])
-				switch recordIndex {
-				case 0: // ServerHello
-					if rt != recordTypeHandshake || s2cSaved[5] != typeServerHello {
-						return false
-					}
-				case 1: // ChangeCipherSpec
-					if rt != recordTypeChangeCipherSpec || s2cSaved[5] != 1 {
-						return false
-					}
-				default: // ApplicationData records
-					if rt != recordTypeApplicationData {
-						return false
-					}
-				}
-				handshakeLen = recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
-			}
-			if handshakeLen > maxTLSRecordPayload {
-				return false
-			}
-			if len(s2cSaved) < handshakeLen {
-				break // need more data
-			}
-			recordLens[recordIndex] = handshakeLen
-
-			// Parse ServerHello to extract cipher suite.
-			if recordIndex == 0 {
-				hello := new(serverHelloMsg)
-				if !hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) {
-					return false
-				}
-				cipherSuite = hello.cipherSuite
-			}
-
-			s2cSaved = s2cSaved[handshakeLen:]
-			handshakeLen = 0
-			recordIndex++
+	// Compare full profile.
+	if profile != nil && !profile.IsExpired() {
+		if profile.CipherSuite != hello.cipherSuite {
+			globalCacheManager.InvalidateProfile(key)
+			globalCacheManager.InvalidateFingerprint()
+			return true
+		}
+		if !recordLensMatch(profile.RecordLens, recordLens) {
+			globalCacheManager.InvalidateProfile(key)
+			return true
 		}
 	}
 
-	if recordIndex == 0 {
-		return false
-	}
-
-	// Probe succeeded — compare against cached profile.
-	key := dest
-	if profile := globalCacheManager.GetProfile(key); profile != nil {
-		if !profile.IsExpired() {
-			// Check if cipher suite changed.
-			if profile.CipherSuite != cipherSuite {
-				globalCacheManager.InvalidateProfile(key)
-				globalCacheManager.InvalidateFingerprint()
-				return true
-			}
-			// Check if record lengths differ (with tolerance for record[6]).
-			if !recordLensMatch(profile.RecordLens, recordLens) {
-				globalCacheManager.InvalidateProfile(key)
-				return true
-			}
-		}
-	}
-
-	// Target alive and unchanged.
 	return true
 }
 

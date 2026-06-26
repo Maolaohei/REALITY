@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // CacheManager manages all REALITY cache state.
@@ -13,6 +14,7 @@ type CacheManager struct {
 	fingerprints sync.Map // map[string]*targetFingerprintCache
 	stats        CacheManagerStats
 	dirty        atomic.Bool // true when cache has unsaved changes
+	maxProfiles  int         // max profiles before LRU eviction
 }
 
 // CacheManagerStats tracks cache hit/miss rates for diagnostics.
@@ -24,17 +26,43 @@ type CacheManagerStats struct {
 
 // NewCacheManager creates a new cache manager.
 func NewCacheManager() *CacheManager {
-	return &CacheManager{}
+	return &CacheManager{
+		maxProfiles: 1000,
+	}
 }
 
 // StoreProfile stores a profile in the cache. Returns true if it was a new entry.
+// If the cache exceeds maxProfiles, the oldest profile is evicted.
 func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 	_, loaded := m.profiles.LoadOrStore(key, profile)
 	if !loaded {
 		m.stats.ProfileEntries.Add(1)
 		m.dirty.Store(true)
+		m.evictIfFull()
 	}
 	return !loaded
+}
+
+// evictIfFull removes the oldest profile if cache exceeds maxProfiles.
+func (m *CacheManager) evictIfFull() {
+	if int(m.stats.ProfileEntries.Load()) <= m.maxProfiles {
+		return
+	}
+	// Find and remove the oldest profile.
+	var oldestKey string
+	var oldestTime time.Time
+	m.profiles.Range(func(key, val any) bool {
+		p := val.(*RealityProfile)
+		if oldestKey == "" || p.CapturedAt.Before(oldestTime) {
+			oldestKey = key.(string)
+			oldestTime = p.CapturedAt
+		}
+		return true
+	})
+	if oldestKey != "" {
+		m.profiles.Delete(oldestKey)
+		m.stats.ProfileEntries.Add(-1)
+	}
 }
 
 // GetProfile retrieves a profile from the cache. Returns nil if not found or expired.
@@ -49,6 +77,17 @@ func (m *CacheManager) GetProfile(key string) *RealityProfile {
 		return nil
 	}
 	return profile
+}
+
+// GetProfileOrExpired retrieves a profile, even if expired.
+// Used for fallback during TTL gap (between expiration and next refresh).
+// Returns nil only if the profile doesn't exist at all.
+func (m *CacheManager) GetProfileOrExpired(key string) *RealityProfile {
+	val, ok := m.profiles.Load(key)
+	if !ok {
+		return nil
+	}
+	return val.(*RealityProfile)
 }
 
 // InvalidateProfile removes a profile from the cache.
@@ -86,6 +125,18 @@ func (m *CacheManager) RangeProfiles(fn func(key string, profile *RealityProfile
 	m.profiles.Range(func(key, val any) bool {
 		return fn(key.(string), val.(*RealityProfile))
 	})
+}
+
+// SnapshotProfiles returns a shallow copy of all profiles for consistent serialization.
+func (m *CacheManager) SnapshotProfiles() map[string]*RealityProfile {
+	snap := make(map[string]*RealityProfile)
+	m.profiles.Range(func(key, val any) bool {
+		p := val.(*RealityProfile)
+		cp := *p // shallow copy
+		snap[key.(string)] = &cp
+		return true
+	})
+	return snap
 }
 
 // IsDirty returns true if the cache has unsaved changes.
