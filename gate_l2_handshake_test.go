@@ -4,8 +4,14 @@ package reality
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -335,4 +341,139 @@ func TestL2_REALITY_DataPlane(t *testing.T) {
 	}
 
 	t.Log("REALITY Data Plane: 10/10 passed")
+}
+
+// TestL2_REALITY_LargeEncryptedExtensions verifies the C2 code path:
+// when the target's EncryptedExtensions exceeds 512 bytes, the handshakeBuf
+// accumulation logic must correctly reconstruct the message across iterations.
+func TestL2_REALITY_LargeEncryptedExtensions(t *testing.T) {
+	// Generate a cert with many SANs to produce a large EncryptedExtensions.
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sans []string
+	for i := 0; i < 50; i++ {
+		sans = append(sans, fmt.Sprintf("san%d.example.com", i))
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{Organization: []string{"C2 Test"}},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     sans,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	targetCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{targetCert},
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetLn.Close()
+	targetAddr := targetLn.Addr().String()
+
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 65536)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					c.Write(buf[:n])
+				}
+			}(conn)
+		}
+	}()
+
+	privateKeyBytes := make([]byte, 32)
+	for i := range privateKeyBytes {
+		privateKeyBytes[i] = byte(i + 0x30)
+	}
+
+	serverLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverLn.Close()
+
+	serverConfig := &Config{
+		Dest:        targetAddr,
+		Type:        "tcp",
+		ServerNames: map[string]bool{"c2test.example.com": true},
+		PrivateKey:  privateKeyBytes,
+		ShortIds:    map[[8]byte]bool{{0x02}: true},
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return net.Dial("tcp", targetAddr)
+		},
+	}
+
+	go func() {
+		for {
+			conn, err := serverLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				_, err := Server(context.Background(), c, serverConfig)
+				if err != nil {
+					c.Close()
+				}
+			}(conn)
+		}
+	}()
+
+	go DetectPostHandshakeRecordsLens(serverConfig)
+	time.Sleep(100 * time.Millisecond)
+
+	for i := 0; i < 5; i++ {
+		clientConn, err := tls.Dial("tcp", serverLn.Addr().String(), &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         "c2test.example.com",
+			MinVersion:         tls.VersionTLS13,
+			MaxVersion:         tls.VersionTLS13,
+		})
+		if err != nil {
+			t.Fatalf("iteration %d: dial: %v", i, err)
+		}
+
+		msg := fmt.Sprintf("c2 large ee test %d", i)
+		_, err = clientConn.Write([]byte(msg))
+		if err != nil {
+			t.Fatalf("iteration %d: write: %v", i, err)
+		}
+
+		buf := make([]byte, 4096)
+		clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := clientConn.Read(buf)
+		if err != nil {
+			t.Fatalf("iteration %d: read: %v", i, err)
+		}
+		if string(buf[:n]) != msg {
+			t.Fatalf("iteration %d: data mismatch", i)
+		}
+		clientConn.Close()
+	}
+
+	t.Log("C2 Large EncryptedExtensions: 5/5 passed")
 }
