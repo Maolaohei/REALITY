@@ -301,7 +301,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	}
 
 	remoteAddr := conn.RemoteAddr().String()
-	if config.Show {
+	show := config.Show
+	if show {
 		fmt.Printf("REALITY remoteAddr: %v\n", remoteAddr)
 	}
 
@@ -315,7 +316,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			store := InitPersistentStore(cacheDir)
 			store.StartPeriodicSave(5 * time.Minute)
 			// Register event handlers for cache/persist/refresh.
-			RegisterAllHandlers(config.Show)
+			RegisterAllHandlers(show)
 			// Warmup: proactively probe all known targets in background.
 			WarmupProfiles(cacheDir)
 		}
@@ -400,11 +401,14 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				}
 				block, _ := aes.NewCipher(hs.c.AuthKey)
 				aead, _ := cipher.NewGCM(block)
-				if config.Show {
+				if show {
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.AuthKey[:16]: %v\tAEAD: %T\n", remoteAddr, hs.c.AuthKey[:16], aead)
 				}
-				ciphertext := make([]byte, 32)
-				plainText := make([]byte, 32)
+				// Use stack-allocated arrays to avoid heap allocs for 32-byte buffers.
+				var ctBuf [32]byte
+				var ptBuf [32]byte
+				ciphertext := ctBuf[:]
+				plainText := ptBuf[:]
 				copy(ciphertext, hs.clientHello.sessionId)
 				copy(hs.clientHello.sessionId, plainText) // hs.clientHello.sessionId points to hs.clientHello.raw[39:]
 				if _, err = aead.Open(plainText[:0], hs.clientHello.random[20:], ciphertext, hs.clientHello.original); err != nil {
@@ -414,7 +418,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				copy(hs.c.ClientVer[:], plainText)
 				hs.c.ClientTime = time.Unix(int64(binary.BigEndian.Uint32(plainText[4:])), 0)
 				copy(hs.c.ClientShortId[:], plainText[8:])
-				if config.Show {
+				if show {
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientVer: %v\n", remoteAddr, hs.c.ClientVer)
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientTime: %v\n", remoteAddr, hs.c.ClientTime)
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientShortId: %v\n", remoteAddr, hs.c.ClientShortId)
@@ -431,7 +435,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				}
 				break
 			}
-			if config.Show {
+			if show {
 				fmt.Printf("REALITY remoteAddr: %v\ths.c.conn == conn: %v\n", remoteAddr, hs.c.conn == conn)
 			}
 			break
@@ -443,7 +447,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			close(clientHelloReady)
 		}
 		if hs.c.conn != conn {
-			if config.Show && hs.clientHello != nil {
+			if show && hs.clientHello != nil {
 				fmt.Printf("REALITY remoteAddr: %v\tforwarded SNI: %v\n", remoteAddr, hs.clientHello.serverName)
 			}
 			_, err := io.Copy(target, NewRatelimitedConn(underlying, &config.LimitFallbackUpload))
@@ -502,7 +506,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					}
 					handshakeLen = recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
 				}
-				if config.Show {
+				if show {
 					fmt.Printf("REALITY remoteAddr: %v\tlen(s2cSaved): %v\t%v: %v\n", remoteAddr, len(s2cSaved), t, handshakeLen)
 				}
 				if handshakeLen > maxTLSRecordPayload { // exceeds TLS spec max (RFC 8446 §5.1)
@@ -546,7 +550,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			copy(usedLen[:], hs.c.out.handshakeLen[:])
 
 			err = hs.handshake()
-			if config.Show {
+			if show {
 				fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
 			}
 			if err != nil {
@@ -560,13 +564,13 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					if err != nil {
 						conn.Close()
 					}
-					if config.Show {
+					if show {
 						fmt.Printf("REALITY remoteAddr: %v\ttime.Since(start): %v\tn: %v\terr: %v\n", remoteAddr, time.Since(start), n, err)
 					}
 				}
 			}()
 			err = hs.readClientFinished()
-			if config.Show {
+			if show {
 				fmt.Printf("REALITY remoteAddr: %v\ths.readClientFinished() err: %v\n", remoteAddr, err)
 			}
 			if err != nil {
@@ -603,7 +607,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 							postHandshakeRecord := hs.c.out.cipher.(aead).Seal(pt[:5], hs.c.out.seq[:], pt[5:], pt[:5])
 							hs.c.out.incSeq()
 							hs.c.write(postHandshakeRecord)
-							if config.Show {
+							if show {
 								fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
 							}
 						}
@@ -630,6 +634,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					recordCount++
 				}
 			}
+			now := time.Now()
 			profile := &RealityProfile{
 				RecordLens:   usedLen,
 				Fingerprint:  computeFingerprint(hs.hello.cipherSuite, alpn, usedLen[0], usedLen[2]),
@@ -637,7 +642,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				ALPN:         alpn,
 				TLSVersion:   hs.c.vers,
 				RecordCount:  recordCount,
-				CapturedAt:   time.Now(),
+				CapturedAt:   now,
 			}
 
 			// Build fingerprint for cache.
@@ -647,7 +652,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				SupportedVersions: hs.clientHello.supportedVersions,
 				KeyShareGroup:     uint16(hs.hello.serverShare.group),
 				SignatureSchemes:  hs.clientHello.supportedSignatureAlgorithms,
-				LastUpdated:       time.Now(),
+				LastUpdated:       now,
 			}
 
 			// Emit event — cache/persist/refresh handlers process it.
@@ -685,7 +690,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 	waitGroup.Wait()
 	target.Close()
-	if config.Show {
+	if show {
 		fmt.Printf("REALITY remoteAddr: %v\ths.c.isHandshakeComplete.Load(): %v\n", remoteAddr, hs.c.isHandshakeComplete.Load())
 	}
 	if hs.c.isHandshakeComplete.Load() {

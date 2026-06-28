@@ -42,14 +42,14 @@ func (b *EventBus) On(eventType EventType, handler EventHandler) {
 	b.handlers[eventType] = append(b.handlers[eventType], handler)
 }
 
-// Emit fires an event to all registered handlers.
+// Emit fires an event to all registered handlers concurrently.
 func (b *EventBus) Emit(event Event) {
 	b.mu.RLock()
 	handlers := b.handlers[event.Type]
 	b.mu.RUnlock()
 
 	for _, h := range handlers {
-		h(event)
+		go h(event)
 	}
 }
 
