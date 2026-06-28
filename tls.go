@@ -164,6 +164,13 @@ var (
 	// as defined by RFC 8446 §5.1 (2^14 = 16384 bytes).
 	maxTLSRecordPayload = 16384
 
+	// maxConcurrentHandshakes limits the number of simultaneous handshake
+	// attempts to prevent resource exhaustion from connection flooding.
+	maxConcurrentHandshakes = 1000
+
+	// handshakeSem is a counting semaphore for concurrent handshakes.
+	handshakeSem = make(chan struct{}, maxConcurrentHandshakes)
+
 	// empty is a reusable zero-filled buffer for padding and ML-DSA-65 cert
 	// extensions. 8192 bytes is sufficient (largest use: 3309 bytes).
 	empty = make([]byte, 8192)
@@ -273,9 +280,26 @@ func Value(vals ...byte) (value int) {
 	return
 }
 
+var maxTimeDiffWarnOnce sync.Once
+
 // You MUST call `DetectPostHandshakeRecordsLens(config)` in advance manually
 // if you don't use REALITY's listener, e.g., Xray-core's RAW transport.
 func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
+	// Rate-limit concurrent handshakes to prevent resource exhaustion.
+	select {
+	case handshakeSem <- struct{}{}:
+		defer func() { <-handshakeSem }()
+	case <-ctx.Done():
+		conn.Close()
+		return nil, ctx.Err()
+	}
+
+	if config.MaxTimeDiff == 0 {
+		maxTimeDiffWarnOnce.Do(func() {
+			fmt.Println("REALITY WARNING: MaxTimeDiff not configured, defaulting to 90s. Set MaxTimeDiff=-1 to disable or MaxTimeDiff=<duration> to set explicitly.")
+		})
+	}
+
 	remoteAddr := conn.RemoteAddr().String()
 	if config.Show {
 		fmt.Printf("REALITY remoteAddr: %v\n", remoteAddr)
@@ -348,7 +372,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	go func() {
 		for {
 			mutex.Lock()
-			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
+			hs.clientHello, _, err = hs.c.readClientHello(context.Background())
 			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
@@ -395,9 +419,13 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientTime: %v\n", remoteAddr, hs.c.ClientTime)
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientShortId: %v\n", remoteAddr, hs.c.ClientShortId)
 				}
+				maxTimeDiff := config.MaxTimeDiff
+				if maxTimeDiff == 0 {
+					maxTimeDiff = 90 * time.Second
+				}
 				if (config.MinClientVer == nil || bigEndianUint24(hs.c.ClientVer[:]) >= bigEndianUint24(config.MinClientVer)) &&
 					(config.MaxClientVer == nil || bigEndianUint24(hs.c.ClientVer[:]) <= bigEndianUint24(config.MaxClientVer)) &&
-					(config.MaxTimeDiff == 0 || time.Since(hs.c.ClientTime).Abs() <= config.MaxTimeDiff) &&
+					(maxTimeDiff < 0 || time.Since(hs.c.ClientTime).Abs() <= maxTimeDiff) &&
 					(config.ShortIds[hs.c.ClientShortId]) {
 					hs.c.conn = conn
 				}
@@ -524,7 +552,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			if err != nil {
 				break
 			}
-			go func() { // TODO: Probe some time-outs in advance.
+			go func() {
 				if handshakeLen-len(s2cSaved) > 0 {
 					io.ReadFull(target, buf[:handshakeLen-len(s2cSaved)])
 				}

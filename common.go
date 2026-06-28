@@ -559,7 +559,7 @@ type Config struct {
 	PrivateKey   []byte
 	MinClientVer []byte
 	MaxClientVer []byte
-	MaxTimeDiff  time.Duration
+	MaxTimeDiff  time.Duration // default 90s if 0; set to -1 to disable replay protection
 	ShortIds     map[[8]byte]bool
 
 	Mldsa65Key []byte

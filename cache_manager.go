@@ -67,12 +67,12 @@ func NewCacheManager() *CacheManager {
 // --- Singleflight ---
 
 func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (*RealityProfile, error) {
-	val, _ := m.singleflight.LoadOrStore(key, &probeFlight{done: make(chan struct{})})
-	flight := val.(*probeFlight)
-	select {
-	case <-flight.done:
-		return flight.value, flight.err
-	default:
+	flight := &probeFlight{done: make(chan struct{})}
+	val, loaded := m.singleflight.LoadOrStore(key, flight)
+	if loaded {
+		existing := val.(*probeFlight)
+		<-existing.done
+		return existing.value, existing.err
 	}
 	flight.value, flight.err = fn()
 	close(flight.done)

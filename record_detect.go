@@ -2,6 +2,7 @@ package reality
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"math"
@@ -30,10 +31,14 @@ func DetectPostHandshakeRecordsLens(config *Config) {
 							GlobalPostHandshakeRecordsLens.Store(key, []int{})
 						}
 					}()
-					target, err := net.Dial(config.Type, config.Dest)
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					var d net.Dialer
+					target, err := d.DialContext(ctx, config.Type, config.Dest)
 					if err != nil {
 						return
 					}
+					defer target.Close()
 					if config.Xver == 1 || config.Xver == 2 {
 						if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, target.LocalAddr(), target.RemoteAddr()).WriteTo(target); err != nil {
 							return
@@ -55,7 +60,7 @@ func DetectPostHandshakeRecordsLens(config *Config) {
 						nextProtos = nil
 					}
 					uConn := utls.UClient(detectConn, &utls.Config{
-						ServerName: sni, // needs new loopvar behaviour
+						ServerName: sni,
 						NextProtos: nextProtos,
 					}, fingerprint)
 					if err = uConn.Handshake(); err != nil {
@@ -64,10 +69,14 @@ func DetectPostHandshakeRecordsLens(config *Config) {
 					io.Copy(io.Discard, uConn)
 				}()
 				go func() {
-					target, err := net.Dial(config.Type, config.Dest)
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					var d net.Dialer
+					target, err := d.DialContext(ctx, config.Type, config.Dest)
 					if err != nil {
 						return
 					}
+					defer target.Close()
 					if config.Xver == 1 || config.Xver == 2 {
 						if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, target.LocalAddr(), target.RemoteAddr()).WriteTo(target); err != nil {
 							return
@@ -89,7 +98,7 @@ func DetectPostHandshakeRecordsLens(config *Config) {
 						Key:  key,
 					}
 					uConn := utls.UClient(conn, &utls.Config{
-						ServerName: sni, // needs new loopvar behaviour
+						ServerName: sni,
 						NextProtos: nextProtos,
 					}, fingerprint)
 					if err = uConn.Handshake(); err != nil {
