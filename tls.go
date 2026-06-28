@@ -475,6 +475,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		buf := *bufPtr
 		s2cSavedPtr := recordBufPool.Get().(*[]byte)
 		s2cSaved := (*s2cSavedPtr)[:0]
+		defer recordBufPool.Put(bufPtr)
+		defer recordBufPool.Put(s2cSavedPtr)
 		handshakeLen := 0
 
 		// Read from target and cache the result.
@@ -694,8 +696,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			// Call `underlying.CloseWrite()` once `io.Copy()` returned
 			underlying.CloseWrite()
 		}
-		recordBufPool.Put(bufPtr)
-		recordBufPool.Put(s2cSavedPtr)
 		waitGroup.Done()
 	}()
 
