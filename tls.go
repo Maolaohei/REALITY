@@ -74,9 +74,14 @@ type MirrorConn struct {
 }
 
 func (c *MirrorConn) Read(b []byte) (int, error) {
+	// Caller holds the mutex. We release it here to allow the target read
+	// goroutine to proceed, then re-acquire after our read completes.
+	// Note: if this goroutine panics between Unlock and Lock, the mutex
+	// will be permanently held. The Read syscall itself cannot panic,
+	// and the code between Lock and return is panic-safe (slice ops + Write).
 	c.Unlock()
 	n, err := c.Conn.Read(b)
-	c.Lock() // calling c.Lock() before c.Target.Write(), to make sure that this goroutine has the priority to make the next move
+	c.Lock()
 	if n != 0 {
 		c.Target.Write(b[:n])
 	}
@@ -483,6 +488,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					return
 				}
 				continue
+			}
+			// Guard against OOM from malicious target sending excessive data.
+			// TLS 1.3 handshake is at most 7 records × 16KB = 112KB.
+			// Use 64KB as a safe hard limit (covers normal handshake with margin).
+			if len(s2cSaved)+n > maxRecordSize {
+				break f
 			}
 			mutex.Lock()
 			s2cSaved = append(s2cSaved, buf[:n]...)

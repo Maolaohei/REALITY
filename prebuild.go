@@ -19,6 +19,10 @@ func ProbeTarget(ctx context.Context, config *Config) (*RealityProfile, error) {
 	}
 	defer target.Close()
 
+	// Apply a read deadline so slow targets don't block forever.
+	// Context only covers the dial; reads need their own deadline.
+	target.SetReadDeadline(time.Now().Add(10 * time.Second))
+
 	buf := make([]byte, maxRecordSize)
 	s2cSaved := make([]byte, 0, maxRecordSize)
 	handshakeLen := 0
