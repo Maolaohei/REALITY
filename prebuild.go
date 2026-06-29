@@ -142,13 +142,13 @@ func ensureAutoProbe(config *Config) {
 		if !m.started {
 			m.Start()
 		}
-		m.AddTarget(dest, "")
+		m.AddTarget(dest, "", "")
 	})
 }
 
 func StopAutoProbe(dest string) {
 	if globalRefreshManager != nil {
-		globalRefreshManager.RemoveTarget(dest, "")
+		globalRefreshManager.RemoveTarget(dest, "", "")
 	}
 	probeOnces.Delete(dest)
 }

@@ -19,13 +19,14 @@ const (
 
 // ProfileEntry wraps a RealityProfile with state metadata.
 type ProfileEntry struct {
+	mu             sync.Mutex
 	Profile        *RealityProfile
 	State          ProfileState
 	FailCount      int
 	NextRetry      time.Time
 	TTL            time.Duration
 	StabilityScore int
-	RefCount       int32     // pinned connections using this profile
+	RefCount       int32     // pinned connections using this profile (atomic for read-heavy path)
 	PendingSince   time.Time // when state became PendingDelete (fallback TTL)
 }
 
@@ -91,6 +92,9 @@ func (m *CacheManager) GetProfile(key string) (*RealityProfile, bool) {
 		return nil, false
 	}
 	entry := val.(*ProfileEntry)
+
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
 	// Skip pending-delete for new connections — they should use the new profile.
 	if entry.State == ProfilePendingDelete {
@@ -197,25 +201,31 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 // Old profile is marked PendingDelete; new profile is stored.
 // Old profile is actually deleted when all pinned connections release it.
 func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
-	// Store new profile.
 	newEntry := &ProfileEntry{
 		Profile: newProfile,
 		State:   ProfileValid,
 		TTL:     m.baseTTL,
 	}
+
+	// Step 1: Load old entry before storing new one.
+	oldVal, hadOld := m.entries.Load(key)
+
+	// Step 2: Store new entry.
 	m.entries.Store(key, newEntry)
 	m.stats.HotSwaps.Add(1)
 	m.dirty.Store(true)
 
-	// Mark old profile for deferred deletion.
-	if val, ok := m.entries.Load(key); ok {
-		oldEntry := val.(*ProfileEntry)
+	// Step 3: Mark old entry for deferred deletion.
+	if hadOld {
+		oldEntry := oldVal.(*ProfileEntry)
 		if oldEntry != newEntry {
+			oldEntry.mu.Lock()
 			oldEntry.State = ProfilePendingDelete
 			oldEntry.PendingSince = time.Now()
+			oldEntry.mu.Unlock()
 			// If nothing is using it, delete immediately.
 			if atomic.LoadInt32(&oldEntry.RefCount) <= 0 {
-				m.entries.CompareAndDelete(key, val)
+				m.entries.CompareAndDelete(key, oldVal)
 				m.stats.ProfileInvalidated.Add(1)
 			}
 		}
@@ -226,6 +236,8 @@ func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
 func (m *CacheManager) MarkStale(key string) {
 	if val, ok := m.entries.Load(key); ok {
 		entry := val.(*ProfileEntry)
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
 		if entry.State == ProfileValid || entry.State == ProfileStale {
 			entry.State = ProfileStale
 			if entry.StabilityScore < 4 {
@@ -250,6 +262,8 @@ func (m *CacheManager) MarkNegative(key string) {
 		return
 	}
 	entry := val.(*ProfileEntry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 	entry.FailCount++
 	entry.StabilityScore = 0
 	backoff := time.Duration(1<<min(entry.FailCount-1, 4)) * time.Minute
@@ -276,8 +290,10 @@ func (m *CacheManager) InvalidateProfile(key string) {
 		}
 	} else {
 		// Connections still using it — defer deletion.
+		entry.mu.Lock()
 		entry.State = ProfilePendingDelete
 		entry.PendingSince = time.Now()
+		entry.mu.Unlock()
 	}
 }
 
@@ -287,6 +303,34 @@ func (m *CacheManager) InvalidateFingerprint() {
 
 func (m *CacheManager) StoreFingerprint(key string, fp *targetFingerprintCache) {
 	m.fingerprints.Store(key, fp)
+}
+
+// FindCachedProfileByDest searches for a cached profile matching the given dest prefix
+// and cipher suite. Returns the profile's RecordLens and TLSVersion if found and valid.
+// This is used by Server() to skip target probing when a cached profile is available.
+func (m *CacheManager) FindCachedProfileByDest(dest string, cipherSuite uint16) (lens [7]int, tlsVersion uint16, ok bool) {
+	m.entries.Range(func(key, val any) bool {
+		entry := val.(*ProfileEntry)
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
+		if entry.State == ProfilePendingDelete || entry.State == ProfileNegative {
+			return true
+		}
+		if time.Since(entry.Profile.CapturedAt) >= entry.TTL {
+			return true
+		}
+		if DestFromKey(key.(string)) != dest {
+			return true
+		}
+		if entry.Profile.CipherSuite != cipherSuite {
+			return true
+		}
+		lens = entry.Profile.RecordLens
+		tlsVersion = entry.Profile.TLSVersion
+		ok = true
+		return false
+	})
+	return
 }
 
 // --- Eviction ---

@@ -101,7 +101,7 @@ func TestRegressionBackgroundRefreshNonBlocking(t *testing.T) {
 	m := GetRefreshManager()
 
 	// Start refresh
-	m.AddTarget("example.com:443", "example.com")
+	m.AddTarget("example.com:443", "example.com", "")
 
 	// Verify it's running
 	active := m.GetStats()
@@ -112,7 +112,7 @@ func TestRegressionBackgroundRefreshNonBlocking(t *testing.T) {
 	// Stop — should not block
 	done := make(chan struct{})
 	go func() {
-		m.RemoveTarget("example.com:443", "example.com")
+		m.RemoveTarget("example.com:443", "example.com", "")
 		close(done)
 	}()
 
@@ -347,12 +347,12 @@ func TestRefreshDoesNotBlockHandshake(t *testing.T) {
 	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	m := GetRefreshManager()
 
-	m.AddTarget("example.com:443", "example.com")
+	m.AddTarget("example.com:443", "example.com", "")
 
 	// Stop should be non-blocking
 	done := make(chan struct{})
 	go func() {
-		m.RemoveTarget("example.com:443", "example.com")
+		m.RemoveTarget("example.com:443", "example.com", "")
 		close(done)
 	}()
 

@@ -26,6 +26,8 @@ type RefreshManager struct {
 type refreshEntry struct {
 	dest       string
 	serverName string
+	alpn       string // ALPN for building full cache key
+	cacheKey   string // precomputed CacheKey(dest, serverName, alpn, VersionTLS13)
 	timer      *time.Timer
 	stopCh     chan struct{}
 	failCount  int // consecutive probe failures
@@ -105,7 +107,7 @@ func (m *RefreshManager) Stop() {
 
 // AddTarget registers a target for background refresh. If already registered,
 // this is a no-op. The target will be probed periodically.
-func (m *RefreshManager) AddTarget(dest, serverName string) {
+func (m *RefreshManager) AddTarget(dest, serverName, alpn string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -116,9 +118,11 @@ func (m *RefreshManager) AddTarget(dest, serverName string) {
 	}
 
 	entry := &refreshEntry{
-		dest:       dest,
+		dest:     dest,
 		serverName: serverName,
-		stopCh:     make(chan struct{}),
+		alpn:     alpn,
+		cacheKey: CacheKey(dest, serverName, alpn, VersionTLS13),
+		stopCh:   make(chan struct{}),
 	}
 	entry.timer = time.AfterFunc(randomRefreshInterval(), func() {
 		m.probeAndReschedule(entry)
@@ -127,7 +131,7 @@ func (m *RefreshManager) AddTarget(dest, serverName string) {
 }
 
 // RemoveTarget stops refresh for a single target.
-func (m *RefreshManager) RemoveTarget(dest, serverName string) {
+func (m *RefreshManager) RemoveTarget(dest, serverName, alpn string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -185,7 +189,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", dest)
 	if err != nil {
-		globalCacheManager.MarkNegative(dest)
+		globalCacheManager.MarkNegative(entry.cacheKey)
 		return false
 	}
 	defer conn.Close()
@@ -197,39 +201,38 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
 	if err != nil {
-		globalCacheManager.MarkNegative(dest)
+		globalCacheManager.MarkNegative(entry.cacheKey)
 		return false
 	}
 	s2cSaved = append(s2cSaved, buf[:n]...)
 
 	// Validate ServerHello record.
 	if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 {
-		globalCacheManager.MarkNegative(dest)
+		globalCacheManager.MarkNegative(entry.cacheKey)
 		return false
 	}
 	if recordType(s2cSaved[0]) != recordTypeHandshake || s2cSaved[5] != typeServerHello {
-		globalCacheManager.MarkNegative(dest)
+		globalCacheManager.MarkNegative(entry.cacheKey)
 		return false
 	}
 	serverHelloLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
 	if serverHelloLen > maxTLSRecordPayload || serverHelloLen > len(s2cSaved) {
-		globalCacheManager.MarkNegative(dest)
+		globalCacheManager.MarkNegative(entry.cacheKey)
 		return false
 	}
 
 	hello := new(serverHelloMsg)
 	if !hello.unmarshal(s2cSaved[recordHeaderLen:serverHelloLen]) {
-		globalCacheManager.MarkNegative(dest)
+		globalCacheManager.MarkNegative(entry.cacheKey)
 		return false
 	}
 
 	// Quick check: compare cipherSuite only.
-	key := dest
-	profile, _ := globalCacheManager.GetProfile(key)
+	profile, _ := globalCacheManager.GetProfile(entry.cacheKey)
 	if profile != nil && !profile.IsExpired() {
 		if profile.CipherSuite == hello.cipherSuite {
 			// CipherSuite unchanged — skip Phase B (fast path).
-			globalCacheManager.MarkStale(key)
+			globalCacheManager.MarkStale(entry.cacheKey)
 			return true
 		}
 		// CipherSuite changed — need Phase B to confirm.
@@ -245,7 +248,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 		for recordIndex < 7 && len(s2cSaved) > recordHeaderLen {
 			handshakeLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
 			if handshakeLen > maxTLSRecordPayload {
-				globalCacheManager.MarkNegative(key)
+				globalCacheManager.MarkNegative(entry.cacheKey)
 				return false
 			}
 			if len(s2cSaved) < handshakeLen {
@@ -286,7 +289,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 					RecordLens:   recordLens,
 					Fingerprint:  computeFingerprint(hello.cipherSuite, "", recordLens[0], recordLens[2]),
 					CipherSuite:  hello.cipherSuite,
-					ALPN:         "",
+					ALPN:         entry.alpn,
 					RecordCount:  0,
 					CapturedAt:   time.Now(),
 				}
@@ -295,7 +298,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 						newProfile.RecordCount++
 					}
 				}
-				globalCacheManager.HotSwapProfile(key, newProfile)
+				globalCacheManager.HotSwapProfile(entry.cacheKey, newProfile)
 				globalCacheManager.InvalidateFingerprint()
 			}
 			return true
@@ -305,7 +308,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 	// Profile unchanged — reset debouncing state.
 	entry.stableCount = 0
 
-	globalCacheManager.MarkStale(key)
+	globalCacheManager.MarkStale(entry.cacheKey)
 	return true
 }
 
@@ -323,8 +326,8 @@ func (m *RefreshManager) FormatStats() string {
 }
 
 // invalidateCache removes cached profiles for a target.
-func invalidateCache(dest, serverName string) {
-	profileKey := dest + "|" + serverName
+func invalidateCache(dest, serverName, alpn string) {
+	profileKey := CacheKey(dest, serverName, alpn, VersionTLS13)
 	globalCacheManager.InvalidateProfile(profileKey)
 }
 
@@ -345,18 +348,18 @@ func recordLensMatch(a, b [7]int) bool {
 }
 
 // StartBackgroundRefreshForProfile is called when a new profile is cached.
-func StartBackgroundRefreshForProfile(dest, serverName string) {
+func StartBackgroundRefreshForProfile(dest, serverName, alpn string) {
 	m := GetRefreshManager()
 	if !m.started {
 		m.Start()
 	}
-	m.AddTarget(dest, serverName)
+	m.AddTarget(dest, serverName, alpn)
 }
 
 // StopBackgroundRefreshForProfile is called when a profile is invalidated.
-func StopBackgroundRefreshForProfile(dest, serverName string) {
+func StopBackgroundRefreshForProfile(dest, serverName, alpn string) {
 	if globalRefreshManager != nil {
-		globalRefreshManager.RemoveTarget(dest, serverName)
+		globalRefreshManager.RemoveTarget(dest, serverName, alpn)
 	}
 }
 

@@ -43,13 +43,20 @@ func (b *EventBus) On(eventType EventType, handler EventHandler) {
 }
 
 // Emit fires an event to all registered handlers concurrently.
+// Each handler runs in its own goroutine with panic recovery to prevent
+// one handler's panic from killing the goroutine or affecting others.
 func (b *EventBus) Emit(event Event) {
 	b.mu.RLock()
 	handlers := b.handlers[event.Type]
 	b.mu.RUnlock()
 
 	for _, h := range handlers {
-		go h(event)
+		go func(handler EventHandler) {
+			defer func() {
+				recover()
+			}()
+			handler(event)
+		}(h)
 	}
 }
 

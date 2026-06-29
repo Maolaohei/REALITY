@@ -32,7 +32,7 @@ func RegisterPersistHandlers(bus *EventBus) {
 func RegisterRefreshHandlers(bus *EventBus) {
 	bus.On(EventHandshakeComplete, func(e Event) {
 		// Start background refresh for this target.
-		StartBackgroundRefreshForProfile(e.Dest, e.ServerName)
+		StartBackgroundRefreshForProfile(e.Dest, e.ServerName, e.ALPN)
 	})
 }
 

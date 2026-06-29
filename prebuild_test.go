@@ -283,15 +283,15 @@ func TestBackgroundRefreshStartStop(t *testing.T) {
 	ResetGlobalRefreshManagerForTesting()
 	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	m := GetRefreshManager()
-	m.AddTarget("example.com:443", "example.com")
+	m.AddTarget("example.com:443", "example.com", "")
 	if m.GetStats() != 1 {
 		t.Error("want 1")
 	}
-	m.AddTarget("example.com:443", "example.com")
+	m.AddTarget("example.com:443", "example.com", "")
 	if m.GetStats() != 1 {
 		t.Error("want 1 after dup")
 	}
-	m.RemoveTarget("example.com:443", "example.com")
+	m.RemoveTarget("example.com:443", "example.com", "")
 	if m.GetStats() != 0 {
 		t.Error("want 0")
 	}
@@ -302,13 +302,13 @@ func TestBackgroundRefreshMultipleTargets(t *testing.T) {
 	t.Cleanup(ResetGlobalRefreshManagerForTesting)
 	m := GetRefreshManager()
 	for _, t := range []string{"a.com:443", "b.com:443", "c.com:443"} {
-		m.AddTarget(t, t)
+		m.AddTarget(t, t, "")
 	}
 	if m.GetStats() != 3 {
 		t.Error("want 3")
 	}
 	for _, t := range []string{"a.com:443", "b.com:443", "c.com:443"} {
-		m.RemoveTarget(t, t)
+		m.RemoveTarget(t, t, "")
 	}
 }
 
@@ -321,7 +321,7 @@ func TestBackgroundRefreshConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			m.AddTarget("concurrent"+string(rune('0'+n))+".com:443", "test")
+			m.AddTarget("concurrent"+string(rune('0'+n))+".com:443", "test", "")
 		}(i)
 	}
 	wg.Wait()

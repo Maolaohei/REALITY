@@ -76,12 +76,11 @@ type MirrorConn struct {
 func (c *MirrorConn) Read(b []byte) (int, error) {
 	// Caller holds the mutex. We release it here to allow the target read
 	// goroutine to proceed, then re-acquire after our read completes.
-	// Note: if this goroutine panics between Unlock and Lock, the mutex
-	// will be permanently held. The Read syscall itself cannot panic,
-	// and the code between Lock and return is panic-safe (slice ops + Write).
+	// defer c.Lock() guarantees the mutex is always re-locked before returning,
+	// even if c.Conn.Read panics (unlikely for syscalls) or Write/Close panics.
 	c.Unlock()
+	defer c.Lock()
 	n, err := c.Conn.Read(b)
-	c.Lock()
 	if n != 0 {
 		c.Target.Write(b[:n])
 	}
@@ -206,7 +205,7 @@ type RealityProfile struct {
 	Fingerprint   uint64
 	CipherSuite   uint16
 	ALPN          string
-	TLSVersion    uint16 // TLS 1.2 or 1.3 — different versions have different record layouts
+	TLSVersion    uint16 // TLS 1.2 or 1.3 �?different versions have different record layouts
 	RecordCount   int
 	CapturedAt    time.Time
 }
@@ -232,27 +231,6 @@ type targetFingerprintCache struct {
 // but uses the optimized encoding/binary path.
 func bigEndianUint16(b []byte) uint16 {
 	return binary.BigEndian.Uint16(b)
-}
-
-// verifyTargetUnchanged checks if the target's TLS behavior matches cached
-// profile. Returns true if unchanged (safe to use cached profile).
-func verifyTargetUnchanged(dest, serverName string, hello *serverHelloMsg, clientHello *clientHelloMsg) bool {
-	alpn := ""
-	if len(clientHello.alpnProtocols) > 0 {
-		alpn = clientHello.alpnProtocols[0]
-	}
-	key := CacheKey(dest, serverName, alpn, VersionTLS13)
-	profile, _ := globalCacheManager.GetProfile(key)
-	if profile == nil {
-		return false
-	}
-	if profile.CipherSuite != hello.cipherSuite {
-		return false
-	}
-	if profile.ALPN != alpn {
-		return false
-	}
-	return true
 }
 
 // computeFingerprint computes FNV64 hash of (CipherSuite, ALPN, ServerHelloLen, ExtensionsLen).
@@ -314,6 +292,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	// Initialize event handlers and persistent store on first call.
 	if profileStore == nil {
 		cacheDir := config.CacheDir
+		if cacheDir == "-" {
+			cacheDir = ""
+		}
 		if cacheDir == "" {
 			cacheDir = DefaultCacheDir()
 		}
@@ -541,16 +522,31 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					mutex.Unlock()
 					continue f
 				}
-				if i == 0 {
-					hs.hello = new(serverHelloMsg)
-					if !hs.hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) ||
-						hs.hello.vers != VersionTLS12 || hs.hello.supportedVersion != VersionTLS13 ||
-						cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil ||
-						(!(hs.hello.serverShare.group == X25519 && len(hs.hello.serverShare.data) == 32) &&
-							!(hs.hello.serverShare.group == X25519MLKEM768 && len(hs.hello.serverShare.data) == mlkem.CiphertextSize768+32)) {
-						break f
-					}
+			if i == 0 {
+				hs.hello = new(serverHelloMsg)
+				if !hs.hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) ||
+					hs.hello.vers != VersionTLS12 || hs.hello.supportedVersion != VersionTLS13 ||
+					cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil ||
+					(!(hs.hello.serverShare.group == X25519 && len(hs.hello.serverShare.data) == 32) &&
+						!(hs.hello.serverShare.group == X25519MLKEM768 && len(hs.hello.serverShare.data) == mlkem.CiphertextSize768+32)) {
+					break f
 				}
+				// Cache fast path: after parsing ServerHello, check if we have a cached
+				// profile for this target with matching CipherSuite. If so, use the cached
+				// RecordLens directly and skip remaining target reads.
+				if cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(config.Dest, hs.hello.cipherSuite); cacheHit {
+					hs.c.out.handshakeLen[0] = handshakeLen
+					for ci := 1; ci < 7; ci++ {
+						hs.c.out.handshakeLen[ci] = cachedLens[ci]
+					}
+					s2cSaved = s2cSaved[handshakeLen:]
+					handshakeLen = 0
+					if show {
+						fmt.Printf("REALITY remoteAddr: %v\tcache hit — using cached RecordLens, skipping target reads\n", remoteAddr)
+					}
+					break
+				}
+			}
 				hs.c.out.handshakeLen[i] = handshakeLen
 				s2cSaved = s2cSaved[handshakeLen:]
 				handshakeLen = 0
@@ -668,7 +664,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				LastUpdated:       now,
 			}
 
-			// Emit event — cache/persist/refresh handlers process it.
+			// Emit event �?cache/persist/refresh handlers process it.
 			globalEventBus.Emit(Event{
 				Type:        EventHandshakeComplete,
 				Dest:        config.Dest,
