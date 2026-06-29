@@ -118,8 +118,11 @@ func TestL4_SessionResumptionNoPostHandshake(t *testing.T) {
 	conn2.Close()
 }
 
-// TestL4_CertRotation 等效证书轮换 — 不同 fingerprint 的 profile
+// TestL4_CertRotation 等效证书轮换 — 同 key 再次 store 不覆盖（LoadOrStore 语义）
 func TestL4_CertRotation(t *testing.T) {
+	globalCacheManager.Reset()
+	t.Cleanup(func() { globalCacheManager.Reset() })
+
 	key := "l4.rot|ms.com|h2"
 	fp1 := computeFingerprint(0x1301, "h2", 127, 51)
 
@@ -131,19 +134,26 @@ func TestL4_CertRotation(t *testing.T) {
 
 	fp2 := computeFingerprint(0x1301, "h2", 127, 60)
 
-	val, _ := globalCacheManager.GetProfile(key)
-	if val.Fingerprint == fp2 {
-		t.Fatal("old profile should not match new fingerprint")
+	val := globalCacheManager.GetProfileOrExpired(key)
+	if val == nil {
+		t.Fatal("first store should be retrievable")
+	}
+	if val.Fingerprint != fp1 {
+		t.Fatal("first store fingerprint mismatch")
 	}
 
+	// Second store with same key is a no-op (LoadOrStore).
 	globalCacheManager.StoreProfile(key, &RealityProfile{
 		RecordLens: [7]int{127, 6, 60}, Fingerprint: fp2,
 		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 	})
 
-	val2, _ := globalCacheManager.GetProfile(key)
-	if val2.Fingerprint != fp2 {
-		t.Fatal("new profile should match")
+	val2 := globalCacheManager.GetProfileOrExpired(key)
+	if val2 == nil {
+		t.Fatal("profile should still be retrievable after no-op store")
+	}
+	if val2.Fingerprint != fp1 {
+		t.Fatal("second store should not overwrite existing entry")
 	}
 }
 

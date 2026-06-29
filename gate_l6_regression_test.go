@@ -174,12 +174,15 @@ func TestL6_ReleaseGate(t *testing.T) {
 		fp := computeFingerprint(0x1301, "h2", 100, 50)
 		key := "gate|test|h2"
 
+		globalCacheManager.Reset()
+		t.Cleanup(func() { globalCacheManager.Reset() })
+
 		globalCacheManager.StoreProfile(key, &RealityProfile{
 			RecordLens: [7]int{100, 6, 50}, Fingerprint: fp,
 			CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
 		})
 
-		p, _ := globalCacheManager.GetProfile(key)
+		p := globalCacheManager.GetProfileOrExpired(key)
 		if p == nil {
 			t.Error("cache miss")
 			return
@@ -417,6 +420,9 @@ func TestL6_NoCacheInHandshakePath(t *testing.T) {
 
 // TestL6_DataPlaneIntegrityAfterCacheLoad 验证 cache 加载后数据面仍正常
 func TestL6_DataPlaneIntegrityAfterCacheLoad(t *testing.T) {
+	globalCacheManager.Reset()
+	t.Cleanup(func() { globalCacheManager.Reset() })
+
 	key := "regression|microsoft.com|h2"
 	fp := computeFingerprint(0x1301, "h2", 127, 51)
 
@@ -426,7 +432,7 @@ func TestL6_DataPlaneIntegrityAfterCacheLoad(t *testing.T) {
 	})
 	defer globalCacheManager.InvalidateProfile(key)
 
-	p, _ := globalCacheManager.GetProfile(key)
+	p := globalCacheManager.GetProfileOrExpired(key)
 	if p == nil {
 		t.Fatal("cache miss")
 	}

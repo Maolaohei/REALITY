@@ -343,6 +343,234 @@ func TestL2_REALITY_DataPlane(t *testing.T) {
 	t.Log("REALITY Data Plane: 10/10 passed")
 }
 
+// TestL2_REALITY_CacheHitMiss verifies cache behavior across multiple connections.
+// First connection: cache miss → full handshake → store profile.
+// Subsequent connections: cache hit → skip target reads → use cached RecordLens.
+func TestL2_REALITY_CacheHitMiss(t *testing.T) {
+	globalCacheManager.Reset()
+	t.Cleanup(func() { globalCacheManager.Reset() })
+
+	// 1. Start target TLS server on a FIXED address.
+	targetCert := mustTestCert()
+	targetLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{targetCert},
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("target listen: %v", err)
+	}
+	defer targetLn.Close()
+	targetAddr := targetLn.Addr().String()
+
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 65536)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					c.Write(buf[:n])
+				}
+			}(conn)
+		}
+	}()
+
+	// 2. Generate REALITY key.
+	privateKeyBytes := make([]byte, 32)
+	for i := range privateKeyBytes {
+		privateKeyBytes[i] = byte(i + 1)
+	}
+
+	// 3. Start REALITY Server with Show=true.
+	serverLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reality server listen: %v", err)
+	}
+	defer serverLn.Close()
+	serverAddr := serverLn.Addr().String()
+
+	serverConfig := &Config{
+		Dest:        targetAddr, // FIXED dest — same across all connections.
+		Type:        "tcp",
+		Show:        true,
+		ServerNames: map[string]bool{"test.example.com": true},
+		PrivateKey:  privateKeyBytes,
+		ShortIds:    map[[8]byte]bool{{0x01}: true},
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return net.Dial("tcp", targetAddr)
+		},
+	}
+
+	go func() {
+		for {
+			conn, err := serverLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				_, err := Server(context.Background(), c, serverConfig)
+				if err != nil {
+					c.Close()
+				}
+			}(conn)
+		}
+	}()
+
+	go DetectPostHandshakeRecordsLens(serverConfig)
+	time.Sleep(100 * time.Millisecond)
+
+	dial := func(label string) {
+		t.Helper()
+		conn, err := tls.Dial("tcp", serverAddr, &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         "test.example.com",
+			MinVersion:         tls.VersionTLS13,
+			MaxVersion:         tls.VersionTLS13,
+		})
+		if err != nil {
+			t.Fatalf("%s dial: %v", label, err)
+		}
+		msg := "hello " + label
+		conn.Write([]byte(msg))
+		buf := make([]byte, 4096)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _ := conn.Read(buf)
+		if string(buf[:n]) != msg {
+			t.Fatalf("%s data mismatch", label)
+		}
+		conn.Close()
+	}
+
+	// 4. First connection — cache miss, full handshake, profile stored.
+	t.Log("=== Connection 1: CACHE MISS (first, profile stored) ===")
+	dial("conn1")
+
+	// 5. Second connection — cache hit, skip target reads.
+	t.Log("=== Connection 2: CACHE HIT (reuse RecordLens) ===")
+	dial("conn2")
+
+	// 6. Third connection — cache still valid.
+	t.Log("=== Connection 3: CACHE HIT (still valid) ===")
+	dial("conn3")
+
+	t.Log("Cache hit/miss test: 3/3 connections passed")
+	t.Logf("Cache report:\n%s", globalCacheManager.CacheReport())
+}
+
+// TestL2_CacheLogic directly tests cache hit/miss/isolation behavior
+// without requiring a full REALITY handshake.
+func TestL2_CacheLogic(t *testing.T) {
+	globalCacheManager.Reset()
+	t.Cleanup(func() { globalCacheManager.Reset() })
+
+	dest := "1.2.3.4:443"
+	serverName := "www.google.com"
+	alpn := "h2"
+	tlsVer := uint16(VersionTLS13)
+	key := CacheKey(dest, serverName, alpn, tlsVer)
+
+	lens := [7]int{1215, 6, 41, 0, 0, 0, 0}
+	fp := computeFingerprint(0x1301, alpn, lens[0], lens[2])
+
+	// --- Test 1: Cache miss on empty cache ---
+	t.Log("=== Test 1: Cache miss (empty cache) ===")
+	_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, 0x1301, alpn, tlsVer)
+	if hit {
+		t.Fatal("expected cache miss on empty cache")
+	}
+	t.Log("  Result: MISS — no profile stored yet")
+
+	// --- Test 2: Store profile, expect cache hit ---
+	t.Log("=== Test 2: Store profile → cache hit ===")
+	globalCacheManager.StoreProfile(key, &RealityProfile{
+		RecordLens:  lens,
+		Fingerprint: fp,
+		CipherSuite: 0x1301,
+		ALPN:        alpn,
+		TLSVersion:  tlsVer,
+		CapturedAt:  time.Now(),
+	})
+
+	gotLens, gotVer, hit := globalCacheManager.FindCachedProfileByDest(dest, 0x1301, alpn, tlsVer)
+	if !hit {
+		t.Fatal("expected cache hit after store")
+	}
+	if gotLens != lens {
+		t.Fatalf("RecordLens mismatch: got %v, want %v", gotLens, lens)
+	}
+	if gotVer != tlsVer {
+		t.Fatalf("TLSVersion mismatch: got 0x%x, want 0x%x", gotVer, tlsVer)
+	}
+	t.Logf("  Result: HIT — lens=%v tlsVer=0x%x", gotLens, gotVer)
+
+	// --- Test 3: ALPN mismatch → cache miss ---
+	t.Log("=== Test 3: ALPN mismatch → miss ===")
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1301, "http/1.1", tlsVer)
+	if hit {
+		t.Fatal("expected cache miss for different ALPN")
+	}
+	t.Log("  Result: MISS — ALPN 'http/1.1' != 'h2'")
+
+	// --- Test 4: TLSVersion mismatch → cache miss ---
+	t.Log("=== Test 4: TLSVersion mismatch → miss ===")
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1301, alpn, VersionTLS12)
+	if hit {
+		t.Fatal("expected cache miss for different TLS version")
+	}
+	t.Log("  Result: MISS — TLSVersion 0x0302 != 0x0303")
+
+	// --- Test 5: CipherSuite mismatch → cache miss ---
+	t.Log("=== Test 5: CipherSuite mismatch → miss ===")
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1302, alpn, tlsVer)
+	if hit {
+		t.Fatal("expected cache miss for different CipherSuite")
+	}
+	t.Log("  Result: MISS — CipherSuite 0x1302 != 0x1301")
+
+	// --- Test 6: Dest mismatch → cache miss ---
+	t.Log("=== Test 6: Dest mismatch → miss ===")
+	_, _, hit = globalCacheManager.FindCachedProfileByDest("5.6.7.8:443", 0x1301, alpn, tlsVer)
+	if hit {
+		t.Fatal("expected cache miss for different dest")
+	}
+	t.Log("  Result: MISS — dest '5.6.7.8:443' != '1.2.3.4:443'")
+
+	// --- Test 7: Invalid RecordLens → cache miss (defense) ---
+	t.Log("=== Test 7: Invalid RecordLens → miss (defense) ===")
+	badKey := CacheKey(dest, serverName, "grpc", tlsVer)
+	globalCacheManager.StoreProfile(badKey, &RealityProfile{
+		RecordLens:  [7]int{99999, 6, 41}, // 99999 > maxTLSRecordPayload
+		Fingerprint: fp,
+		CipherSuite: 0x1301,
+		ALPN:        "grpc",
+		TLSVersion:  tlsVer,
+		CapturedAt:  time.Now(),
+	})
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1301, "grpc", tlsVer)
+	if hit {
+		t.Fatal("expected cache miss for invalid RecordLens")
+	}
+	t.Log("  Result: MISS — RecordLens[0]=99999 exceeds maxTLSRecordPayload")
+
+	// --- Test 8: Invalidate → cache miss ---
+	t.Log("=== Test 8: Invalidate → miss ===")
+	globalCacheManager.InvalidateProfile(key)
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1301, alpn, tlsVer)
+	if hit {
+		t.Fatal("expected cache miss after invalidation")
+	}
+	t.Log("  Result: MISS — profile invalidated")
+
+	t.Logf("\nCache report:\n%s", globalCacheManager.CacheReport())
+}
+
 // TestL2_REALITY_LargeEncryptedExtensions verifies the C2 code path:
 // when the target's EncryptedExtensions exceeds 512 bytes, the handshakeBuf
 // accumulation logic must correctly reconstruct the message across iterations.

@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+// probeBufferPool reuses 64 KiB buffers for background probe reads,
+// avoiding per-probe allocation of two 64 KiB slices.
+var probeBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, maxRecordSize)
+		return &buf
+	},
+}
+
 // RefreshManager is a unified scheduler for background target probing.
 // Instead of per-target goroutines, it uses a single scheduler that
 // manages all targets with independent timers.
@@ -194,8 +203,12 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 	}
 	defer conn.Close()
 
-	buf := make([]byte, maxRecordSize)
-	s2cSaved := make([]byte, 0, maxRecordSize)
+	bufPtr := probeBufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	s2cSavedPtr := probeBufferPool.Get().(*[]byte)
+	s2cSaved := (*s2cSavedPtr)[:0]
+	defer probeBufferPool.Put(bufPtr)
+	defer probeBufferPool.Put(s2cSavedPtr)
 
 	// Phase A: Read only ServerHello.
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -285,9 +298,14 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 			if entry.stableCount >= 2 {
 				// Confirmed stable change — safe to swap.
 				entry.stableCount = 0
+				// Validate RecordLens before caching.
+				if !ValidateRecordLens(recordLens) {
+					globalCacheManager.MarkNegative(entry.cacheKey)
+					return false
+				}
 				newProfile := &RealityProfile{
 					RecordLens:   recordLens,
-					Fingerprint:  computeFingerprint(hello.cipherSuite, "", recordLens[0], recordLens[2]),
+					Fingerprint:  computeFingerprint(hello.cipherSuite, entry.alpn, recordLens[0], recordLens[2]),
 					CipherSuite:  hello.cipherSuite,
 					ALPN:         entry.alpn,
 					RecordCount:  0,

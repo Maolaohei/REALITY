@@ -205,7 +205,7 @@ type RealityProfile struct {
 	Fingerprint   uint64
 	CipherSuite   uint16
 	ALPN          string
-	TLSVersion    uint16 // TLS 1.2 or 1.3 �?different versions have different record layouts
+	TLSVersion    uint16 // TLS 1.2 or 1.3 - different versions have different record layouts
 	RecordCount   int
 	CapturedAt    time.Time
 }
@@ -532,19 +532,31 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					break f
 				}
 				// Cache fast path: after parsing ServerHello, check if we have a cached
-				// profile for this target with matching CipherSuite. If so, use the cached
-				// RecordLens directly and skip remaining target reads.
-				if cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(config.Dest, hs.hello.cipherSuite); cacheHit {
-					hs.c.out.handshakeLen[0] = handshakeLen
-					for ci := 1; ci < 7; ci++ {
-						hs.c.out.handshakeLen[ci] = cachedLens[ci]
+				// profile for this target with matching CipherSuite, ALPN, and TLS version.
+				// If so, use the cached RecordLens directly and skip remaining target reads.
+				clientALPN := ""
+				if hs.clientHello != nil && len(hs.clientHello.alpnProtocols) > 0 {
+					clientALPN = hs.clientHello.alpnProtocols[0]
+				}
+				if cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(
+					config.Dest, hs.hello.cipherSuite, clientALPN, VersionTLS13); cacheHit {
+					// Double-check: validate cached RecordLens before reusing.
+					if !ValidateRecordLens(cachedLens) {
+						if show {
+							fmt.Printf("REALITY remoteAddr: %v\tcache hit but RecordLens invalid, falling back\n", remoteAddr)
+						}
+					} else {
+						hs.c.out.handshakeLen[0] = handshakeLen
+						for ci := 1; ci < 7; ci++ {
+							hs.c.out.handshakeLen[ci] = cachedLens[ci]
+						}
+						s2cSaved = s2cSaved[handshakeLen:]
+						handshakeLen = 0
+						if show {
+							fmt.Printf("REALITY remoteAddr: %v\tcache hit — using cached RecordLens, skipping target reads\n", remoteAddr)
+						}
+						break
 					}
-					s2cSaved = s2cSaved[handshakeLen:]
-					handshakeLen = 0
-					if show {
-						fmt.Printf("REALITY remoteAddr: %v\tcache hit — using cached RecordLens, skipping target reads\n", remoteAddr)
-					}
-					break
 				}
 			}
 				hs.c.out.handshakeLen[i] = handshakeLen
@@ -664,7 +676,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				LastUpdated:       now,
 			}
 
-			// Emit event �?cache/persist/refresh handlers process it.
+			// Emit event -- cache/persist/refresh handlers process it.
 			globalEventBus.Emit(Event{
 				Type:        EventHandshakeComplete,
 				Dest:        config.Dest,

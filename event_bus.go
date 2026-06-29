@@ -1,6 +1,11 @@
 package reality
 
-import "sync"
+import (
+	"fmt"
+	"os"
+	"runtime/debug"
+	"sync"
+)
 
 // Event types emitted by the TLS handshake flow.
 type EventType int
@@ -53,7 +58,9 @@ func (b *EventBus) Emit(event Event) {
 	for _, h := range handlers {
 		go func(handler EventHandler) {
 			defer func() {
-				recover()
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "REALITY: event handler panic: %v\n%s\n", r, debug.Stack())
+				}
 			}()
 			handler(event)
 		}(h)

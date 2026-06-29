@@ -11,10 +11,9 @@ import (
 type ProfileState int
 
 const (
-	ProfileValid       ProfileState = iota // Fresh and valid
-	ProfileStale                           // Expired but usable (stale-while-revalidate)
-	ProfileNegative                        // Probe failed, don't retry too often
-	ProfilePendingDelete                   // Marked for deletion, waiting for refCount=0
+	ProfileValid    ProfileState = iota // Fresh and valid
+	ProfileStale                        // Expired but usable (stale-while-revalidate)
+	ProfileNegative                     // Probe failed, don't retry too often
 )
 
 // ProfileEntry wraps a RealityProfile with state metadata.
@@ -26,8 +25,6 @@ type ProfileEntry struct {
 	NextRetry      time.Time
 	TTL            time.Duration
 	StabilityScore int
-	RefCount       int32     // pinned connections using this profile (atomic for read-heavy path)
-	PendingSince   time.Time // when state became PendingDelete (fallback TTL)
 }
 
 // CacheManager manages all REALITY cache state.
@@ -35,11 +32,12 @@ type CacheManager struct {
 	entries      sync.Map // map[string]*ProfileEntry
 	fingerprints sync.Map // map[string]*targetFingerprintCache
 	singleflight sync.Map // map[string]*probeFlight
+	destIndex    map[string]map[string]struct{} // dest → set of cache keys (secondary index)
+	indexMu      sync.Mutex                     // protects destIndex
 	stats        CacheManagerStats
 	dirty        atomic.Bool
 	maxProfiles  int
 	baseTTL      time.Duration
-	mu           sync.Mutex // protects eviction and pending-delete cleanup
 }
 
 type probeFlight struct {
@@ -52,17 +50,48 @@ type CacheManagerStats struct {
 	ProfileEntries     atomic.Int64
 	ProfileInvalidated atomic.Uint64
 	FingerprintChanged atomic.Uint64
-	StaleServed        atomic.Uint64
-	NegativeHits       atomic.Uint64
+	StaleServed        atomic.Int64
+	NegativeHits       atomic.Int64
 	HotSwaps           atomic.Uint64
-	Pins               atomic.Int64
 }
 
 func NewCacheManager() *CacheManager {
 	return &CacheManager{
+		destIndex:   make(map[string]map[string]struct{}),
 		maxProfiles: 1000,
 		baseTTL:     ProfileTTL,
 	}
+}
+
+// --- Secondary index ---
+
+// addToIndex adds a key to the dest secondary index.
+func (m *CacheManager) addToIndex(dest, key string) {
+	m.indexMu.Lock()
+	defer m.indexMu.Unlock()
+	if m.destIndex[dest] == nil {
+		m.destIndex[dest] = make(map[string]struct{})
+	}
+	m.destIndex[dest][key] = struct{}{}
+}
+
+// removeFromIndex removes a key from the dest secondary index.
+func (m *CacheManager) removeFromIndex(dest, key string) {
+	m.indexMu.Lock()
+	defer m.indexMu.Unlock()
+	if keys, ok := m.destIndex[dest]; ok {
+		delete(keys, key)
+		if len(keys) == 0 {
+			delete(m.destIndex, dest)
+		}
+	}
+}
+
+// keysByDest returns all cache keys for a given dest. Caller must not modify the returned map.
+func (m *CacheManager) keysByDest(dest string) map[string]struct{} {
+	m.indexMu.Lock()
+	defer m.indexMu.Unlock()
+	return m.destIndex[dest]
 }
 
 // --- Singleflight ---
@@ -81,11 +110,10 @@ func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (
 	return flight.value, flight.err
 }
 
-// --- GetProfile with hot-swap support ---
+// --- GetProfile ---
 
 // GetProfile retrieves a profile for a new connection.
 // Returns (profile, isStale).
-// Skips ProfilePendingDelete entries (old connections only).
 func (m *CacheManager) GetProfile(key string) (*RealityProfile, bool) {
 	val, ok := m.entries.Load(key)
 	if !ok {
@@ -95,11 +123,6 @@ func (m *CacheManager) GetProfile(key string) (*RealityProfile, bool) {
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
-
-	// Skip pending-delete for new connections — they should use the new profile.
-	if entry.State == ProfilePendingDelete {
-		return nil, false
-	}
 
 	switch entry.State {
 	case ProfileValid:
@@ -120,6 +143,8 @@ func (m *CacheManager) GetProfile(key string) (*RealityProfile, bool) {
 			return nil, false
 		}
 		m.entries.Delete(key)
+		m.removeFromIndex(DestFromKey(key), key)
+		m.stats.ProfileEntries.Add(-1)
 		return nil, false
 	}
 
@@ -135,53 +160,10 @@ func (m *CacheManager) GetProfileOrExpired(key string) *RealityProfile {
 	return val.(*ProfileEntry).Profile
 }
 
-// --- Pin / Unpin for hot-swap ---
-
-// Pin increments the reference count for a profile.
-// Call this when a connection starts using a profile.
-// Returns the profile and true if found, nil and false if not found.
-func (m *CacheManager) Pin(key string) (*RealityProfile, bool) {
-	val, ok := m.entries.Load(key)
-	if !ok {
-		return nil, false
-	}
-	entry := val.(*ProfileEntry)
-	atomic.AddInt32(&entry.RefCount, 1)
-	m.stats.Pins.Add(1)
-	return entry.Profile, true
-}
-
-// Unpin decrements the reference count.
-// If the profile is marked PendingDelete and refCount reaches 0, it is actually deleted.
-func (m *CacheManager) Unpin(key string) {
-	val, ok := m.entries.Load(key)
-	if !ok {
-		return
-	}
-	entry := val.(*ProfileEntry)
-	newCount := atomic.AddInt32(&entry.RefCount, -1)
-
-	// If pending delete and no more users, actually delete.
-	if newCount <= 0 && entry.State == ProfilePendingDelete {
-		if m.entries.CompareAndDelete(key, val) {
-			m.stats.ProfileInvalidated.Add(1)
-			m.dirty.Store(true)
-		}
-	}
-}
-
-// PinCount returns the current reference count for a key.
-func (m *CacheManager) PinCount(key string) int32 {
-	val, ok := m.entries.Load(key)
-	if !ok {
-		return 0
-	}
-	return atomic.LoadInt32(&val.(*ProfileEntry).RefCount)
-}
-
 // --- Store / Hot-swap ---
 
-// StoreProfile stores a valid profile entry.
+// StoreProfile stores a profile entry. If the key already exists, the old
+// entry is kept (LoadOrStore semantics).
 func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 	entry := &ProfileEntry{
 		Profile: profile,
@@ -190,6 +172,7 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 	}
 	_, loaded := m.entries.LoadOrStore(key, entry)
 	if !loaded {
+		m.addToIndex(DestFromKey(key), key)
 		m.stats.ProfileEntries.Add(1)
 		m.dirty.Store(true)
 		m.evictIfFull()
@@ -197,39 +180,20 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 	return !loaded
 }
 
-// HotSwapProfile replaces a profile while preserving pinned connections.
-// Old profile is marked PendingDelete; new profile is stored.
-// Old profile is actually deleted when all pinned connections release it.
+// HotSwapProfile replaces a profile atomically.
+// The old entry is deleted from the map immediately. Any goroutine that
+// already loaded the old entry continues using it (safe for read-only use);
+// new connections will get the new entry from the map.
 func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
 	newEntry := &ProfileEntry{
 		Profile: newProfile,
 		State:   ProfileValid,
 		TTL:     m.baseTTL,
 	}
-
-	// Step 1: Load old entry before storing new one.
-	oldVal, hadOld := m.entries.Load(key)
-
-	// Step 2: Store new entry.
 	m.entries.Store(key, newEntry)
+	m.addToIndex(DestFromKey(key), key)
 	m.stats.HotSwaps.Add(1)
 	m.dirty.Store(true)
-
-	// Step 3: Mark old entry for deferred deletion.
-	if hadOld {
-		oldEntry := oldVal.(*ProfileEntry)
-		if oldEntry != newEntry {
-			oldEntry.mu.Lock()
-			oldEntry.State = ProfilePendingDelete
-			oldEntry.PendingSince = time.Now()
-			oldEntry.mu.Unlock()
-			// If nothing is using it, delete immediately.
-			if atomic.LoadInt32(&oldEntry.RefCount) <= 0 {
-				m.entries.CompareAndDelete(key, oldVal)
-				m.stats.ProfileInvalidated.Add(1)
-			}
-		}
-	}
 }
 
 // MarkStale marks a profile as stale.
@@ -259,6 +223,7 @@ func (m *CacheManager) MarkNegative(key string) {
 			TTL:       m.baseTTL,
 		}
 		m.entries.Store(key, entry)
+		m.addToIndex(DestFromKey(key), key)
 		return
 	}
 	entry := val.(*ProfileEntry)
@@ -274,26 +239,17 @@ func (m *CacheManager) MarkNegative(key string) {
 	entry.NextRetry = time.Now().Add(backoff)
 }
 
-// InvalidateProfile marks a profile for deletion.
-// If refCount=0, deletes immediately. Otherwise marks PendingDelete.
+// InvalidateProfile deletes a profile from the cache immediately.
 func (m *CacheManager) InvalidateProfile(key string) {
 	val, ok := m.entries.Load(key)
 	if !ok {
 		return
 	}
-	entry := val.(*ProfileEntry)
-	if atomic.LoadInt32(&entry.RefCount) <= 0 {
-		// No connections using it — delete now.
-		if m.entries.CompareAndDelete(key, val) {
-			m.stats.ProfileInvalidated.Add(1)
-			m.dirty.Store(true)
-		}
-	} else {
-		// Connections still using it — defer deletion.
-		entry.mu.Lock()
-		entry.State = ProfilePendingDelete
-		entry.PendingSince = time.Now()
-		entry.mu.Unlock()
+	if m.entries.CompareAndDelete(key, val) {
+		m.removeFromIndex(DestFromKey(key), key)
+		m.stats.ProfileEntries.Add(-1)
+		m.stats.ProfileInvalidated.Add(1)
+		m.dirty.Store(true)
 	}
 }
 
@@ -305,31 +261,58 @@ func (m *CacheManager) StoreFingerprint(key string, fp *targetFingerprintCache) 
 	m.fingerprints.Store(key, fp)
 }
 
-// FindCachedProfileByDest searches for a cached profile matching the given dest prefix
-// and cipher suite. Returns the profile's RecordLens and TLSVersion if found and valid.
-// This is used by Server() to skip target probing when a cached profile is available.
-func (m *CacheManager) FindCachedProfileByDest(dest string, cipherSuite uint16) (lens [7]int, tlsVersion uint16, ok bool) {
-	m.entries.Range(func(key, val any) bool {
+// ValidateRecordLens checks that a RecordLens array contains sane values:
+// every non-zero length must be between recordHeaderLen and maxTLSRecordPayload.
+// Returns false if any lens is out of range (indicating a corrupt or stale profile).
+func ValidateRecordLens(lens [7]int) bool {
+	for _, l := range lens {
+		if l == 0 {
+			continue // absent record is OK (e.g. no NewSessionTicket yet)
+		}
+		if l < recordHeaderLen || l > maxTLSRecordPayload {
+			return false
+		}
+	}
+	return true
+}
+
+// FindCachedProfileByDest searches for a cached profile matching the given dest,
+// cipher suite, ALPN, and TLS version. Returns the profile's RecordLens and
+// TLSVersion if found and valid. This is used by Server() to skip target reads
+// when a cached profile is available.
+func (m *CacheManager) FindCachedProfileByDest(dest string, cipherSuite uint16, alpn string, tlsVersion uint16) (lens [7]int, foundTLSVersion uint16, ok bool) {
+	keys := m.keysByDest(dest)
+	for key := range keys {
+		val, exists := m.entries.Load(key)
+		if !exists {
+			continue
+		}
 		entry := val.(*ProfileEntry)
 		entry.mu.Lock()
-		defer entry.mu.Unlock()
-		if entry.State == ProfilePendingDelete || entry.State == ProfileNegative {
-			return true
+		if entry.State == ProfileNegative {
+			entry.mu.Unlock()
+			continue
 		}
 		if time.Since(entry.Profile.CapturedAt) >= entry.TTL {
-			return true
+			entry.mu.Unlock()
+			continue
 		}
-		if DestFromKey(key.(string)) != dest {
-			return true
+		if entry.Profile.CipherSuite != cipherSuite ||
+			entry.Profile.ALPN != alpn ||
+			entry.Profile.TLSVersion != tlsVersion {
+			entry.mu.Unlock()
+			continue
 		}
-		if entry.Profile.CipherSuite != cipherSuite {
-			return true
+		if !ValidateRecordLens(entry.Profile.RecordLens) {
+			entry.mu.Unlock()
+			continue
 		}
 		lens = entry.Profile.RecordLens
-		tlsVersion = entry.Profile.TLSVersion
+		foundTLSVersion = entry.Profile.TLSVersion
+		entry.mu.Unlock()
 		ok = true
-		return false
-	})
+		return
+	}
 	return
 }
 
@@ -343,10 +326,6 @@ func (m *CacheManager) evictIfFull() {
 	var oldestTime time.Time
 	m.entries.Range(func(key, val any) bool {
 		entry := val.(*ProfileEntry)
-		// Don't evict pinned or pending-delete entries.
-		if atomic.LoadInt32(&entry.RefCount) > 0 {
-			return true
-		}
 		if oldestKey == "" || entry.Profile.CapturedAt.Before(oldestTime) {
 			oldestKey = key.(string)
 			oldestTime = entry.Profile.CapturedAt
@@ -355,6 +334,7 @@ func (m *CacheManager) evictIfFull() {
 	})
 	if oldestKey != "" {
 		m.entries.Delete(oldestKey)
+		m.removeFromIndex(DestFromKey(oldestKey), oldestKey)
 		m.stats.ProfileEntries.Add(-1)
 	}
 }
@@ -366,7 +346,7 @@ func (m *CacheManager) SnapshotProfiles() map[string]*RealityProfile {
 	now := time.Now()
 	m.entries.Range(func(key, val any) bool {
 		entry := val.(*ProfileEntry)
-		if entry.State == ProfileNegative || entry.State == ProfilePendingDelete {
+		if entry.State == ProfileNegative {
 			return true
 		}
 		if now.Sub(entry.Profile.CapturedAt) > entry.TTL {
@@ -385,15 +365,13 @@ func (m *CacheManager) CacheReport() string {
 	stale := m.stats.StaleServed.Load()
 	negative := m.stats.NegativeHits.Load()
 	hotSwaps := m.stats.HotSwaps.Load()
-	pins := m.stats.Pins.Load()
 
 	return fmt.Sprintf(`REALITY cache report:
   active profiles:  %d
   invalidated:      %d
   stale served:     %d
   negative hits:    %d
-  hot swaps:        %d
-  total pins:       %d`, entries, invalidated, stale, negative, hotSwaps, pins)
+  hot swaps:        %d`, entries, invalidated, stale, negative, hotSwaps)
 }
 
 func (m *CacheManager) IsDirty() bool {
@@ -404,56 +382,35 @@ func (m *CacheManager) ClearDirty() {
 	m.dirty.Store(false)
 }
 
-// CleanupPending removes PendingDelete entries older than maxAge.
-// This is a safety net for leaked Pin/Unpin (e.g., panic without defer).
-// Should be called periodically (e.g., every 5 minutes).
-func (m *CacheManager) CleanupPending(maxAge time.Duration) {
-	now := time.Now()
-	m.entries.Range(func(key, val any) bool {
-		entry := val.(*ProfileEntry)
-		if entry.State == ProfilePendingDelete {
-			if now.Sub(entry.PendingSince) > maxAge {
-				// Force delete regardless of refCount (safety net).
-				if m.entries.CompareAndDelete(key, val) {
-					m.stats.ProfileInvalidated.Add(1)
-					m.dirty.Store(true)
-				}
-			}
-		}
+// Reset clears all cache state for test isolation.
+func (m *CacheManager) Reset() {
+	// Delete all entries one by one to ensure sync.Map internal state is clean.
+	var keys []any
+	m.entries.Range(func(key, _ any) bool {
+		keys = append(keys, key)
 		return true
 	})
-}
-
-// startCleanupLoop runs CleanupPending every interval in the background.
-func (m *CacheManager) startCleanupLoop(interval time.Duration, stop <-chan struct{}) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				m.CleanupPending(10 * time.Minute)
-			case <-stop:
-				return
-			}
-		}
-	}()
+	for _, key := range keys {
+		m.entries.Delete(key)
+	}
+	m.fingerprints.Range(func(key, _ any) bool {
+		m.fingerprints.Delete(key)
+		return true
+	})
+	m.singleflight.Range(func(key, _ any) bool {
+		m.singleflight.Delete(key)
+		return true
+	})
+	m.indexMu.Lock()
+	m.destIndex = make(map[string]map[string]struct{})
+	m.indexMu.Unlock()
+	m.stats.ProfileEntries.Store(0)
+	m.stats.ProfileInvalidated.Store(0)
+	m.stats.FingerprintChanged.Store(0)
+	m.stats.StaleServed.Store(0)
+	m.stats.NegativeHits.Store(0)
+	m.stats.HotSwaps.Store(0)
+	m.dirty.Store(false)
 }
 
 var globalCacheManager = NewCacheManager()
-
-var cleanupStop = make(chan struct{})
-
-func init() {
-	// Start background cleanup for leaked Pin/Unpin.
-	globalCacheManager.startCleanupLoop(5*time.Minute, cleanupStop)
-}
-
-// StopCleanupLoop stops the background cleanup goroutine. For test cleanup.
-func StopCleanupLoop() {
-	select {
-	case <-cleanupStop:
-	default:
-		close(cleanupStop)
-	}
-}

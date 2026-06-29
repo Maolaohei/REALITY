@@ -335,59 +335,6 @@ func TestBackgroundRefreshFormatStats(t *testing.T) {
 	}
 }
 
-func TestPinFallbackTTL_CleanupDeletesExpired(t *testing.T) {
-	key := "pin.cleanup|microsoft.com|h2"
-	fp := computeFingerprint(0x1301, "h2", 1215, 41)
-	globalCacheManager.StoreProfile(key, &RealityProfile{
-		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
-		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
-	})
-	globalCacheManager.Pin(key)
-	globalCacheManager.InvalidateProfile(key)
-	val, _ := globalCacheManager.entries.Load(key)
-	entry := val.(*ProfileEntry)
-	entry.PendingSince = time.Now().Add(-15 * time.Minute)
-	globalCacheManager.CleanupPending(10 * time.Minute)
-	if _, ok := globalCacheManager.entries.Load(key); ok {
-		t.Fatal("should be deleted")
-	}
-}
-
-func TestPinFallbackTTL_KeepsRecentEntries(t *testing.T) {
-	key := "pin.recent|microsoft.com|h2"
-	fp := computeFingerprint(0x1301, "h2", 1215, 41)
-	globalCacheManager.StoreProfile(key, &RealityProfile{
-		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
-		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
-	})
-	globalCacheManager.Pin(key)
-	globalCacheManager.InvalidateProfile(key)
-	globalCacheManager.CleanupPending(10 * time.Minute)
-	if _, ok := globalCacheManager.entries.Load(key); !ok {
-		t.Fatal("should keep recent")
-	}
-	globalCacheManager.Unpin(key)
-	globalCacheManager.InvalidateProfile(key)
-}
-
-func TestPinFallbackTTL_SafetyNetForLeak(t *testing.T) {
-	key := "pin.leak|microsoft.com|h2"
-	fp := computeFingerprint(0x1301, "h2", 1215, 41)
-	globalCacheManager.StoreProfile(key, &RealityProfile{
-		RecordLens: [7]int{1215, 6, 41}, Fingerprint: fp,
-		CipherSuite: 0x1301, ALPN: "h2", CapturedAt: time.Now(),
-	})
-	globalCacheManager.Pin(key)
-	globalCacheManager.InvalidateProfile(key)
-	val, _ := globalCacheManager.entries.Load(key)
-	entry := val.(*ProfileEntry)
-	entry.PendingSince = time.Now().Add(-15 * time.Minute)
-	globalCacheManager.CleanupPending(10 * time.Minute)
-	if _, ok := globalCacheManager.entries.Load(key); ok {
-		t.Fatal("should force delete")
-	}
-}
-
 func BenchmarkRealityProfileCacheHit(b *testing.B) {
 	key := "bench.hit|microsoft.com|h2"
 	fp := computeFingerprint(0x1301, "h2", 1215, 41)

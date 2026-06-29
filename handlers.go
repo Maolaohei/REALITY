@@ -11,7 +11,7 @@ func RegisterCacheHandlers(bus *EventBus) {
 		if globalCacheManager.StoreProfile(profileKey, e.Profile) {
 			// New entry — also store fingerprint.
 			if e.Fingerprint != nil {
-				fpKey := e.Dest + "|" + e.ServerName
+				fpKey := e.Dest + "|" + e.ServerName + "|" + e.ALPN
 				globalCacheManager.StoreFingerprint(fpKey, e.Fingerprint)
 			}
 		}
