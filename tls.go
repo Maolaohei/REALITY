@@ -526,26 +526,46 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				hs.hello = new(serverHelloMsg)
 				if !hs.hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) ||
 					hs.hello.vers != VersionTLS12 || hs.hello.supportedVersion != VersionTLS13 ||
-					cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil ||
-					(!(hs.hello.serverShare.group == X25519 && len(hs.hello.serverShare.data) == 32) &&
-						!(hs.hello.serverShare.group == X25519MLKEM768 && len(hs.hello.serverShare.data) == mlkem.CiphertextSize768+32)) {
+					cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil {
 					break f
 				}
-				// Cache fast path: after parsing ServerHello, check if we have a cached
-				// profile for this target with matching CipherSuite, ALPN, and TLS version.
-				// If so, use the cached RecordLens directly and skip remaining target reads.
+
+				// Cache fast path: verify cached RecordLens against target's actual
+				// TLS record headers in s2cSaved before reusing. If verification fails
+				// (target changed certificates/config), fall through to slow path
+				// with s2cSaved and handshakeLen completely untouched.
 				clientALPN := ""
 				if hs.clientHello != nil && len(hs.clientHello.alpnProtocols) > 0 {
 					clientALPN = hs.clientHello.alpnProtocols[0]
 				}
 				if cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(
-					config.Dest, hs.hello.cipherSuite, clientALPN, VersionTLS13); cacheHit {
-					// Double-check: validate cached RecordLens before reusing.
-					if !ValidateRecordLens(cachedLens) {
-						if show {
-							fmt.Printf("REALITY remoteAddr: %v\tcache hit but RecordLens invalid, falling back\n", remoteAddr)
+					config.Dest, hs.hello.cipherSuite, clientALPN, VersionTLS13); cacheHit && ValidateRecordLens(cachedLens) {
+
+					valid := true
+					currentOffset := 0
+					baseOffset := handshakeLen
+
+					for ci := 1; ci < 7; ci++ {
+						absOffset := baseOffset + currentOffset
+						// If not enough data for a 5-byte TLS record header,
+						// fall back to slow path which will block-read from target.
+						if len(s2cSaved) < absOffset+recordHeaderLen {
+							valid = false
+							break
 						}
-					} else {
+						actualPayloadLen := int(s2cSaved[absOffset+3])<<8 | int(s2cSaved[absOffset+4])
+						expectedTotalLen := cachedLens[ci]
+						// cachedLens stores recordHeaderLen + payloadLen (total).
+						// Verify the actual header Length field matches.
+						if actualPayloadLen+recordHeaderLen != expectedTotalLen {
+							valid = false
+							break
+						}
+						currentOffset += expectedTotalLen
+					}
+
+					if valid {
+						// Verified: safe to commit cached state atomically.
 						hs.c.out.handshakeLen[0] = handshakeLen
 						for ci := 1; ci < 7; ci++ {
 							hs.c.out.handshakeLen[ci] = cachedLens[ci]
@@ -553,10 +573,15 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 						s2cSaved = s2cSaved[handshakeLen:]
 						handshakeLen = 0
 						if show {
-							fmt.Printf("REALITY remoteAddr: %v\tcache hit — using cached RecordLens, skipping target reads\n", remoteAddr)
+							fmt.Printf("REALITY remoteAddr: %v\tcache hit & verified — using cached RecordLens\n", remoteAddr)
 						}
 						break
 					}
+					if show {
+						fmt.Printf("REALITY remoteAddr: %v\tcache hit but target response mismatch, falling back\n", remoteAddr)
+					}
+					// Invalidate stale cache so refresh_manager re-probes next time.
+					globalCacheManager.InvalidateByDest(config.Dest)
 				}
 			}
 				hs.c.out.handshakeLen[i] = handshakeLen

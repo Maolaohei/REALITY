@@ -374,6 +374,16 @@ func (m *CacheManager) CacheReport() string {
   hot swaps:        %d`, entries, invalidated, stale, negative, hotSwaps)
 }
 
+// InvalidateByDest deletes all cached profiles for a given dest.
+// Used when the cache fast path verification fails, indicating the target
+// has changed (e.g. OCSP/certificate rotation).
+func (m *CacheManager) InvalidateByDest(dest string) {
+	keys := m.keysByDest(dest)
+	for key := range keys {
+		m.InvalidateProfile(key)
+	}
+}
+
 func (m *CacheManager) IsDirty() bool {
 	return m.dirty.Load()
 }
