@@ -240,15 +240,41 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 		return false
 	}
 
-	// Quick check: compare cipherSuite only.
+	// Quick check: compare cipherSuite, then optionally read records 1-2
+	// for a faster fingerprint comparison without reading all 7 records.
 	profile, _ := globalCacheManager.GetProfile(entry.cacheKey)
-	if profile != nil && !profile.IsExpired() {
-		if profile.CipherSuite == hello.cipherSuite {
-			// CipherSuite unchanged — skip Phase B (fast path).
+	if profile != nil && !profile.IsExpired() && profile.CipherSuite == hello.cipherSuite {
+		// CipherSuite matches — try quick check of records 1-2 (CCS + EE).
+		quickBuf := s2cSaved[serverHelloLen:]
+		quickLens := [2]int{0, 0}
+		quickOK := true
+		for qi := 0; qi < 2; qi++ {
+			for len(quickBuf) < recordHeaderLen {
+				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				extra, rerr := io.ReadAtLeast(conn, buf, recordHeaderLen)
+				if rerr != nil {
+					quickOK = false
+					break
+				}
+				quickBuf = append(quickBuf, buf[:extra]...)
+			}
+			if !quickOK {
+				break
+			}
+			recLen := recordHeaderLen + int(bigEndianUint16(quickBuf[3:5]))
+			if recLen > maxTLSRecordPayload || len(quickBuf) < recLen {
+				quickOK = false
+				break
+			}
+			quickLens[qi] = recLen
+			quickBuf = quickBuf[recLen:]
+		}
+		if quickOK && quickLens[0] == profile.RecordLens[1] && quickLens[1] == profile.RecordLens[2] {
+			// CCS + EE lengths match cached values — confident no change.
 			globalCacheManager.MarkStale(entry.cacheKey)
 			return true
 		}
-		// CipherSuite changed — need Phase B to confirm.
+		// Quick check failed — fall through to full Phase B.
 	}
 
 	// Phase B: Read remaining records to get full record lengths.

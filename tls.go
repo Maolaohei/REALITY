@@ -73,6 +73,11 @@ type MirrorConn struct {
 	Target net.Conn
 }
 
+// mirrorIdleTimeout is the maximum time a MirrorConn.Read will wait for data
+// from the client before giving up. Prevents permanent hangs if the client
+// or target becomes unresponsive during the handshake phase.
+const mirrorIdleTimeout = 2 * time.Minute
+
 func (c *MirrorConn) Read(b []byte) (int, error) {
 	// Caller holds the mutex. We release it here to allow the target read
 	// goroutine to proceed, then re-acquire after our read completes.
@@ -80,7 +85,13 @@ func (c *MirrorConn) Read(b []byte) (int, error) {
 	// even if c.Conn.Read panics (unlikely for syscalls) or Write/Close panics.
 	c.Unlock()
 	defer c.Lock()
+	// Set idle deadline on client read to prevent permanent hangs.
+	_ = c.Conn.SetReadDeadline(time.Now().Add(mirrorIdleTimeout))
 	n, err := c.Conn.Read(b)
+	// Clear deadline after successful read so subsequent operations are not affected.
+	if err == nil {
+		_ = c.Conn.SetReadDeadline(time.Time{})
+	}
 	if n != 0 {
 		c.Target.Write(b[:n])
 	}
@@ -352,6 +363,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 	copying := false
 	clientHelloReady := make(chan struct{})
+	authFailed := make(chan struct{}, 1)
 
 	waitGroup := new(sync.WaitGroup)
 	waitGroup.Add(2)
@@ -432,6 +444,13 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		default:
 			close(clientHelloReady)
 		}
+		// Signal auth failure so goroutine2 can bail out early.
+		if hs.c.conn != conn {
+			select {
+			case authFailed <- struct{}{}:
+			default:
+			}
+		}
 		if hs.c.conn != conn {
 			if show && hs.clientHello != nil {
 				fmt.Printf("REALITY remoteAddr: %v\tforwarded SNI: %v\n", remoteAddr, hs.clientHello.serverName)
@@ -461,8 +480,17 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		handshakeLen := 0
 
 		// Read from target and cache the result.
+		// Set idle deadline on target to prevent permanent hangs if target
+		// becomes unresponsive during handshake.
+		target.SetReadDeadline(time.Now().Add(mirrorIdleTimeout))
 	f:
 		for {
+			// If auth failed, stop reading from target immediately.
+			select {
+			case <-authFailed:
+				break f
+			default:
+			}
 			n, err := target.Read(buf)
 			if n == 0 {
 				if err != nil {
@@ -530,58 +558,36 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					break f
 				}
 
-				// Cache fast path: verify cached RecordLens against target's actual
-				// TLS record headers in s2cSaved before reusing. If verification fails
-				// (target changed certificates/config), fall through to slow path
-				// with s2cSaved and handshakeLen completely untouched.
+				// Cache fast path: commit cached RecordLens immediately after R0
+				// without waiting for R1-R6. This saves the RTT needed to download
+				// the Certificate record (~3-5KB) from the target.
 				clientALPN := ""
 				if hs.clientHello != nil && len(hs.clientHello.alpnProtocols) > 0 {
 					clientALPN = hs.clientHello.alpnProtocols[0]
 				}
-				if cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(
-					config.Dest, hs.hello.cipherSuite, clientALPN, VersionTLS13); cacheHit && ValidateRecordLens(cachedLens) {
-
-					valid := true
-					currentOffset := 0
-					baseOffset := handshakeLen
-
+				cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(
+					config.Dest, hs.hello.cipherSuite, clientALPN, VersionTLS13)
+				if cacheHit && ValidateRecordLens(cachedLens) {
+					// Commit immediately — trust the cache. If wrong, the
+					// client handshake will fail and next connection uses slow path.
+					hs.c.out.handshakeLen[0] = handshakeLen
 					for ci := 1; ci < 7; ci++ {
-						absOffset := baseOffset + currentOffset
-						// If not enough data for a 5-byte TLS record header,
-						// fall back to slow path which will block-read from target.
-						if len(s2cSaved) < absOffset+recordHeaderLen {
-							valid = false
-							break
-						}
-						actualPayloadLen := int(s2cSaved[absOffset+3])<<8 | int(s2cSaved[absOffset+4])
-						expectedTotalLen := cachedLens[ci]
-						// cachedLens stores recordHeaderLen + payloadLen (total).
-						// Verify the actual header Length field matches.
-						if actualPayloadLen+recordHeaderLen != expectedTotalLen {
-							valid = false
-							break
-						}
-						currentOffset += expectedTotalLen
+						hs.c.out.handshakeLen[ci] = cachedLens[ci]
 					}
-
-					if valid {
-						// Verified: safe to commit cached state atomically.
-						hs.c.out.handshakeLen[0] = handshakeLen
-						for ci := 1; ci < 7; ci++ {
-							hs.c.out.handshakeLen[ci] = cachedLens[ci]
-						}
-						s2cSaved = s2cSaved[handshakeLen:]
-						handshakeLen = 0
-						if show {
-							fmt.Printf("REALITY remoteAddr: %v\tcache hit & verified — using cached RecordLens\n", remoteAddr)
-						}
-						break
-					}
+					s2cSaved = s2cSaved[handshakeLen:]
+					handshakeLen = 0
 					if show {
-						fmt.Printf("REALITY remoteAddr: %v\tcache hit but target response mismatch, falling back\n", remoteAddr)
+						fmt.Printf("REALITY remoteAddr: %v\tcache hit — using cached RecordLens (skipping R1-R6)\n", remoteAddr)
 					}
-					// Invalidate stale cache so refresh_manager re-probes next time.
-					globalCacheManager.InvalidateByDest(config.Dest)
+					break
+				}
+				// Cache miss or validation failed — invalidate and re-probe.
+				if cacheHit {
+					clientSN := ""
+					if hs.clientHello != nil {
+						clientSN = hs.clientHello.serverName
+					}
+					globalCacheManager.InvalidateAndReprobe(config.Dest, clientSN, clientALPN)
 				}
 			}
 				hs.c.out.handshakeLen[i] = handshakeLen
@@ -622,8 +628,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			if err != nil {
 				break
 			}
-			postHandshakeReady := false
-
 			{
 				key := config.Dest + " " + hs.clientHello.serverName
 				if len(hs.clientHello.alpnProtocols) == 0 {
@@ -657,15 +661,11 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 								fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
 							}
 						}
-						postHandshakeReady = true
 					}
 				}
 				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
 					hs.c.MaxUselessRecords = maxUseless.(int)
 				}
-			}
-			if !postHandshakeReady {
-				break
 			}
 			hs.c.isHandshakeComplete.Store(true)
 

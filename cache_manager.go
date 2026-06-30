@@ -384,6 +384,17 @@ func (m *CacheManager) InvalidateByDest(dest string) {
 	}
 }
 
+// InvalidateAndReprobe clears cached profiles for a dest and immediately
+// triggers an async re-probe. Uses DoProbe singleflight to prevent
+// concurrent probe storms.
+func (m *CacheManager) InvalidateAndReprobe(dest, serverName, alpn string) {
+	m.InvalidateByDest(dest)
+	key := CacheKey(dest, serverName, alpn, VersionTLS13)
+	go m.DoProbe(key, func() (*RealityProfile, error) {
+		return probeTargetRaw(dest)
+	})
+}
+
 func (m *CacheManager) IsDirty() bool {
 	return m.dirty.Load()
 }
