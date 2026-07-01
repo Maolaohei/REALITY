@@ -3,20 +3,103 @@ package reality
 import (
 	"context"
 	"fmt"
-	"io"
 	"math/rand"
-	"net"
 	"sync"
 	"time"
 )
 
-// probeBufferPool reuses 64 KiB buffers for background probe reads,
-// avoiding per-probe allocation of two 64 KiB slices.
-var probeBufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, maxRecordSize)
-		return &buf
-	},
+// alpnToInt converts an ALPN string to the integer index used by ProbeTargetViaUTLS.
+func alpnToInt(alpn string) int {
+	switch alpn {
+	case "http/1.1":
+		return 1
+	case "h2":
+		return 2
+	default:
+		return 0
+	}
+}
+
+// probeTarget connects to the target using a real uTLS ClientHello and compares
+// the captured record lengths against the cached profile.
+// Two-phase approach: Phase A checks only CipherSuite from ServerHello,
+// Phase B reads full 7 records only if Phase A detects changes.
+// Returns true if probe succeeded, false on error.
+// Debouncing: requires 2 consecutive identical probe results before triggering HotSwap.
+func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntry) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+	defer cancel()
+
+	globalCacheManager.stats.ProbeAttempts.Add(1)
+
+	// Determine serverName: use entry's if set, otherwise fall back to dest host.
+	sn := serverName
+	if sn == "" {
+		sn = DestFromKey(entry.cacheKey)
+	}
+
+	result, err := ProbeTargetViaUTLS(ctx, dest, sn, alpnToInt(entry.alpn), 0)
+	if err != nil {
+		globalCacheManager.MarkNegative(entry.cacheKey)
+		return false
+	}
+
+	globalCacheManager.stats.ProbeSuccesses.Add(1)
+
+	// Check cached profile for comparison.
+	profile, _ := globalCacheManager.GetProfile(entry.cacheKey)
+
+	// Phase A: Quick CipherSuite check.
+	if profile != nil && !profile.IsExpired() && profile.CipherSuite == result.CipherSuite {
+		// CipherSuite matches — quick check records 1-2 (CCS + EE).
+		if result.RecordLens[1] == profile.RecordLens[1] && result.RecordLens[2] == profile.RecordLens[2] {
+			// CCS + EE lengths match cached values — confident no change.
+			globalCacheManager.MarkStale(entry.cacheKey)
+			return true
+		}
+		// Quick check failed — fall through to full comparison.
+	}
+
+	// Phase B: Full profile comparison.
+	if profile != nil && !profile.IsExpired() {
+		if profile.CipherSuite != result.CipherSuite || !recordLensMatch(profile.RecordLens, result.RecordLens) {
+			// Target appears to have changed. Apply debouncing: only
+			// HotSwap after 2 consecutive identical probe results to
+			// filter out transient network jitter.
+			if entry.lastProbeCipherSuite == result.CipherSuite && entry.lastProbeLens == result.RecordLens {
+				entry.stableCount++
+			} else {
+				entry.stableCount = 1
+				entry.lastProbeCipherSuite = result.CipherSuite
+				entry.lastProbeLens = result.RecordLens
+			}
+			if entry.stableCount >= 2 {
+				// Confirmed stable change — safe to swap.
+				entry.stableCount = 0
+				if !ValidateRecordLens(result.RecordLens) {
+					globalCacheManager.MarkNegative(entry.cacheKey)
+					return false
+				}
+				newProfile := &RealityProfile{
+					RecordLens:   result.RecordLens,
+					Fingerprint:  computeFingerprint(result.CipherSuite, entry.alpn, result.RecordLens[0], result.RecordLens[2]),
+					CipherSuite:  result.CipherSuite,
+					ALPN:         entry.alpn,
+					RecordCount:  result.RecordCount,
+					CapturedAt:   time.Now(),
+				}
+				globalCacheManager.HotSwapProfile(entry.cacheKey, newProfile)
+				globalCacheManager.InvalidateFingerprint()
+			}
+			return true
+		}
+	}
+
+	// Profile unchanged — reset debouncing state.
+	entry.stableCount = 0
+
+	globalCacheManager.MarkStale(entry.cacheKey)
+	return true
 }
 
 // RefreshManager is a unified scheduler for background target probing.
@@ -184,176 +267,6 @@ func (m *RefreshManager) probeAndReschedule(entry *refreshEntry) {
 			entry.timer.Reset(backoff)
 		}
 	}
-}
-
-// probeTarget connects to the target and compares against cached profile.
-// Two-phase approach: Phase A reads only ServerHello (fast path),
-// Phase B reads all 7 records only if Phase A detects changes.
-// Returns true if probe succeeded, false on error.
-// Debouncing: requires 2 consecutive identical probe results before triggering HotSwap.
-func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntry) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
-	defer cancel()
-
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", dest)
-	if err != nil {
-		globalCacheManager.MarkNegative(entry.cacheKey)
-		return false
-	}
-	defer conn.Close()
-
-	bufPtr := probeBufferPool.Get().(*[]byte)
-	buf := *bufPtr
-	s2cSavedPtr := probeBufferPool.Get().(*[]byte)
-	s2cSaved := (*s2cSavedPtr)[:0]
-	defer probeBufferPool.Put(bufPtr)
-	defer probeBufferPool.Put(s2cSavedPtr)
-
-	// Phase A: Read only ServerHello.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
-	if err != nil {
-		globalCacheManager.MarkNegative(entry.cacheKey)
-		return false
-	}
-	s2cSaved = append(s2cSaved, buf[:n]...)
-
-	// Validate ServerHello record.
-	if bigEndianUint16(s2cSaved[1:3]) != VersionTLS12 {
-		globalCacheManager.MarkNegative(entry.cacheKey)
-		return false
-	}
-	if recordType(s2cSaved[0]) != recordTypeHandshake || s2cSaved[5] != typeServerHello {
-		globalCacheManager.MarkNegative(entry.cacheKey)
-		return false
-	}
-	serverHelloLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
-	if serverHelloLen > maxTLSRecordPayload || serverHelloLen > len(s2cSaved) {
-		globalCacheManager.MarkNegative(entry.cacheKey)
-		return false
-	}
-
-	hello := new(serverHelloMsg)
-	if !hello.unmarshal(s2cSaved[recordHeaderLen:serverHelloLen]) {
-		globalCacheManager.MarkNegative(entry.cacheKey)
-		return false
-	}
-
-	// Quick check: compare cipherSuite, then optionally read records 1-2
-	// for a faster fingerprint comparison without reading all 7 records.
-	profile, _ := globalCacheManager.GetProfile(entry.cacheKey)
-	if profile != nil && !profile.IsExpired() && profile.CipherSuite == hello.cipherSuite {
-		// CipherSuite matches — try quick check of records 1-2 (CCS + EE).
-		quickBuf := s2cSaved[serverHelloLen:]
-		quickLens := [2]int{0, 0}
-		quickOK := true
-		for qi := 0; qi < 2; qi++ {
-			for len(quickBuf) < recordHeaderLen {
-				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				extra, rerr := io.ReadAtLeast(conn, buf, recordHeaderLen)
-				if rerr != nil {
-					quickOK = false
-					break
-				}
-				quickBuf = append(quickBuf, buf[:extra]...)
-			}
-			if !quickOK {
-				break
-			}
-			recLen := recordHeaderLen + int(bigEndianUint16(quickBuf[3:5]))
-			if recLen > maxTLSRecordPayload || len(quickBuf) < recLen {
-				quickOK = false
-				break
-			}
-			quickLens[qi] = recLen
-			quickBuf = quickBuf[recLen:]
-		}
-		if quickOK && quickLens[0] == profile.RecordLens[1] && quickLens[1] == profile.RecordLens[2] {
-			// CCS + EE lengths match cached values — confident no change.
-			globalCacheManager.MarkStale(entry.cacheKey)
-			return true
-		}
-		// Quick check failed — fall through to full Phase B.
-	}
-
-	// Phase B: Read remaining records to get full record lengths.
-	var recordLens [7]int
-	recordLens[0] = serverHelloLen
-	recordIndex := 1
-	s2cSaved = s2cSaved[serverHelloLen:]
-
-	for recordIndex < 7 {
-		for recordIndex < 7 && len(s2cSaved) > recordHeaderLen {
-			handshakeLen := recordHeaderLen + int(bigEndianUint16(s2cSaved[3:5]))
-			if handshakeLen > maxTLSRecordPayload {
-				globalCacheManager.MarkNegative(entry.cacheKey)
-				return false
-			}
-			if len(s2cSaved) < handshakeLen {
-				break
-			}
-			recordLens[recordIndex] = handshakeLen
-			s2cSaved = s2cSaved[handshakeLen:]
-			recordIndex++
-		}
-		if recordIndex >= 7 {
-			break
-		}
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, err := io.ReadAtLeast(conn, buf, recordHeaderLen+1)
-		if err != nil {
-			break
-		}
-		s2cSaved = append(s2cSaved, buf[:n]...)
-	}
-
-	// Compare full profile.
-	if profile != nil && !profile.IsExpired() {
-		if profile.CipherSuite != hello.cipherSuite || !recordLensMatch(profile.RecordLens, recordLens) {
-			// Target appears to have changed. Apply debouncing: only
-			// HotSwap after 2 consecutive identical probe results to
-			// filter out transient network抖动.
-			if entry.lastProbeCipherSuite == hello.cipherSuite && entry.lastProbeLens == recordLens {
-				entry.stableCount++
-			} else {
-				entry.stableCount = 1
-				entry.lastProbeCipherSuite = hello.cipherSuite
-				entry.lastProbeLens = recordLens
-			}
-			if entry.stableCount >= 2 {
-				// Confirmed stable change — safe to swap.
-				entry.stableCount = 0
-				// Validate RecordLens before caching.
-				if !ValidateRecordLens(recordLens) {
-					globalCacheManager.MarkNegative(entry.cacheKey)
-					return false
-				}
-				newProfile := &RealityProfile{
-					RecordLens:   recordLens,
-					Fingerprint:  computeFingerprint(hello.cipherSuite, entry.alpn, recordLens[0], recordLens[2]),
-					CipherSuite:  hello.cipherSuite,
-					ALPN:         entry.alpn,
-					RecordCount:  0,
-					CapturedAt:   time.Now(),
-				}
-				for _, l := range recordLens {
-					if l > 0 {
-						newProfile.RecordCount++
-					}
-				}
-				globalCacheManager.HotSwapProfile(entry.cacheKey, newProfile)
-				globalCacheManager.InvalidateFingerprint()
-			}
-			return true
-		}
-	}
-
-	// Profile unchanged — reset debouncing state.
-	entry.stableCount = 0
-
-	globalCacheManager.MarkStale(entry.cacheKey)
-	return true
 }
 
 // GetStats returns statistics about the refresh manager.

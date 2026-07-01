@@ -186,6 +186,10 @@ var (
 	// handshakeSem is a counting semaphore for concurrent handshakes.
 	handshakeSem = make(chan struct{}, maxConcurrentHandshakes)
 
+	// globalReplayGuard deduplicates ClientHello.random prefixes to prevent
+	// resource-wasting replays within the MaxTimeDiff window.
+	globalReplayGuard *ReplayGuard
+
 	// empty is a reusable zero-filled buffer for padding and ML-DSA-65 cert
 	// extensions. 8192 bytes is sufficient (largest use: 3309 bytes).
 	empty = make([]byte, 8192)
@@ -319,6 +323,17 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		}
 	}
 
+	// Initialize replay guard once (uses MaxTimeDiff as the dedup window).
+	if globalReplayGuard == nil {
+		window := config.MaxTimeDiff
+		if window == 0 {
+			window = 90 * time.Second
+		}
+		if window > 0 {
+			globalReplayGuard = NewReplayGuard(window, 0)
+		}
+	}
+
 	// Trigger automatic pre-build probe on first connection.
 	// This starts a background probe + periodic refresh for the target.
 	ensureAutoProbe(config)
@@ -429,6 +444,13 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					(config.MaxClientVer == nil || bigEndianUint24(hs.c.ClientVer[:]) <= bigEndianUint24(config.MaxClientVer)) &&
 					(maxTimeDiff < 0 || time.Since(hs.c.ClientTime).Abs() <= maxTimeDiff) &&
 					(config.ShortIds[hs.c.ClientShortId]) {
+					// Replay guard: reject if this random prefix was seen recently.
+					if globalReplayGuard != nil && !globalReplayGuard.CheckAndMark([20]byte(hs.clientHello.random[:20])) {
+						if show {
+							fmt.Printf("REALITY remoteAddr: %v\treplay detected, rejecting\n", remoteAddr)
+						}
+						break
+					}
 					hs.c.conn = conn
 				}
 				break
@@ -581,8 +603,21 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					}
 					break
 				}
-				// Cache miss or validation failed — invalidate and re-probe.
-				if cacheHit {
+				// Cache miss or validation failed — trigger async re-probe.
+				// Use DoProbe singleflight to deduplicate concurrent probes
+				// for the same dest (multiple connections hit cache miss).
+				if !cacheHit {
+					// True cache miss — probe with singleflight dedup.
+					clientSN := ""
+					if hs.clientHello != nil {
+						clientSN = hs.clientHello.serverName
+					}
+					profileKey := CacheKey(config.Dest, clientSN, clientALPN, VersionTLS13)
+					go globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
+						return probeTargetRaw(config.Dest, clientSN, alpnToInt(clientALPN))
+					})
+				} else {
+					// Validation failed — invalidate and re-probe.
 					clientSN := ""
 					if hs.clientHello != nil {
 						clientSN = hs.clientHello.serverName

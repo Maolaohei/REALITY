@@ -1,6 +1,7 @@
 package reality
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -31,7 +32,8 @@ type ProfileEntry struct {
 type CacheManager struct {
 	entries      sync.Map // map[string]*ProfileEntry
 	fingerprints sync.Map // map[string]*targetFingerprintCache
-	singleflight sync.Map // map[string]*probeFlight
+	singleflight sync.Map // map[string]*probeFlight (background refresh)
+	handshakeSF  sync.Map // map[string]*probeFlight (handshake path, short timeout)
 	destIndex    map[string]map[string]struct{} // dest → set of cache keys (secondary index)
 	indexMu      sync.Mutex                     // protects destIndex
 	stats        CacheManagerStats
@@ -53,6 +55,8 @@ type CacheManagerStats struct {
 	StaleServed        atomic.Int64
 	NegativeHits       atomic.Int64
 	HotSwaps           atomic.Uint64
+	ProbeAttempts      atomic.Uint64
+	ProbeSuccesses     atomic.Uint64
 }
 
 func NewCacheManager() *CacheManager {
@@ -63,28 +67,32 @@ func NewCacheManager() *CacheManager {
 	}
 }
 
-// --- Secondary index ---
+// --- Unified index operations ---
 
-// addToIndex adds a key to the dest secondary index.
-func (m *CacheManager) addToIndex(dest, key string) {
+// putLocked stores a profile entry and updates the dest secondary index.
+// This is the ONLY way to add entries to the cache. All callers must use this.
+func (m *CacheManager) putLocked(key, dest string, entry *ProfileEntry) {
+	m.entries.Store(key, entry)
 	m.indexMu.Lock()
-	defer m.indexMu.Unlock()
 	if m.destIndex[dest] == nil {
 		m.destIndex[dest] = make(map[string]struct{})
 	}
 	m.destIndex[dest][key] = struct{}{}
+	m.indexMu.Unlock()
 }
 
-// removeFromIndex removes a key from the dest secondary index.
-func (m *CacheManager) removeFromIndex(dest, key string) {
+// deleteLocked removes a profile entry and cleans up the dest secondary index.
+// This is the ONLY way to remove entries from the cache. All callers must use this.
+func (m *CacheManager) deleteLocked(key, dest string) {
+	m.entries.Delete(key)
 	m.indexMu.Lock()
-	defer m.indexMu.Unlock()
 	if keys, ok := m.destIndex[dest]; ok {
 		delete(keys, key)
 		if len(keys) == 0 {
 			delete(m.destIndex, dest)
 		}
 	}
+	m.indexMu.Unlock()
 }
 
 // keysByDest returns all cache keys for a given dest. Caller must not modify the returned map.
@@ -97,8 +105,55 @@ func (m *CacheManager) keysByDest(dest string) map[string]struct{} {
 // --- Singleflight ---
 
 func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (*RealityProfile, error) {
+	m.stats.ProbeAttempts.Add(1)
 	flight := &probeFlight{done: make(chan struct{})}
 	val, loaded := m.singleflight.LoadOrStore(key, flight)
+	if loaded {
+		existing := val.(*probeFlight)
+		<-existing.done
+		if existing.err == nil {
+			m.stats.ProbeSuccesses.Add(1)
+		}
+		return existing.value, existing.err
+	}
+	flight.value, flight.err = fn()
+	close(flight.done)
+	m.singleflight.Delete(key)
+	if flight.err == nil {
+		m.stats.ProbeSuccesses.Add(1)
+	}
+	return flight.value, flight.err
+}
+
+// GetOrProbeForHandshake retrieves a cached profile or probes the target if
+// no valid cache entry exists. Uses a separate singleflight group with a
+// shorter timeout (5s) to avoid blocking handshake goroutines on slow probes.
+func (m *CacheManager) GetOrProbeForHandshake(ctx context.Context, key, dest, serverName string, alpn int) (*RealityProfile, error) {
+	// Fast path: check cache first.
+	if val, ok := m.entries.Load(key); ok {
+		entry := val.(*ProfileEntry)
+		entry.mu.Lock()
+		if entry.State == ProfileValid || entry.State == ProfileStale {
+			if time.Since(entry.Profile.CapturedAt) < entry.TTL {
+				entry.mu.Unlock()
+				return entry.Profile, nil
+			}
+		}
+		entry.mu.Unlock()
+	}
+
+	// Slow path: probe with singleflight dedup.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	return m.doHandshakeProbe(key, func() (*RealityProfile, error) {
+		return probeTargetRaw(dest, serverName, alpn)
+	})
+}
+
+func (m *CacheManager) doHandshakeProbe(key string, fn func() (*RealityProfile, error)) (*RealityProfile, error) {
+	flight := &probeFlight{done: make(chan struct{})}
+	val, loaded := m.handshakeSF.LoadOrStore(key, flight)
 	if loaded {
 		existing := val.(*probeFlight)
 		<-existing.done
@@ -106,7 +161,7 @@ func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (
 	}
 	flight.value, flight.err = fn()
 	close(flight.done)
-	m.singleflight.Delete(key)
+	m.handshakeSF.Delete(key)
 	return flight.value, flight.err
 }
 
@@ -143,7 +198,7 @@ func (m *CacheManager) GetProfile(key string) (*RealityProfile, bool) {
 			return nil, false
 		}
 		m.entries.Delete(key)
-		m.removeFromIndex(DestFromKey(key), key)
+		m.deleteLocked(key, DestFromKey(key))
 		m.stats.ProfileEntries.Add(-1)
 		return nil, false
 	}
@@ -172,7 +227,7 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 	}
 	_, loaded := m.entries.LoadOrStore(key, entry)
 	if !loaded {
-		m.addToIndex(DestFromKey(key), key)
+		m.putLocked(key, DestFromKey(key), entry)
 		m.stats.ProfileEntries.Add(1)
 		m.dirty.Store(true)
 		m.evictIfFull()
@@ -191,7 +246,7 @@ func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
 		TTL:     m.baseTTL,
 	}
 	m.entries.Store(key, newEntry)
-	m.addToIndex(DestFromKey(key), key)
+	m.putLocked(key, DestFromKey(key), newEntry)
 	m.stats.HotSwaps.Add(1)
 	m.dirty.Store(true)
 }
@@ -223,7 +278,7 @@ func (m *CacheManager) MarkNegative(key string) {
 			TTL:       m.baseTTL,
 		}
 		m.entries.Store(key, entry)
-		m.addToIndex(DestFromKey(key), key)
+		m.putLocked(key, DestFromKey(key), entry)
 		return
 	}
 	entry := val.(*ProfileEntry)
@@ -246,7 +301,7 @@ func (m *CacheManager) InvalidateProfile(key string) {
 		return
 	}
 	if m.entries.CompareAndDelete(key, val) {
-		m.removeFromIndex(DestFromKey(key), key)
+		m.deleteLocked(key, DestFromKey(key))
 		m.stats.ProfileEntries.Add(-1)
 		m.stats.ProfileInvalidated.Add(1)
 		m.dirty.Store(true)
@@ -333,8 +388,7 @@ func (m *CacheManager) evictIfFull() {
 		return true
 	})
 	if oldestKey != "" {
-		m.entries.Delete(oldestKey)
-		m.removeFromIndex(DestFromKey(oldestKey), oldestKey)
+		m.deleteLocked(oldestKey, DestFromKey(oldestKey))
 		m.stats.ProfileEntries.Add(-1)
 	}
 }
@@ -365,13 +419,22 @@ func (m *CacheManager) CacheReport() string {
 	stale := m.stats.StaleServed.Load()
 	negative := m.stats.NegativeHits.Load()
 	hotSwaps := m.stats.HotSwaps.Load()
+	attempts := m.stats.ProbeAttempts.Load()
+	successes := m.stats.ProbeSuccesses.Load()
+	var successRate float64
+	if attempts > 0 {
+		successRate = float64(successes) / float64(attempts) * 100
+	}
 
 	return fmt.Sprintf(`REALITY cache report:
-  active profiles:  %d
-  invalidated:      %d
-  stale served:     %d
-  negative hits:    %d
-  hot swaps:        %d`, entries, invalidated, stale, negative, hotSwaps)
+  active profiles:     %d
+  invalidated:         %d
+  stale served:        %d
+  negative hits:       %d
+  hot swaps:           %d
+  probe attempts:      %d
+  probe successes:     %d
+  probe success rate:  %.1f%%`, entries, invalidated, stale, negative, hotSwaps, attempts, successes, successRate)
 }
 
 // InvalidateByDest deletes all cached profiles for a given dest.
@@ -391,7 +454,7 @@ func (m *CacheManager) InvalidateAndReprobe(dest, serverName, alpn string) {
 	m.InvalidateByDest(dest)
 	key := CacheKey(dest, serverName, alpn, VersionTLS13)
 	go m.DoProbe(key, func() (*RealityProfile, error) {
-		return probeTargetRaw(dest)
+		return probeTargetRaw(dest, serverName, alpnToInt(alpn))
 	})
 }
 
@@ -401,6 +464,37 @@ func (m *CacheManager) IsDirty() bool {
 
 func (m *CacheManager) ClearDirty() {
 	m.dirty.Store(false)
+}
+
+// CheckConsistency verifies that the entries map and destIndex are in sync.
+// Returns a list of problems (empty = consistent). For testing only.
+func (m *CacheManager) CheckConsistency() []string {
+	var problems []string
+	m.entries.Range(func(k, v any) bool {
+		key := k.(string)
+		dest := DestFromKey(key)
+		m.indexMu.Lock()
+		keys, ok := m.destIndex[dest]
+		m.indexMu.Unlock()
+		if !ok {
+			problems = append(problems, fmt.Sprintf("entry %s: dest %s missing from destIndex", key, dest))
+			return true
+		}
+		if _, exists := keys[key]; !exists {
+			problems = append(problems, fmt.Sprintf("entry %s missing from destIndex[%s]", key, dest))
+		}
+		return true
+	})
+	m.indexMu.Lock()
+	for dest, keys := range m.destIndex {
+		for key := range keys {
+			if _, ok := m.entries.Load(key); !ok {
+				problems = append(problems, fmt.Sprintf("dangling destIndex entry: dest=%s key=%s", dest, key))
+			}
+		}
+	}
+	m.indexMu.Unlock()
+	return problems
 }
 
 // Reset clears all cache state for test isolation.
@@ -422,6 +516,10 @@ func (m *CacheManager) Reset() {
 		m.singleflight.Delete(key)
 		return true
 	})
+	m.handshakeSF.Range(func(key, _ any) bool {
+		m.handshakeSF.Delete(key)
+		return true
+	})
 	m.indexMu.Lock()
 	m.destIndex = make(map[string]map[string]struct{})
 	m.indexMu.Unlock()
@@ -431,6 +529,8 @@ func (m *CacheManager) Reset() {
 	m.stats.StaleServed.Store(0)
 	m.stats.NegativeHits.Store(0)
 	m.stats.HotSwaps.Store(0)
+	m.stats.ProbeAttempts.Store(0)
+	m.stats.ProbeSuccesses.Store(0)
 	m.dirty.Store(false)
 }
 

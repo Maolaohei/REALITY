@@ -12,7 +12,7 @@ import (
 )
 
 func TestProbeTarget_ConnectionRefused(t *testing.T) {
-	profile, err := probeTargetRaw("127.0.0.1:1")
+	profile, err := probeTargetRaw("127.0.0.1:1", "localhost", 2)
 	if err == nil {
 		t.Error("expected error")
 	}
