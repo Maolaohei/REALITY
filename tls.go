@@ -584,11 +584,15 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				// without waiting for R1-R6. This saves the RTT needed to download
 				// the Certificate record (~3-5KB) from the target.
 				clientALPN := ""
-				if hs.clientHello != nil && len(hs.clientHello.alpnProtocols) > 0 {
-					clientALPN = hs.clientHello.alpnProtocols[0]
+				clientSN := ""
+				if hs.clientHello != nil {
+					clientSN = hs.clientHello.serverName
+					if len(hs.clientHello.alpnProtocols) > 0 {
+						clientALPN = hs.clientHello.alpnProtocols[0]
+					}
 				}
 				cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(
-					config.Dest, hs.hello.cipherSuite, clientALPN, VersionTLS13)
+					config.Dest, clientSN, hs.hello.cipherSuite, clientALPN, VersionTLS13)
 				if cacheHit && ValidateRecordLens(cachedLens) {
 					// Commit immediately — trust the cache. If wrong, the
 					// client handshake will fail and next connection uses slow path.

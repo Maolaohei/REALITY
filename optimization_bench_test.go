@@ -54,7 +54,7 @@ func BenchmarkFindCachedProfileByDest(b *testing.B) {
 	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		m.FindCachedProfileByDest("1.2.3.4:443", 0x1301, "h2", VersionTLS13)
+		m.FindCachedProfileByDest("1.2.3.4:443", "example.com", 0x1301, "h2", VersionTLS13)
 	}
 }
 

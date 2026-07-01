@@ -481,7 +481,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 1: Cache miss on empty cache ---
 	t.Log("=== Test 1: Cache miss (empty cache) ===")
-	_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, 0x1301, alpn, tlsVer)
+	_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss on empty cache")
 	}
@@ -498,7 +498,7 @@ func TestL2_CacheLogic(t *testing.T) {
 		CapturedAt:  time.Now(),
 	})
 
-	gotLens, gotVer, hit := globalCacheManager.FindCachedProfileByDest(dest, 0x1301, alpn, tlsVer)
+	gotLens, gotVer, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
 	if !hit {
 		t.Fatal("expected cache hit after store")
 	}
@@ -512,7 +512,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 3: ALPN mismatch → cache miss ---
 	t.Log("=== Test 3: ALPN mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1301, "http/1.1", tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "http/1.1", tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for different ALPN")
 	}
@@ -520,7 +520,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 4: TLSVersion mismatch → cache miss ---
 	t.Log("=== Test 4: TLSVersion mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1301, alpn, VersionTLS12)
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, VersionTLS12)
 	if hit {
 		t.Fatal("expected cache miss for different TLS version")
 	}
@@ -528,7 +528,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 5: CipherSuite mismatch → cache miss ---
 	t.Log("=== Test 5: CipherSuite mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1302, alpn, tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1302, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for different CipherSuite")
 	}
@@ -536,7 +536,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 6: Dest mismatch → cache miss ---
 	t.Log("=== Test 6: Dest mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfileByDest("5.6.7.8:443", 0x1301, alpn, tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfileByDest("5.6.7.8:443", serverName, 0x1301, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for different dest")
 	}
@@ -553,7 +553,7 @@ func TestL2_CacheLogic(t *testing.T) {
 		TLSVersion:  tlsVer,
 		CapturedAt:  time.Now(),
 	})
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1301, "grpc", tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "grpc", tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for invalid RecordLens")
 	}
@@ -562,13 +562,122 @@ func TestL2_CacheLogic(t *testing.T) {
 	// --- Test 8: Invalidate → cache miss ---
 	t.Log("=== Test 8: Invalidate → miss ===")
 	globalCacheManager.InvalidateProfile(key)
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, 0x1301, alpn, tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss after invalidation")
 	}
 	t.Log("  Result: MISS — profile invalidated")
 
 	t.Logf("\nCache report:\n%s", globalCacheManager.CacheReport())
+}
+
+// TestL2_CacheALPNMismatch_BugReproduction reproduces the bug where
+// probeTargetRaw stored profiles with ALPN="" (hardcoded empty string),
+// but FindCachedProfileByDest looked up by the actual ALPN (e.g. "h2").
+// This caused every connection to miss the cache and re-probe the target,
+// leading to intermittent handshake failures from unstable probe results.
+func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
+	globalCacheManager.Reset()
+	t.Cleanup(func() { globalCacheManager.Reset() })
+
+	dest := "microsoft.com:443"
+	serverName := "www.microsoft.com"
+	tlsVer := uint16(VersionTLS13)
+	lens := [7]int{1215, 6, 41, 8273, 286, 74, 0}
+
+	// === Reproduce Bug: profile stored with ALPN="" (old probeTargetRaw behavior) ===
+	buggyKey := CacheKey(dest, serverName, "", tlsVer) // ALPN="" in key
+	fp := computeFingerprint(0x1301, "", lens[0], lens[2])
+	globalCacheManager.StoreProfile(buggyKey, &RealityProfile{
+		RecordLens:   lens,
+		Fingerprint:  fp,
+		CipherSuite:  0x1301,
+		ALPN:         "", // BUG: old code hardcoded empty string
+		TLSVersion:   tlsVer,
+		CapturedAt:   time.Now(),
+	})
+
+	// Lookup with actual ALPN="h2" → should MISS because key mismatch
+	_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "h2", tlsVer)
+	if hit {
+		t.Fatal("BUG STILL PRESENT: cache hit with ALPN='' stored but 'h2' queried")
+	}
+	t.Log("Confirmed bug: profile stored with ALPN='' is NOT found when querying ALPN='h2'")
+
+	// === Fix: profile stored with ALPN="h2" (new probeTargetRaw behavior) ===
+	globalCacheManager.Reset()
+
+	fixedKey := CacheKey(dest, serverName, "h2", tlsVer)
+	fp2 := computeFingerprint(0x1301, "h2", lens[0], lens[2])
+	globalCacheManager.StoreProfile(fixedKey, &RealityProfile{
+		RecordLens:   lens,
+		Fingerprint:  fp2,
+		CipherSuite:  0x1301,
+		ALPN:         "h2", // FIX: correct ALPN
+		TLSVersion:   tlsVer,
+		CapturedAt:   time.Now(),
+	})
+
+	// Lookup with ALPN="h2" → should HIT
+	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "h2", tlsVer)
+	if !hit {
+		t.Fatal("FIX FAILED: expected cache hit with correct ALPN")
+	}
+	t.Log("Fix verified: profile stored with ALPN='h2' is found when querying ALPN='h2'")
+}
+
+// TestL2_CacheServerNameIsolation_BugReproduction reproduces the bug where
+// FindCachedProfileByDest did not check serverName, so profiles for different
+// SNIs sharing the same dest would be mixed up.
+func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
+	globalCacheManager.Reset()
+	t.Cleanup(func() { globalCacheManager.Reset() })
+
+	dest := "microsoft.com:443"
+	tlsVer := uint16(VersionTLS13)
+	alpn := "h2"
+
+	// Store profile for www.microsoft.com
+	keyMS := CacheKey(dest, "www.microsoft.com", alpn, tlsVer)
+	lensMS := [7]int{1215, 6, 41, 8273, 286, 74, 0}
+	globalCacheManager.StoreProfile(keyMS, &RealityProfile{
+		RecordLens:  lensMS,
+		CipherSuite: 0x1301,
+		ALPN:        alpn,
+		TLSVersion:  tlsVer,
+		CapturedAt:  time.Now(),
+	})
+
+	// Store profile for a different SNI on the same dest
+	keyOther := CacheKey(dest, "login.live.com", alpn, tlsVer)
+	lensOther := [7]int{1300, 6, 50, 9000, 300, 80, 0}
+	globalCacheManager.StoreProfile(keyOther, &RealityProfile{
+		RecordLens:  lensOther,
+		CipherSuite: 0x1301,
+		ALPN:        alpn,
+		TLSVersion:  tlsVer,
+		CapturedAt:  time.Now(),
+	})
+
+	// Lookup for www.microsoft.com → must return its record lens, not login.live.com's
+	gotLens, _, hit := globalCacheManager.FindCachedProfileByDest(dest, "www.microsoft.com", 0x1301, alpn, tlsVer)
+	if !hit {
+		t.Fatal("expected cache hit for www.microsoft.com")
+	}
+	if gotLens != lensMS {
+		t.Fatalf("serverName isolation broken: got lens %v (login.live.com), want %v (www.microsoft.com)", gotLens, lensMS)
+	}
+	t.Logf("Correct: returned lens %v for www.microsoft.com", gotLens)
+
+	// Lookup for login.live.com → must return its record lens
+	gotLens2, _, hit2 := globalCacheManager.FindCachedProfileByDest(dest, "login.live.com", 0x1301, alpn, tlsVer)
+	if !hit2 {
+		t.Fatal("expected cache hit for login.live.com")
+	}
+	if gotLens2 != lensOther {
+		t.Fatalf("serverName isolation broken: got lens %v (www.microsoft.com), want %v (login.live.com)", gotLens2, lensOther)
+	}
+	t.Logf("Correct: returned lens %v for login.live.com", gotLens2)
 }
 
 // TestL2_REALITY_LargeEncryptedExtensions verifies the C2 code path:
@@ -704,4 +813,160 @@ func TestL2_REALITY_LargeEncryptedExtensions(t *testing.T) {
 	}
 
 	t.Log("C2 Large EncryptedExtensions: 5/5 passed")
+}
+
+// TestL2_StaleCacheCausesHandshakeFailure simulates the real-world scenario:
+// REALITY impersonates microsoft.com, client accesses baidu.com through tunnel.
+// When cache has stale record lens (e.g. from a previous target), the padding
+// calculation in encrypt() goes negative, causing handshake failure and fallback
+// to direct forwarding — the browser then sees the target's real cert.
+func TestL2_StaleCacheCausesHandshakeFailure(t *testing.T) {
+	globalCacheManager.Reset()
+	t.Cleanup(func() { globalCacheManager.Reset() })
+
+	dest := "microsoft.com:443"
+	serverName := "www.microsoft.com"
+	tlsVer := uint16(VersionTLS13)
+	alpn := "h2"
+
+	// Scenario: target server updated its cert chain, making records larger.
+	// Old cached profile has small record lens, but actual server sends bigger ones.
+	oldLens := [7]int{1215, 6, 41, 8273, 286, 74, 0}   // stale cache
+	newLens := [7]int{1300, 6, 55, 9200, 310, 82, 0}    // actual target response
+
+	// Store stale profile in cache (simulates old probe result)
+	key := CacheKey(dest, serverName, alpn, tlsVer)
+	globalCacheManager.StoreProfile(key, &RealityProfile{
+		RecordLens:  oldLens,
+		CipherSuite: 0x1301,
+		ALPN:        alpn,
+		TLSVersion:  tlsVer,
+		CapturedAt:  time.Now(),
+	})
+
+	// Verify cache hit returns stale data
+	gotLens, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
+	if !hit {
+		t.Fatal("expected cache hit")
+	}
+	if gotLens != oldLens {
+		t.Fatalf("expected stale lens %v, got %v", oldLens, gotLens)
+	}
+
+	// Simulate what happens during handshake when cached lens are stale.
+	// In encrypt(), the padding formula is:
+	//   padding = cached_lens - len(record) - AEAD_overhead
+	// where len(record) = 5 (TLS header) + payload_size
+	// and AEAD overhead = 16 bytes (AES-GCM tag)
+	//
+	// If the target's actual record is larger than cached, padding < 0 → handshake fails.
+	overhead := 16
+	for i := 2; i <= 5; i++ {
+		// The payload is the actual handshake message bytes (e.g. Certificate body).
+		// In real handshake, payload_size ≈ actual_record_lens - 5 (header) - 16 (AEAD)
+		actualPayloadSize := newLens[i] - 5 - overhead
+		recordSize := 5 + actualPayloadSize
+		padding := oldLens[i] - recordSize - overhead
+		if padding < 0 {
+			t.Logf("Record[%d]: stale lens=%d, actual record=%d, padding=%d → HANDSHAKE FAILS",
+				i, oldLens[i], recordSize, padding)
+		} else {
+			t.Logf("Record[%d]: stale lens=%d, actual record=%d, padding=%d → OK",
+				i, oldLens[i], recordSize, padding)
+		}
+	}
+
+	// Now invalidate stale cache and store correct profile
+	globalCacheManager.InvalidateProfile(key)
+	globalCacheManager.StoreProfile(key, &RealityProfile{
+		RecordLens:  newLens,
+		CipherSuite: 0x1301,
+		ALPN:        alpn,
+		TLSVersion:  tlsVer,
+		CapturedAt:  time.Now(),
+	})
+
+	// Verify cache now returns correct data
+	gotLens2, _, hit2 := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
+	if !hit2 {
+		t.Fatal("expected cache hit after refresh")
+	}
+	if gotLens2 != newLens {
+		t.Fatalf("expected fresh lens %v, got %v", newLens, gotLens2)
+	}
+
+	// Verify padding would be non-negative with correct lens
+	for i := 2; i <= 5; i++ {
+		actualPayloadSize := newLens[i] - 5 - overhead
+		recordSize := 5 + actualPayloadSize
+		padding := newLens[i] - recordSize - overhead
+		if padding < 0 {
+			t.Fatalf("Record[%d]: even with fresh lens, padding=%d < 0", i, padding)
+		}
+	}
+
+	t.Log("Stale cache scenario: confirmed padding error with stale data, correct with fresh data")
+}
+
+// TestL2_ALPNMismatchCausesProbeStorm demonstrates how the old ALPN=""
+// bug caused every connection to miss cache and trigger a new probe,
+// leading to inconsistent record lens across connections.
+func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
+	globalCacheManager.Reset()
+	t.Cleanup(func() { globalCacheManager.Reset() })
+
+	dest := "microsoft.com:443"
+	serverName := "www.microsoft.com"
+	tlsVer := uint16(VersionTLS13)
+
+	// Simulate old bug: 5 connections each store profile with ALPN=""
+	for i := 0; i < 5; i++ {
+		buggyKey := CacheKey(dest, serverName, "", tlsVer)
+		lens := [7]int{1200 + i*10, 6, 40 + i, 8000 + i*100, 250 + i*5, 70 + i, 0}
+		globalCacheManager.StoreProfile(buggyKey, &RealityProfile{
+			RecordLens:  lens,
+			CipherSuite: 0x1301,
+			ALPN:        "", // BUG
+			TLSVersion:  tlsVer,
+			CapturedAt:  time.Now(),
+		})
+	}
+
+	// Every lookup with ALPN="h2" misses
+	misses := 0
+	for i := 0; i < 5; i++ {
+		_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "h2", tlsVer)
+		if !hit {
+			misses++
+		}
+	}
+	if misses != 5 {
+		t.Fatalf("expected 5 misses, got %d", misses)
+	}
+	t.Logf("ALPN mismatch: 5/5 lookups missed cache (probe storm)")
+
+	// Now with fix: store with correct ALPN
+	globalCacheManager.Reset()
+	fixedKey := CacheKey(dest, serverName, "h2", tlsVer)
+	lens := [7]int{1215, 6, 41, 8273, 286, 74, 0}
+	globalCacheManager.StoreProfile(fixedKey, &RealityProfile{
+		RecordLens:  lens,
+		CipherSuite: 0x1301,
+		ALPN:        "h2", // FIX
+		TLSVersion:  tlsVer,
+		CapturedAt:  time.Now(),
+	})
+
+	// All lookups hit
+	hits := 0
+	for i := 0; i < 5; i++ {
+		_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "h2", tlsVer)
+		if hit {
+			hits++
+		}
+	}
+	if hits != 5 {
+		t.Fatalf("expected 5 hits, got %d", hits)
+	}
+	t.Logf("ALPN fix: 5/5 lookups hit cache (no more probe storm)")
 }

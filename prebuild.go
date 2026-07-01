@@ -15,11 +15,12 @@ func ProbeTarget(ctx context.Context, config *Config) (*RealityProfile, error) {
 		return nil, err
 	}
 
+	alpn := intToALPN(2)
 	return &RealityProfile{
 		RecordLens:   result.RecordLens,
-		Fingerprint:  computeFingerprint(result.CipherSuite, "", result.RecordLens[0], result.RecordLens[2]),
+		Fingerprint:  computeFingerprint(result.CipherSuite, alpn, result.RecordLens[0], result.RecordLens[2]),
 		CipherSuite:  result.CipherSuite,
-		ALPN:         "",
+		ALPN:         alpn,
 		TLSVersion:   VersionTLS13,
 		RecordCount:  result.RecordCount,
 		CapturedAt:   time.Now(),
@@ -49,7 +50,9 @@ func ensureAutoProbe(config *Config) {
 		if !m.started {
 			m.Start()
 		}
-		m.AddTarget(dest, "", "")
+		// Don't register target here — serverName/ALPN are unknown at this
+		// point. Registration happens in RegisterRefreshHandlers via the
+		// EventHandshakeComplete event with correct parameters.
 	})
 }
 
@@ -71,11 +74,12 @@ func probeTargetRaw(dest, serverName string, alpnIndex int) (*RealityProfile, er
 		return nil, err
 	}
 
+	alpn := intToALPN(alpnIndex)
 	return &RealityProfile{
 		RecordLens:   result.RecordLens,
-		Fingerprint:  computeFingerprint(result.CipherSuite, "", result.RecordLens[0], result.RecordLens[2]),
+		Fingerprint:  computeFingerprint(result.CipherSuite, alpn, result.RecordLens[0], result.RecordLens[2]),
 		CipherSuite:  result.CipherSuite,
-		ALPN:         "",
+		ALPN:         alpn,
 		TLSVersion:   VersionTLS13,
 		RecordCount:  result.RecordCount,
 		CapturedAt:   time.Now(),
@@ -120,7 +124,8 @@ func WarmupProfiles(dir string) {
 
 					alpnIndex := alpnToInt(parts[2])
 
-					globalCacheManager.DoProbe(dest, func() (*RealityProfile, error) {
+					profileKey := CacheKey(dest, serverName, parts[2], VersionTLS13)
+					globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
 						return probeTargetRaw(dest, serverName, alpnIndex)
 					})
 				}(key)

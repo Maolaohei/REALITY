@@ -20,6 +20,18 @@ func alpnToInt(alpn string) int {
 	}
 }
 
+// intToALPN converts an ALPN index back to the protocol string.
+func intToALPN(index int) string {
+	switch index {
+	case 1:
+		return "http/1.1"
+	case 2:
+		return "h2"
+	default:
+		return ""
+	}
+}
+
 // probeTarget connects to the target using a real uTLS ClientHello and compares
 // the captured record lengths against the cached profile.
 // Two-phase approach: Phase A checks only CipherSuite from ServerHello,

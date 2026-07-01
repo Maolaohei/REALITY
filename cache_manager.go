@@ -332,12 +332,17 @@ func ValidateRecordLens(lens [7]int) bool {
 }
 
 // FindCachedProfileByDest searches for a cached profile matching the given dest,
-// cipher suite, ALPN, and TLS version. Returns the profile's RecordLens and
+// serverName, cipher suite, ALPN, and TLS version. Returns the profile's RecordLens and
 // TLSVersion if found and valid. This is used by Server() to skip target reads
 // when a cached profile is available.
-func (m *CacheManager) FindCachedProfileByDest(dest string, cipherSuite uint16, alpn string, tlsVersion uint16) (lens [7]int, foundTLSVersion uint16, ok bool) {
+func (m *CacheManager) FindCachedProfileByDest(dest, serverName string, cipherSuite uint16, alpn string, tlsVersion uint16) (lens [7]int, foundTLSVersion uint16, ok bool) {
 	keys := m.keysByDest(dest)
 	for key := range keys {
+		// Parse serverName from cache key to ensure exact SNI match.
+		_, keySN, keyALPN, _ := ParseCacheKey(key)
+		if keySN != serverName || keyALPN != alpn {
+			continue
+		}
 		val, exists := m.entries.Load(key)
 		if !exists {
 			continue
@@ -353,7 +358,6 @@ func (m *CacheManager) FindCachedProfileByDest(dest string, cipherSuite uint16, 
 			continue
 		}
 		if entry.Profile.CipherSuite != cipherSuite ||
-			entry.Profile.ALPN != alpn ||
 			entry.Profile.TLSVersion != tlsVersion {
 			entry.mu.Unlock()
 			continue
