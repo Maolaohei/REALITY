@@ -591,8 +591,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 						clientALPN = hs.clientHello.alpnProtocols[0]
 					}
 				}
-				cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(
-					config.Dest, clientSN, hs.hello.cipherSuite, clientALPN, VersionTLS13)
+				cachedLens, _, cacheHit := globalCacheManager.FindCachedProfile(
+					clientSN, hs.hello.cipherSuite, clientALPN, VersionTLS13)
 				if cacheHit && ValidateRecordLens(cachedLens) {
 					// Commit immediately — trust the cache. If wrong, the
 					// client handshake will fail and next connection uses slow path.
@@ -616,7 +616,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					if hs.clientHello != nil {
 						clientSN = hs.clientHello.serverName
 					}
-					profileKey := CacheKey(config.Dest, clientSN, clientALPN, VersionTLS13)
+					profileKey := CacheKey(clientSN, clientALPN, VersionTLS13)
 					go globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
 						return probeTargetRaw(config.Dest, clientSN, alpnToInt(clientALPN))
 					})
@@ -626,7 +626,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					if hs.clientHello != nil {
 						clientSN = hs.clientHello.serverName
 					}
-					globalCacheManager.InvalidateAndReprobe(config.Dest, clientSN, clientALPN)
+					globalCacheManager.InvalidateByServerName(clientSN, config.Dest, clientALPN)
 				}
 			}
 				hs.c.out.handshakeLen[i] = handshakeLen

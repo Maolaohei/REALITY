@@ -44,13 +44,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 
 	globalCacheManager.stats.ProbeAttempts.Add(1)
 
-	// Determine serverName: use entry's if set, otherwise fall back to dest host.
-	sn := serverName
-	if sn == "" {
-		sn = DestFromKey(entry.cacheKey)
-	}
-
-	result, err := ProbeTargetViaUTLS(ctx, dest, sn, alpnToInt(entry.alpn), 0)
+	result, err := ProbeTargetViaUTLS(ctx, dest, serverName, alpnToInt(entry.alpn), 0)
 	if err != nil {
 		globalCacheManager.MarkNegative(entry.cacheKey)
 		return false
@@ -119,7 +113,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 // manages all targets with independent timers.
 type RefreshManager struct {
 	mu      sync.Mutex
-	targets map[string]*refreshEntry
+	targets map[string]*refreshEntry // keyed by serverName
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	started bool
@@ -128,18 +122,18 @@ type RefreshManager struct {
 
 // refreshEntry tracks refresh state for a single target.
 type refreshEntry struct {
-	dest       string
+	dest       string // actual target address for probing
 	serverName string
-	alpn       string // ALPN for building full cache key
-	cacheKey   string // precomputed CacheKey(dest, serverName, alpn, VersionTLS13)
+	alpn       string
+	cacheKey   string // precomputed CacheKey(serverName, alpn, VersionTLS13)
 	timer      *time.Timer
 	stopCh     chan struct{}
 	failCount  int // consecutive probe failures
 
 	// Debouncing: only HotSwap after consecutive identical probe results.
-	lastProbeLens      [7]int
+	lastProbeLens        [7]int
 	lastProbeCipherSuite uint16
-	stableCount        int
+	stableCount          int
 }
 
 var (
@@ -215,18 +209,18 @@ func (m *RefreshManager) AddTarget(dest, serverName, alpn string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Use dest as primary key (serverName may be empty at probe time).
-	key := dest
+	// Use serverName as primary key — one RA SNI maps to one target.
+	key := serverName
 	if _, exists := m.targets[key]; exists {
 		return
 	}
 
 	entry := &refreshEntry{
-		dest:     dest,
+		dest:       dest,
 		serverName: serverName,
-		alpn:     alpn,
-		cacheKey: CacheKey(dest, serverName, alpn, VersionTLS13),
-		stopCh:   make(chan struct{}),
+		alpn:       alpn,
+		cacheKey:   CacheKey(serverName, alpn, VersionTLS13),
+		stopCh:     make(chan struct{}),
 	}
 	entry.timer = time.AfterFunc(randomRefreshInterval(), func() {
 		m.probeAndReschedule(entry)
@@ -239,7 +233,7 @@ func (m *RefreshManager) RemoveTarget(dest, serverName, alpn string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := dest
+	key := serverName
 	if entry, exists := m.targets[key]; exists {
 		entry.timer.Stop()
 		close(entry.stopCh)
@@ -264,7 +258,7 @@ func (m *RefreshManager) probeAndReschedule(entry *refreshEntry) {
 	// Reschedule with adaptive interval.
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := entry.dest
+	key := entry.serverName
 	if _, exists := m.targets[key]; exists {
 		if success {
 			entry.failCount = 0
@@ -296,7 +290,7 @@ func (m *RefreshManager) FormatStats() string {
 
 // invalidateCache removes cached profiles for a target.
 func invalidateCache(dest, serverName, alpn string) {
-	profileKey := CacheKey(dest, serverName, alpn, VersionTLS13)
+	profileKey := CacheKey(serverName, alpn, VersionTLS13)
 	globalCacheManager.InvalidateProfile(profileKey)
 }
 

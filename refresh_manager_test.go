@@ -81,7 +81,7 @@ func TestRefreshProbe_Success(t *testing.T) {
 	addr, closeServer := startMockTLSServer(t, cert)
 	defer closeServer()
 
-	cacheKey := CacheKey(addr, "localhost", "h2", VersionTLS13)
+	cacheKey := CacheKey("localhost", "h2", VersionTLS13)
 	result, err := ProbeTargetViaUTLS(tCtx(t), addr, "localhost", 2, 0)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -123,7 +123,7 @@ func TestRefreshProbe_Success(t *testing.T) {
 // target calls MarkNegative and returns false.
 func TestRefreshProbe_UnreachableTarget(t *testing.T) {
 	dest := "127.0.0.1:1"
-	cacheKey := CacheKey(dest, "test", "h2", VersionTLS13)
+	cacheKey := CacheKey("test", "h2", VersionTLS13)
 
 	m := &RefreshManager{
 		targets: make(map[string]*refreshEntry),
@@ -172,7 +172,7 @@ func TestRefreshProbe_Debouncing(t *testing.T) {
 
 	// Pre-populate cache with a FAKE profile that differs from the real one.
 	// This ensures every probe enters Phase B (change detection).
-	cacheKey := CacheKey(addr, "localhost", "h2", VersionTLS13)
+	cacheKey := CacheKey("localhost", "h2", VersionTLS13)
 	fakeRecordLens := result.RecordLens
 	fakeRecordLens[3] = result.RecordLens[3] + 999 // Cert record length guaranteed different
 	fakeCS := result.CipherSuite
@@ -256,7 +256,7 @@ func TestRefreshManager_DetectsTargetChange(t *testing.T) {
 	}
 
 	// Pre-populate cache with a fake profile that differs from the real one.
-	cacheKey := CacheKey(addr, "localhost", "h2", VersionTLS13)
+	cacheKey := CacheKey("localhost", "h2", VersionTLS13)
 	fakeRecordLens := result.RecordLens
 	fakeRecordLens[3] = result.RecordLens[3] + 999
 	fakeCS := result.CipherSuite

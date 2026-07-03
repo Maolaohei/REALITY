@@ -128,7 +128,7 @@ func (s *PersistentProfileStore) load() {
 		return
 	}
 
-	// Don't load expired entries
+	// Don't load expired entries. Migrate legacy 4-part keys to new 3-part format.
 	now := time.Now()
 	for key, entry := range file.Profiles {
 		capturedAt := time.Unix(0, entry.CapturedAt)
@@ -144,7 +144,14 @@ func (s *PersistentProfileStore) load() {
 			RecordCount: entry.RecordCount,
 			CapturedAt:  capturedAt,
 		}
-		globalCacheManager.StoreProfile(key, profile)
+		// Migrate legacy key: "dest|serverName|alpn|ver" → "serverName|alpn|ver"
+		storeKey := key
+		parts := splitKey(key)
+		if len(parts) >= 4 {
+			// Legacy format — rebuild with new format
+			storeKey = CacheKey(parts[1], parts[2], hexToUint16(parts[3]))
+		}
+		globalCacheManager.StoreProfile(storeKey, profile)
 	}
 }
 

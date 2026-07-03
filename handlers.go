@@ -5,13 +5,13 @@ import "fmt"
 // RegisterCacheHandlers subscribes CacheManager to handshake events.
 func RegisterCacheHandlers(bus *EventBus) {
 	bus.On(EventHandshakeComplete, func(e Event) {
-		profileKey := CacheKey(e.Dest, e.ServerName, e.ALPN, e.TLSVersion)
+		profileKey := CacheKey(e.ServerName, e.ALPN, e.TLSVersion)
 
 		// Store profile in cache.
 		if globalCacheManager.StoreProfile(profileKey, e.Profile) {
 			// New entry — also store fingerprint.
 			if e.Fingerprint != nil {
-				fpKey := e.Dest + "|" + e.ServerName + "|" + e.ALPN
+				fpKey := e.ServerName + "|" + e.ALPN
 				globalCacheManager.StoreFingerprint(fpKey, e.Fingerprint)
 			}
 		}
@@ -42,7 +42,7 @@ func RegisterDiagnosticsHandlers(bus *EventBus, show bool) {
 		return
 	}
 	bus.On(EventHandshakeComplete, func(e Event) {
-		fmt.Printf("REALITY: cached profile for %v\n", e.Dest)
+		fmt.Printf("REALITY: cached profile for %v\n", e.ServerName)
 		fmt.Println(globalCacheManager.CacheReport())
 	})
 }

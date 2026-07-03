@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// BenchmarkCacheInvalidateByDest measures the old invalidation path.
-func BenchmarkCacheInvalidateByDest(b *testing.B) {
+// BenchmarkCacheInvalidateByServerName measures the invalidation path.
+func BenchmarkCacheInvalidateByServerName(b *testing.B) {
 	m := NewCacheManager()
 	for i := 0; i < 100; i++ {
-		key := CacheKey("1.2.3.4:443", "example.com", "h2", VersionTLS13)
+		key := CacheKey("example.com", "h2", VersionTLS13)
 		m.StoreProfile(key, &RealityProfile{
 			RecordLens:  [7]int{1215, 6, 41, 8273, 286, 74, 0},
 			CipherSuite: 0x1301,
@@ -20,14 +20,14 @@ func BenchmarkCacheInvalidateByDest(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		m.InvalidateByDest("1.2.3.4:443")
+		m.InvalidateProfile(CacheKey("example.com", "h2", VersionTLS13))
 	}
 }
 
 // BenchmarkCacheGetProfile measures cache lookup latency.
 func BenchmarkCacheGetProfile(b *testing.B) {
 	m := NewCacheManager()
-	key := CacheKey("1.2.3.4:443", "example.com", "h2", VersionTLS13)
+	key := CacheKey("example.com", "h2", VersionTLS13)
 	m.StoreProfile(key, &RealityProfile{
 		RecordLens:  [7]int{1215, 6, 41, 8273, 286, 74, 0},
 		CipherSuite: 0x1301,
@@ -41,10 +41,10 @@ func BenchmarkCacheGetProfile(b *testing.B) {
 	}
 }
 
-// BenchmarkFindCachedProfileByDest measures the cache fast path lookup.
-func BenchmarkFindCachedProfileByDest(b *testing.B) {
+// BenchmarkFindCachedProfile measures the cache fast path lookup.
+func BenchmarkFindCachedProfile(b *testing.B) {
 	m := NewCacheManager()
-	key := CacheKey("1.2.3.4:443", "example.com", "h2", VersionTLS13)
+	key := CacheKey("example.com", "h2", VersionTLS13)
 	m.StoreProfile(key, &RealityProfile{
 		RecordLens:  [7]int{1215, 6, 41, 8273, 286, 74, 0},
 		CipherSuite: 0x1301,
@@ -54,7 +54,7 @@ func BenchmarkFindCachedProfileByDest(b *testing.B) {
 	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		m.FindCachedProfileByDest("1.2.3.4:443", "example.com", 0x1301, "h2", VersionTLS13)
+		m.FindCachedProfile("example.com", 0x1301, "h2", VersionTLS13)
 	}
 }
 
@@ -72,8 +72,8 @@ func BenchmarkAuthFailedChannel(b *testing.B) {
 
 // BenchmarkRecordLensMatch measures the quick-check comparison.
 func BenchmarkRecordLensMatch(b *testing.B) {
-	a := [7]int{1215, 6, 41, 8273, 286, 74, 100}
-	b2 := [7]int{1215, 6, 41, 8273, 286, 74, 160}
+	a := [7]int{1215, 6, 200, 300, 400, 500, 600}
+	b2 := [7]int{1215, 6, 200, 300, 400, 500, 660}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		recordLensMatch(a, b2)

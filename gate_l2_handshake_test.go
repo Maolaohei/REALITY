@@ -470,18 +470,17 @@ func TestL2_CacheLogic(t *testing.T) {
 	globalCacheManager.Reset()
 	t.Cleanup(func() { globalCacheManager.Reset() })
 
-	dest := "1.2.3.4:443"
 	serverName := "www.google.com"
 	alpn := "h2"
 	tlsVer := uint16(VersionTLS13)
-	key := CacheKey(dest, serverName, alpn, tlsVer)
+	key := CacheKey(serverName, alpn, tlsVer)
 
 	lens := [7]int{1215, 6, 41, 0, 0, 0, 0}
 	fp := computeFingerprint(0x1301, alpn, lens[0], lens[2])
 
 	// --- Test 1: Cache miss on empty cache ---
 	t.Log("=== Test 1: Cache miss (empty cache) ===")
-	_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
+	_, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss on empty cache")
 	}
@@ -498,7 +497,7 @@ func TestL2_CacheLogic(t *testing.T) {
 		CapturedAt:  time.Now(),
 	})
 
-	gotLens, gotVer, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
+	gotLens, gotVer, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if !hit {
 		t.Fatal("expected cache hit after store")
 	}
@@ -512,7 +511,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 3: ALPN mismatch → cache miss ---
 	t.Log("=== Test 3: ALPN mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "http/1.1", tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "http/1.1", tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for different ALPN")
 	}
@@ -520,7 +519,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 4: TLSVersion mismatch → cache miss ---
 	t.Log("=== Test 4: TLSVersion mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, VersionTLS12)
+	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, VersionTLS12)
 	if hit {
 		t.Fatal("expected cache miss for different TLS version")
 	}
@@ -528,23 +527,23 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 5: CipherSuite mismatch → cache miss ---
 	t.Log("=== Test 5: CipherSuite mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1302, alpn, tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1302, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for different CipherSuite")
 	}
 	t.Log("  Result: MISS — CipherSuite 0x1302 != 0x1301")
 
-	// --- Test 6: Dest mismatch → cache miss ---
-	t.Log("=== Test 6: Dest mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfileByDest("5.6.7.8:443", serverName, 0x1301, alpn, tlsVer)
+	// --- Test 6: Different serverName → cache miss ---
+	t.Log("=== Test 6: Different serverName → miss ===")
+	_, _, hit = globalCacheManager.FindCachedProfile("other.example.com", 0x1301, alpn, tlsVer)
 	if hit {
-		t.Fatal("expected cache miss for different dest")
+		t.Fatal("expected cache miss for different serverName")
 	}
-	t.Log("  Result: MISS — dest '5.6.7.8:443' != '1.2.3.4:443'")
+	t.Log("  Result: MISS — serverName 'other.example.com' != 'www.google.com'")
 
 	// --- Test 7: Invalid RecordLens → cache miss (defense) ---
 	t.Log("=== Test 7: Invalid RecordLens → miss (defense) ===")
-	badKey := CacheKey(dest, serverName, "grpc", tlsVer)
+	badKey := CacheKey(serverName, "grpc", tlsVer)
 	globalCacheManager.StoreProfile(badKey, &RealityProfile{
 		RecordLens:  [7]int{99999, 6, 41}, // 99999 > maxTLSRecordPayload
 		Fingerprint: fp,
@@ -553,7 +552,7 @@ func TestL2_CacheLogic(t *testing.T) {
 		TLSVersion:  tlsVer,
 		CapturedAt:  time.Now(),
 	})
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "grpc", tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "grpc", tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for invalid RecordLens")
 	}
@@ -562,7 +561,7 @@ func TestL2_CacheLogic(t *testing.T) {
 	// --- Test 8: Invalidate → cache miss ---
 	t.Log("=== Test 8: Invalidate → miss ===")
 	globalCacheManager.InvalidateProfile(key)
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss after invalidation")
 	}
@@ -573,20 +572,19 @@ func TestL2_CacheLogic(t *testing.T) {
 
 // TestL2_CacheALPNMismatch_BugReproduction reproduces the bug where
 // probeTargetRaw stored profiles with ALPN="" (hardcoded empty string),
-// but FindCachedProfileByDest looked up by the actual ALPN (e.g. "h2").
+// but FindCachedProfile looked up by the actual ALPN (e.g. "h2").
 // This caused every connection to miss the cache and re-probe the target,
 // leading to intermittent handshake failures from unstable probe results.
 func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
 	globalCacheManager.Reset()
 	t.Cleanup(func() { globalCacheManager.Reset() })
 
-	dest := "microsoft.com:443"
 	serverName := "www.microsoft.com"
 	tlsVer := uint16(VersionTLS13)
 	lens := [7]int{1215, 6, 41, 8273, 286, 74, 0}
 
 	// === Reproduce Bug: profile stored with ALPN="" (old probeTargetRaw behavior) ===
-	buggyKey := CacheKey(dest, serverName, "", tlsVer) // ALPN="" in key
+	buggyKey := CacheKey(serverName, "", tlsVer) // ALPN="" in key
 	fp := computeFingerprint(0x1301, "", lens[0], lens[2])
 	globalCacheManager.StoreProfile(buggyKey, &RealityProfile{
 		RecordLens:   lens,
@@ -598,7 +596,7 @@ func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
 	})
 
 	// Lookup with actual ALPN="h2" → should MISS because key mismatch
-	_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "h2", tlsVer)
+	_, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
 	if hit {
 		t.Fatal("BUG STILL PRESENT: cache hit with ALPN='' stored but 'h2' queried")
 	}
@@ -607,7 +605,7 @@ func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
 	// === Fix: profile stored with ALPN="h2" (new probeTargetRaw behavior) ===
 	globalCacheManager.Reset()
 
-	fixedKey := CacheKey(dest, serverName, "h2", tlsVer)
+	fixedKey := CacheKey(serverName, "h2", tlsVer)
 	fp2 := computeFingerprint(0x1301, "h2", lens[0], lens[2])
 	globalCacheManager.StoreProfile(fixedKey, &RealityProfile{
 		RecordLens:   lens,
@@ -619,26 +617,24 @@ func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
 	})
 
 	// Lookup with ALPN="h2" → should HIT
-	_, _, hit = globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "h2", tlsVer)
+	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
 	if !hit {
 		t.Fatal("FIX FAILED: expected cache hit with correct ALPN")
 	}
 	t.Log("Fix verified: profile stored with ALPN='h2' is found when querying ALPN='h2'")
 }
 
-// TestL2_CacheServerNameIsolation_BugReproduction reproduces the bug where
-// FindCachedProfileByDest did not check serverName, so profiles for different
-// SNIs sharing the same dest would be mixed up.
+// TestL2_CacheServerNameIsolation_BugReproduction verifies that different
+// SNIs have isolated cache entries.
 func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
 	globalCacheManager.Reset()
 	t.Cleanup(func() { globalCacheManager.Reset() })
 
-	dest := "microsoft.com:443"
 	tlsVer := uint16(VersionTLS13)
 	alpn := "h2"
 
 	// Store profile for www.microsoft.com
-	keyMS := CacheKey(dest, "www.microsoft.com", alpn, tlsVer)
+	keyMS := CacheKey("www.microsoft.com", alpn, tlsVer)
 	lensMS := [7]int{1215, 6, 41, 8273, 286, 74, 0}
 	globalCacheManager.StoreProfile(keyMS, &RealityProfile{
 		RecordLens:  lensMS,
@@ -648,8 +644,8 @@ func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
 		CapturedAt:  time.Now(),
 	})
 
-	// Store profile for a different SNI on the same dest
-	keyOther := CacheKey(dest, "login.live.com", alpn, tlsVer)
+	// Store profile for a different SNI
+	keyOther := CacheKey("login.live.com", alpn, tlsVer)
 	lensOther := [7]int{1300, 6, 50, 9000, 300, 80, 0}
 	globalCacheManager.StoreProfile(keyOther, &RealityProfile{
 		RecordLens:  lensOther,
@@ -660,7 +656,7 @@ func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
 	})
 
 	// Lookup for www.microsoft.com → must return its record lens, not login.live.com's
-	gotLens, _, hit := globalCacheManager.FindCachedProfileByDest(dest, "www.microsoft.com", 0x1301, alpn, tlsVer)
+	gotLens, _, hit := globalCacheManager.FindCachedProfile("www.microsoft.com", 0x1301, alpn, tlsVer)
 	if !hit {
 		t.Fatal("expected cache hit for www.microsoft.com")
 	}
@@ -670,7 +666,7 @@ func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
 	t.Logf("Correct: returned lens %v for www.microsoft.com", gotLens)
 
 	// Lookup for login.live.com → must return its record lens
-	gotLens2, _, hit2 := globalCacheManager.FindCachedProfileByDest(dest, "login.live.com", 0x1301, alpn, tlsVer)
+	gotLens2, _, hit2 := globalCacheManager.FindCachedProfile("login.live.com", 0x1301, alpn, tlsVer)
 	if !hit2 {
 		t.Fatal("expected cache hit for login.live.com")
 	}
@@ -816,7 +812,7 @@ func TestL2_REALITY_LargeEncryptedExtensions(t *testing.T) {
 }
 
 // TestL2_StaleCacheCausesHandshakeFailure simulates the real-world scenario:
-// REALITY impersonates microsoft.com, client accesses baidu.com through tunnel.
+// REALITY impersonates microsoft.com, client accesses a site through tunnel.
 // When cache has stale record lens (e.g. from a previous target), the padding
 // calculation in encrypt() goes negative, causing handshake failure and fallback
 // to direct forwarding — the browser then sees the target's real cert.
@@ -824,7 +820,6 @@ func TestL2_StaleCacheCausesHandshakeFailure(t *testing.T) {
 	globalCacheManager.Reset()
 	t.Cleanup(func() { globalCacheManager.Reset() })
 
-	dest := "microsoft.com:443"
 	serverName := "www.microsoft.com"
 	tlsVer := uint16(VersionTLS13)
 	alpn := "h2"
@@ -835,7 +830,7 @@ func TestL2_StaleCacheCausesHandshakeFailure(t *testing.T) {
 	newLens := [7]int{1300, 6, 55, 9200, 310, 82, 0}    // actual target response
 
 	// Store stale profile in cache (simulates old probe result)
-	key := CacheKey(dest, serverName, alpn, tlsVer)
+	key := CacheKey(serverName, alpn, tlsVer)
 	globalCacheManager.StoreProfile(key, &RealityProfile{
 		RecordLens:  oldLens,
 		CipherSuite: 0x1301,
@@ -845,7 +840,7 @@ func TestL2_StaleCacheCausesHandshakeFailure(t *testing.T) {
 	})
 
 	// Verify cache hit returns stale data
-	gotLens, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
+	gotLens, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if !hit {
 		t.Fatal("expected cache hit")
 	}
@@ -887,7 +882,7 @@ func TestL2_StaleCacheCausesHandshakeFailure(t *testing.T) {
 	})
 
 	// Verify cache now returns correct data
-	gotLens2, _, hit2 := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)
+	gotLens2, _, hit2 := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if !hit2 {
 		t.Fatal("expected cache hit after refresh")
 	}
@@ -915,13 +910,12 @@ func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
 	globalCacheManager.Reset()
 	t.Cleanup(func() { globalCacheManager.Reset() })
 
-	dest := "microsoft.com:443"
 	serverName := "www.microsoft.com"
 	tlsVer := uint16(VersionTLS13)
 
 	// Simulate old bug: 5 connections each store profile with ALPN=""
 	for i := 0; i < 5; i++ {
-		buggyKey := CacheKey(dest, serverName, "", tlsVer)
+		buggyKey := CacheKey(serverName, "", tlsVer)
 		lens := [7]int{1200 + i*10, 6, 40 + i, 8000 + i*100, 250 + i*5, 70 + i, 0}
 		globalCacheManager.StoreProfile(buggyKey, &RealityProfile{
 			RecordLens:  lens,
@@ -935,7 +929,7 @@ func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
 	// Every lookup with ALPN="h2" misses
 	misses := 0
 	for i := 0; i < 5; i++ {
-		_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "h2", tlsVer)
+		_, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
 		if !hit {
 			misses++
 		}
@@ -947,7 +941,7 @@ func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
 
 	// Now with fix: store with correct ALPN
 	globalCacheManager.Reset()
-	fixedKey := CacheKey(dest, serverName, "h2", tlsVer)
+	fixedKey := CacheKey(serverName, "h2", tlsVer)
 	lens := [7]int{1215, 6, 41, 8273, 286, 74, 0}
 	globalCacheManager.StoreProfile(fixedKey, &RealityProfile{
 		RecordLens:  lens,
@@ -960,7 +954,7 @@ func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
 	// All lookups hit
 	hits := 0
 	for i := 0; i < 5; i++ {
-		_, _, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, "h2", tlsVer)
+		_, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
 		if hit {
 			hits++
 		}

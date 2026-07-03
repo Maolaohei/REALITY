@@ -7,26 +7,6 @@ import (
 	"time"
 )
 
-// ProbeTarget connects to the target server using a real uTLS ClientHello,
-// captures its TLS record lengths, and returns a RealityProfile.
-func ProbeTarget(ctx context.Context, config *Config) (*RealityProfile, error) {
-	result, err := ProbeTargetViaUTLS(ctx, config.Dest, config.Dest, 2, config.Xver)
-	if err != nil {
-		return nil, err
-	}
-
-	alpn := intToALPN(2)
-	return &RealityProfile{
-		RecordLens:   result.RecordLens,
-		Fingerprint:  computeFingerprint(result.CipherSuite, alpn, result.RecordLens[0], result.RecordLens[2]),
-		CipherSuite:  result.CipherSuite,
-		ALPN:         alpn,
-		TLSVersion:   VersionTLS13,
-		RecordCount:  result.RecordCount,
-		CapturedAt:   time.Now(),
-	}, nil
-}
-
 // ============================================================================
 // Auto-start infrastructure
 // ============================================================================
@@ -56,10 +36,11 @@ func ensureAutoProbe(config *Config) {
 	})
 }
 
+// StopAutoProbe stops auto-probing for a given dest.
+// Note: RefreshManager targets are keyed by serverName, so this only
+// cleans up the probeOnces guard. Full target removal requires
+// StopBackgroundRefreshForProfile(dest, serverName, alpn).
 func StopAutoProbe(dest string) {
-	if globalRefreshManager != nil {
-		globalRefreshManager.RemoveTarget(dest, "", "")
-	}
 	probeOnces.Delete(dest)
 }
 
@@ -110,21 +91,31 @@ func WarmupProfiles(dir string) {
 					defer wg.Done()
 					defer func() { <-sem }()
 
-					// Parse dest, serverName, alpn from cache key.
-					// Format: "dest|serverName|alpn|0x0303"
+					// Parse serverName, alpn, dest from cache key.
+					// New format: "serverName|alpn|0x0303"
+					// Legacy format: "dest|serverName|alpn|0x0303"
 					parts := strings.SplitN(k, "|", 4)
-					if len(parts) < 3 {
+					var dest, serverName, alpn string
+					if len(parts) >= 4 {
+						// Legacy 4-part key: extract dest from first segment
+						dest = parts[0]
+						serverName = parts[1]
+						alpn = parts[2]
+					} else if len(parts) >= 3 {
+						// New 3-part key: dest not in key, use serverName as dest
+						serverName = parts[0]
+						alpn = parts[2]
+						dest = serverName
+					} else {
 						return
 					}
-					dest := parts[0]
-					serverName := parts[1]
-					if dest == "" {
+					if serverName == "" || dest == "" {
 						return
 					}
 
-					alpnIndex := alpnToInt(parts[2])
+					alpnIndex := alpnToInt(alpn)
 
-					profileKey := CacheKey(dest, serverName, parts[2], VersionTLS13)
+					profileKey := CacheKey(serverName, alpn, VersionTLS13)
 					globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
 						return probeTargetRaw(dest, serverName, alpnIndex)
 					})
