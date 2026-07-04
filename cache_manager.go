@@ -249,8 +249,8 @@ func ValidateRecordLens(lens [7]int) bool {
 
 // FindCachedProfile searches for a cached profile matching the given
 // serverName, cipher suite, ALPN, and TLS version. Returns the profile's
-// RecordLens and TLSVersion if found and valid.
-func (m *CacheManager) FindCachedProfile(serverName string, cipherSuite uint16, alpn string, tlsVersion uint16) (lens [7]int, foundTLSVersion uint16, ok bool) {
+// RecordLens, TLSVersion, and R0Hash if found and valid.
+func (m *CacheManager) FindCachedProfile(serverName string, cipherSuite uint16, alpn string, tlsVersion uint16) (lens [7]int, foundTLSVersion uint16, r0Hash uint64, ok bool) {
 	key := CacheKey(serverName, alpn, tlsVersion)
 	val, exists := m.entries.Load(key)
 	if !exists {
@@ -277,6 +277,7 @@ func (m *CacheManager) FindCachedProfile(serverName string, cipherSuite uint16, 
 	}
 	lens = entry.Profile.RecordLens
 	foundTLSVersion = entry.Profile.TLSVersion
+	r0Hash = entry.Profile.R0Hash
 	entry.mu.Unlock()
 	ok = true
 	return

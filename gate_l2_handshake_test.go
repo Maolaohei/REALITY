@@ -480,7 +480,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 1: Cache miss on empty cache ---
 	t.Log("=== Test 1: Cache miss (empty cache) ===")
-	_, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
+	_, _, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss on empty cache")
 	}
@@ -497,7 +497,7 @@ func TestL2_CacheLogic(t *testing.T) {
 		CapturedAt:  time.Now(),
 	})
 
-	gotLens, gotVer, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
+	gotLens, gotVer, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if !hit {
 		t.Fatal("expected cache hit after store")
 	}
@@ -511,7 +511,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 3: ALPN mismatch → cache miss ---
 	t.Log("=== Test 3: ALPN mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "http/1.1", tlsVer)
+	_, _, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "http/1.1", tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for different ALPN")
 	}
@@ -519,7 +519,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 4: TLSVersion mismatch → cache miss ---
 	t.Log("=== Test 4: TLSVersion mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, VersionTLS12)
+	_, _, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, VersionTLS12)
 	if hit {
 		t.Fatal("expected cache miss for different TLS version")
 	}
@@ -527,7 +527,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 5: CipherSuite mismatch → cache miss ---
 	t.Log("=== Test 5: CipherSuite mismatch → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1302, alpn, tlsVer)
+	_, _, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1302, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for different CipherSuite")
 	}
@@ -535,7 +535,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 6: Different serverName → cache miss ---
 	t.Log("=== Test 6: Different serverName → miss ===")
-	_, _, hit = globalCacheManager.FindCachedProfile("other.example.com", 0x1301, alpn, tlsVer)
+	_, _, _, hit = globalCacheManager.FindCachedProfile("other.example.com", 0x1301, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for different serverName")
 	}
@@ -552,7 +552,7 @@ func TestL2_CacheLogic(t *testing.T) {
 		TLSVersion:  tlsVer,
 		CapturedAt:  time.Now(),
 	})
-	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "grpc", tlsVer)
+	_, _, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "grpc", tlsVer)
 	if hit {
 		t.Fatal("expected cache miss for invalid RecordLens")
 	}
@@ -561,7 +561,7 @@ func TestL2_CacheLogic(t *testing.T) {
 	// --- Test 8: Invalidate → cache miss ---
 	t.Log("=== Test 8: Invalidate → miss ===")
 	globalCacheManager.InvalidateProfile(key)
-	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
+	_, _, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if hit {
 		t.Fatal("expected cache miss after invalidation")
 	}
@@ -596,7 +596,7 @@ func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
 	})
 
 	// Lookup with actual ALPN="h2" → should MISS because key mismatch
-	_, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
+	_, _, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
 	if hit {
 		t.Fatal("BUG STILL PRESENT: cache hit with ALPN='' stored but 'h2' queried")
 	}
@@ -617,7 +617,7 @@ func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
 	})
 
 	// Lookup with ALPN="h2" → should HIT
-	_, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
+	_, _, _, hit = globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
 	if !hit {
 		t.Fatal("FIX FAILED: expected cache hit with correct ALPN")
 	}
@@ -656,7 +656,7 @@ func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
 	})
 
 	// Lookup for www.microsoft.com → must return its record lens, not login.live.com's
-	gotLens, _, hit := globalCacheManager.FindCachedProfile("www.microsoft.com", 0x1301, alpn, tlsVer)
+	gotLens, _, _, hit := globalCacheManager.FindCachedProfile("www.microsoft.com", 0x1301, alpn, tlsVer)
 	if !hit {
 		t.Fatal("expected cache hit for www.microsoft.com")
 	}
@@ -666,7 +666,7 @@ func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
 	t.Logf("Correct: returned lens %v for www.microsoft.com", gotLens)
 
 	// Lookup for login.live.com → must return its record lens
-	gotLens2, _, hit2 := globalCacheManager.FindCachedProfile("login.live.com", 0x1301, alpn, tlsVer)
+	gotLens2, _, _, hit2 := globalCacheManager.FindCachedProfile("login.live.com", 0x1301, alpn, tlsVer)
 	if !hit2 {
 		t.Fatal("expected cache hit for login.live.com")
 	}
@@ -840,7 +840,7 @@ func TestL2_StaleCacheCausesHandshakeFailure(t *testing.T) {
 	})
 
 	// Verify cache hit returns stale data
-	gotLens, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
+	gotLens, _, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if !hit {
 		t.Fatal("expected cache hit")
 	}
@@ -882,7 +882,7 @@ func TestL2_StaleCacheCausesHandshakeFailure(t *testing.T) {
 	})
 
 	// Verify cache now returns correct data
-	gotLens2, _, hit2 := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
+	gotLens2, _, _, hit2 := globalCacheManager.FindCachedProfile(serverName, 0x1301, alpn, tlsVer)
 	if !hit2 {
 		t.Fatal("expected cache hit after refresh")
 	}
@@ -929,7 +929,7 @@ func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
 	// Every lookup with ALPN="h2" misses
 	misses := 0
 	for i := 0; i < 5; i++ {
-		_, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
+		_, _, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
 		if !hit {
 			misses++
 		}
@@ -954,7 +954,7 @@ func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
 	// All lookups hit
 	hits := 0
 	for i := 0; i < 5; i++ {
-		_, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
+		_, _, _, hit := globalCacheManager.FindCachedProfile(serverName, 0x1301, "h2", tlsVer)
 		if hit {
 			hits++
 		}

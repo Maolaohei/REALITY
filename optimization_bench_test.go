@@ -54,7 +54,7 @@ func BenchmarkFindCachedProfile(b *testing.B) {
 	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		m.FindCachedProfile("example.com", 0x1301, "h2", VersionTLS13)
+		m.FindCachedProfile("example.com", 0x1301, "h2", VersionTLS13) //nolint:errcheck
 	}
 }
 

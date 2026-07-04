@@ -218,6 +218,7 @@ var (
 type RealityProfile struct {
 	RecordLens    [7]int
 	Fingerprint   uint64
+	R0Hash        uint64 // FNV-64a hash of the raw ServerHello bytes (R0)
 	CipherSuite   uint16
 	ALPN          string
 	TLSVersion    uint16 // TLS 1.2 or 1.3 - different versions have different record layouts
@@ -260,6 +261,16 @@ func computeFingerprint(cipherSuite uint16, alpn string, serverHelloLen, extensi
 	h.Write(buf[:])
 	binary.BigEndian.PutUint16(buf[:], uint16(extensionsLen))
 	h.Write(buf[:])
+	return h.Sum64()
+}
+
+// computeR0Hash computes FNV-64a hash of the raw ServerHello record bytes
+// (excluding the 5-byte TLS record header). Used to detect content changes
+// even when the record length stays the same (e.g., cert chain rotation,
+// OCSP update, cipher suite swap at same length).
+func computeR0Hash(serverHelloBytes []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(serverHelloBytes)
 	return h.Sum64()
 }
 
@@ -534,6 +545,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				copying = true // if the target already sent some data, just start bidirectional direct forwarding
 				break
 			}
+			var r0Hash uint64
 			for i, t := range types {
 				if hs.c.out.handshakeLen[i] != 0 {
 					continue
@@ -580,6 +592,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					break f
 				}
 
+				// Capture R0 hash before handshake() modifies hs.hello.original.
+				// Used for cache validation and profile storage.
+				r0Hash = computeR0Hash(s2cSaved[recordHeaderLen:handshakeLen])
+
 				// Cache fast path: commit cached RecordLens immediately after R0
 				// without waiting for R1-R6. This saves the RTT needed to download
 				// the Certificate record (~3-5KB) from the target.
@@ -591,21 +607,35 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 						clientALPN = hs.clientHello.alpnProtocols[0]
 					}
 				}
-				cachedLens, _, cacheHit := globalCacheManager.FindCachedProfile(
+				cachedLens, _, cachedR0Hash, cacheHit := globalCacheManager.FindCachedProfile(
 					clientSN, hs.hello.cipherSuite, clientALPN, VersionTLS13)
 				if cacheHit && ValidateRecordLens(cachedLens) {
-					// Commit immediately — trust the cache. If wrong, the
-					// client handshake will fail and next connection uses slow path.
-					hs.c.out.handshakeLen[0] = handshakeLen
-					for ci := 1; ci < 7; ci++ {
-						hs.c.out.handshakeLen[ci] = cachedLens[ci]
+					// Validate R0 content: compare FNV-64a hash of current
+					// ServerHello against cached hash. This catches content
+					// changes (cert rotation, OCSP, cipher swap) even when
+					// the record length stays the same.
+					if cachedR0Hash == r0Hash {
+						hs.c.out.handshakeLen[0] = handshakeLen
+						for ci := 1; ci < 7; ci++ {
+							hs.c.out.handshakeLen[ci] = cachedLens[ci]
+						}
+						s2cSaved = s2cSaved[handshakeLen:]
+						handshakeLen = 0
+						if show {
+							fmt.Printf("REALITY remoteAddr: %v\tcache hit (R0 hash matched) — using cached RecordLens (skipping R1-R6)\n", remoteAddr)
+						}
+						break
 					}
-					s2cSaved = s2cSaved[handshakeLen:]
-					handshakeLen = 0
+					// R0 hash mismatch — target's ServerHello content changed.
+					// Invalidate stale cache and fall through to slow path.
 					if show {
-						fmt.Printf("REALITY remoteAddr: %v\tcache hit — using cached RecordLens (skipping R1-R6)\n", remoteAddr)
+						fmt.Printf("REALITY remoteAddr: %v\tcache hit but R0 hash mismatch — invalidating and using slow path\n", remoteAddr)
 					}
-					break
+					clientSN := ""
+					if hs.clientHello != nil {
+						clientSN = hs.clientHello.serverName
+					}
+					globalCacheManager.InvalidateByServerName(clientSN, config.Dest, clientALPN)
 				}
 				// Cache miss or validation failed — trigger async re-probe.
 				// Use DoProbe singleflight to deduplicate concurrent probes
@@ -723,6 +753,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			profile := &RealityProfile{
 				RecordLens:   usedLen,
 				Fingerprint:  computeFingerprint(hs.hello.cipherSuite, alpn, usedLen[0], usedLen[2]),
+				R0Hash:       r0Hash,
 				CipherSuite:  hs.hello.cipherSuite,
 				ALPN:         alpn,
 				TLSVersion:   hs.c.vers,
