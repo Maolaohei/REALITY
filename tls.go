@@ -30,7 +30,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"hash/fnv"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
@@ -43,6 +42,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"os"
@@ -155,8 +155,6 @@ func NewRatelimitedConn(conn net.Conn, limit *LimitFallback) net.Conn {
 	}
 }
 
-
-
 var (
 	// maxRecordSize is the buffer size for reading TLS handshake records from
 	// the target server. Raised from 8192 to 65536 (64 KiB) to support targets
@@ -199,49 +197,13 @@ var (
 			return &buf
 		},
 	}
-
-	// plainTextBufPool reuses buffers for post-handshake record plaintext.
-	// Sizes vary (typically <1KB), so we pool by capacity class.
-	plainTextBufPool = sync.Pool{
-		New: func() any {
-			buf := make([]byte, 0, 1024)
-			return &buf
-		},
-	}
 )
-
-
 
 // bigEndianUint16 decodes a big-endian 16-bit unsigned integer from b.
 // This is equivalent to the previous Value() helper for 2-byte slices,
 // but uses the optimized encoding/binary path.
 func bigEndianUint16(b []byte) uint16 {
 	return binary.BigEndian.Uint16(b)
-}
-
-// computeFingerprint computes FNV64 hash of (CipherSuite, ALPN, ServerHelloLen, ExtensionsLen).
-// Used for cache hit/miss decisions — more robust than comparing individual fields.
-func computeFingerprint(cipherSuite uint16, alpn string, serverHelloLen, extensionsLen int) uint64 {
-	h := fnv.New64a()
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], cipherSuite)
-	h.Write(buf[:])
-	h.Write([]byte(alpn))
-	binary.BigEndian.PutUint16(buf[:], uint16(serverHelloLen))
-	h.Write(buf[:])
-	binary.BigEndian.PutUint16(buf[:], uint16(extensionsLen))
-	h.Write(buf[:])
-	return h.Sum64()
-}
-
-// computeR0Hash computes FNV-64a hash of the raw ServerHello record bytes
-// (excluding the 5-byte TLS record header). Used to detect content changes
-// even when the record length stays the same (e.g., cert chain rotation,
-// OCSP update, cipher suite swap at same length).
-func computeR0Hash(serverHelloBytes []byte) uint64 {
-	h := fnv.New64a()
-	h.Write(serverHelloBytes)
-	return h.Sum64()
 }
 
 // bigEndianUint24 decodes a big-endian 24-bit unsigned integer from b.
@@ -260,6 +222,14 @@ func Value(vals ...byte) (value int) {
 }
 
 var maxTimeDiffWarnOnce sync.Once
+
+// computeR0Hash computes FNV-64a hash of the raw ServerHello record bytes
+// (excluding the 5-byte TLS record header).
+func computeR0Hash(serverHelloBytes []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(serverHelloBytes)
+	return h.Sum64()
+}
 
 // You MUST call `DetectPostHandshakeRecordsLens(config)` in advance manually
 // if you don't use REALITY's listener, e.g., Xray-core's RAW transport.
@@ -337,7 +307,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	copying := false
 	clientHelloReady := make(chan struct{})
 	authFailed := make(chan struct{}, 1)
-	prepareDone := make(chan error, 1) // signals prepareHandshake() completion
 
 	waitGroup := new(sync.WaitGroup)
 	waitGroup.Add(2)
@@ -472,48 +441,23 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				break f
 			default:
 			}
-
-			// Batch read optimization: try to read more data in one syscall.
-			// TLS 1.3 handshake is at most 7 records × 16KB = 112KB.
-			// We use 64KB as a safe limit per read.
-			if len(s2cSaved) == 0 || handshakeLen == 0 {
-				// Try to read a full buffer to reduce syscalls.
-				n, err := io.ReadFull(target, buf)
-				if n == 0 {
-					if err != nil {
-						conn.Close()
-						waitGroup.Done()
-						return
-					}
-					continue
+			n, err := target.Read(buf)
+			if n == 0 {
+				if err != nil {
+					conn.Close()
+					waitGroup.Done()
+					return
 				}
-				// Guard against OOM from malicious target sending excessive data.
-				if len(s2cSaved)+n > maxRecordSize {
-					break f
-				}
-				s2cSaved = append(s2cSaved, buf[:n]...)
-			} else {
-				// We need more data for the current record, read incrementally.
-				remaining := handshakeLen - len(s2cSaved)
-				if remaining > len(buf) {
-					remaining = len(buf)
-				}
-				n, err := target.Read(buf[:remaining])
-				if n == 0 {
-					if err != nil {
-						conn.Close()
-						waitGroup.Done()
-						return
-					}
-					continue
-				}
-				if len(s2cSaved)+n > maxRecordSize {
-					break f
-				}
-				s2cSaved = append(s2cSaved, buf[:n]...)
+				continue
 			}
-
+			// Guard against OOM from malicious target sending excessive data.
+			// TLS 1.3 handshake is at most 7 records × 16KB = 112KB.
+			// Use 64KB as a safe hard limit (covers normal handshake with margin).
+			if len(s2cSaved)+n > maxRecordSize {
+				break f
+			}
 			mutex.Lock()
+			s2cSaved = append(s2cSaved, buf[:n]...)
 			if hs.c.conn != conn {
 				copying = true // if the target already sent some data, just start bidirectional direct forwarding
 				break
@@ -564,21 +508,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil {
 					break f
 				}
-
 				r0Hash = computeR0Hash(s2cSaved[recordHeaderLen:handshakeLen])
-
 				if show {
 					fmt.Printf("REALITY remoteAddr: %v\tServerHello received, CipherSuite: 0x%04X, R0Hash: 0x%X\n", remoteAddr, hs.hello.cipherSuite, r0Hash)
 				}
-
-				// Pipeline: start CPU work (ECDH, cert prep) in parallel with reading R1-R6.
-				<-clientHelloReady
-				if hs.c.conn != conn {
-					break f
-				}
-				go func() {
-					prepareDone <- hs.prepareHandshake()
-				}()
 			}
 				hs.c.out.handshakeLen[i] = handshakeLen
 				s2cSaved = s2cSaved[handshakeLen:]
@@ -586,19 +519,14 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			start := time.Now()
 
+			// Capture the handshakeLen values that encrypt() will use.
+			// encrypt() zeros these after use, so we must copy before hs.handshake().
 			var usedLen [7]int
 			copy(usedLen[:], hs.c.out.handshakeLen[:])
 
-			// Pipeline: wait for prepareHandshake() to complete (started after R0).
-			if err := <-prepareDone; err != nil {
-				if show {
-					fmt.Printf("REALITY remoteAddr: %v\tprepareHandshake() err: %v\n", remoteAddr, err)
-				}
-				break
-			}
-			err = hs.sendHandshake()
+			err = hs.handshake()
 			if show {
-				fmt.Printf("REALITY remoteAddr: %v\tsendHandshake() err: %v\n", remoteAddr, err)
+				fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
 			}
 			if err != nil {
 				break
@@ -640,13 +568,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 								maxPtLen = ptLen
 							}
 						}
-						plainTextPtr := plainTextBufPool.Get().(*[]byte)
-						if cap(*plainTextPtr) < maxPtLen {
-							*plainTextPtr = make([]byte, maxPtLen)
-						} else {
-							*plainTextPtr = (*plainTextPtr)[:maxPtLen]
-						}
-						plainText := *plainTextPtr
+						plainText := make([]byte, maxPtLen)
 						for _, length := range postHandshakeRecordsLens {
 							pt := plainText[:length-16]
 							pt[0] = 23
@@ -662,7 +584,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 								fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
 							}
 						}
-						plainTextBufPool.Put(plainTextPtr)
 					}
 				}
 				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
