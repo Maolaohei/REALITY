@@ -42,7 +42,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net"
 	"os"
@@ -222,14 +221,6 @@ func Value(vals ...byte) (value int) {
 }
 
 var maxTimeDiffWarnOnce sync.Once
-
-// computeR0Hash computes FNV-64a hash of the raw ServerHello record bytes
-// (excluding the 5-byte TLS record header).
-func computeR0Hash(serverHelloBytes []byte) uint64 {
-	h := fnv.New64a()
-	h.Write(serverHelloBytes)
-	return h.Sum64()
-}
 
 // You MUST call `DetectPostHandshakeRecordsLens(config)` in advance manually
 // if you don't use REALITY's listener, e.g., Xray-core's RAW transport.
@@ -429,7 +420,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		defer recordBufPool.Put(s2cSavedPtr)
 		handshakeLen := 0
 
-		// Read from target and cache the result.
+		// Read from target.
 		// Set idle deadline on target to prevent permanent hangs if target
 		// becomes unresponsive during handshake.
 		target.SetReadDeadline(time.Now().Add(mirrorIdleTimeout))
@@ -459,10 +450,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			mutex.Lock()
 			s2cSaved = append(s2cSaved, buf[:n]...)
 			if hs.c.conn != conn {
-				copying = true // if the target already sent some data, just start bidirectional direct forwarding
+				copying = true
 				break
 			}
-			var r0Hash uint64
 			for i, t := range types {
 				if hs.c.out.handshakeLen[i] != 0 {
 					continue
@@ -508,9 +498,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil {
 					break f
 				}
-				r0Hash = computeR0Hash(s2cSaved[recordHeaderLen:handshakeLen])
 				if show {
-					fmt.Printf("REALITY remoteAddr: %v\tServerHello received, CipherSuite: 0x%04X, R0Hash: 0x%X\n", remoteAddr, hs.hello.cipherSuite, r0Hash)
+					fmt.Printf("REALITY remoteAddr: %v\tServerHello received, CipherSuite: 0x%04X\n", remoteAddr, hs.hello.cipherSuite)
 				}
 			}
 				hs.c.out.handshakeLen[i] = handshakeLen
