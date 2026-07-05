@@ -559,7 +559,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				}
 			if i == 0 {
 				hs.hello = new(serverHelloMsg)
-				if !hs.hello.parseQuick(s2cSaved[recordHeaderLen:handshakeLen]) ||
+				if !hs.hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) ||
 					hs.hello.vers != VersionTLS12 || hs.hello.supportedVersion != VersionTLS13 ||
 					cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil {
 					break f
