@@ -184,7 +184,8 @@ func parseRecordLens(data []byte) (lens [7]int, cipherSuite uint16, ok bool) {
 
 			if recordIndex == 0 {
 				hello := new(serverHelloMsg)
-				if !hello.unmarshal(saved[recordHeaderLen:handshakeLen]) {
+				// Use parseQuick() - probe only needs cipherSuite, not extensions.
+				if !hello.parseQuick(saved[recordHeaderLen:handshakeLen]) {
 					return
 				}
 				cipherSuite = hello.cipherSuite

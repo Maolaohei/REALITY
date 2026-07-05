@@ -528,10 +528,15 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, err
 		}
 
 		if hc.version == VersionTLS13 {
-			record = append(record, payload...)
+			// Zero-copy: use sliceForAppend to place payload directly after header.
+			// This avoids the append() reallocation when record has spare capacity.
+			var payloadBuf []byte
+			record, payloadBuf = sliceForAppend(record, len(payload))
+			copy(payloadBuf, payload)
 
 			// Encrypt the actual ContentType and replace the plaintext one.
-			record = append(record, record[0])
+			record, _ = sliceForAppend(record, 1)
+			record[len(record)-1] = record[0]
 			padding := 0
 			if recordType(record[0]) == recordTypeHandshake && hc.handshakeLen[1] != 0 {
 				switch payload[0] {
@@ -557,7 +562,7 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, err
 				if padding < 0 {
 					return nil, fmt.Errorf("payload[0]: %v, padding: %v", payload[0], padding)
 				}
-				record = append(record, empty[:padding]...)
+				record, _ = sliceForAppend(record, padding)
 			}
 			record[0] = byte(recordTypeApplicationData)
 
@@ -1012,9 +1017,11 @@ func (c *Conn) flush() (int, error) {
 }
 
 // outBufPool pools the record-sized scratch buffers used by writeRecordLocked.
+// Initial capacity is 16KB + 5 (header) + 16 (AEAD overhead) to avoid growth.
 var outBufPool = sync.Pool{
 	New: func() any {
-		return new([]byte)
+		buf := make([]byte, 0, maxTLSRecordPayload+recordHeaderLen+16)
+		return &buf
 	},
 }
 

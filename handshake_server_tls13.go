@@ -104,7 +104,10 @@ func init() {
 	signedCertMldsa65 = certMldsa
 }
 
-func (hs *serverHandshakeStateTLS13) handshake() error {
+// prepareHandshake performs CPU-intensive operations: ECDH key exchange,
+// certificate preparation, and HMAC computation. This can run in parallel
+// with target reads to overlap CPU and I/O.
+func (hs *serverHandshakeStateTLS13) prepareHandshake() error {
 	c := hs.c
 
 	// Fail fast if init() failed to generate keys/certificates.
@@ -117,82 +120,78 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		fmt.Printf("REALITY remoteAddr: %v\tis using X25519MLKEM768 for TLS' communication: %v\n", remoteAddr, hs.hello.serverShare.group == X25519MLKEM768)
 		fmt.Printf("REALITY remoteAddr: %v\tis using ML-DSA-65 for cert's extra signature: %v\n", remoteAddr, len(c.config.Mldsa65Key) > 0)
 	}
-	// For an overview of the TLS 1.3 handshake, see RFC 8446, Section 2.
-	/*
-		if err := hs.processClientHello(); err != nil {
-			return err
+
+	// ECDH key exchange
+	hs.suite = cipherSuiteTLS13ByID(hs.hello.cipherSuite)
+	c.cipherSuite = hs.suite.id
+	hs.transcript = hs.suite.hash.New()
+
+	var peerData []byte
+	for _, keyShare := range hs.clientHello.keyShares {
+		if keyShare.group == hs.hello.serverShare.group {
+			peerData = keyShare.data
+			break
 		}
-	*/
-	{
-		hs.suite = cipherSuiteTLS13ByID(hs.hello.cipherSuite)
-		c.cipherSuite = hs.suite.id
-		hs.transcript = hs.suite.hash.New()
-
-		var peerData []byte
-		for _, keyShare := range hs.clientHello.keyShares {
-			if keyShare.group == hs.hello.serverShare.group {
-				peerData = keyShare.data
-				break
-			}
-		}
-
-		var peerPub = peerData
-		if hs.hello.serverShare.group == X25519MLKEM768 {
-			peerPub = peerData[mlkem.EncapsulationKeySize768:]
-		}
-
-		key, _ := generateECDHEKey(c.config.rand(), X25519)
-		copy(hs.hello.serverShare.data, key.PublicKey().Bytes())
-		peerKey, _ := key.Curve().NewPublicKey(peerPub)
-		hs.sharedKey, _ = key.ECDH(peerKey)
-
-		if hs.hello.serverShare.group == X25519MLKEM768 {
-			k, _ := mlkem.NewEncapsulationKey768(peerData[:mlkem.EncapsulationKeySize768])
-			mlkemSharedSecret, ciphertext := k.Encapsulate()
-			hs.sharedKey = append(mlkemSharedSecret, hs.sharedKey...)
-			copy(hs.hello.serverShare.data, append(ciphertext, hs.hello.serverShare.data[:32]...))
-		}
-
-		c.serverName = hs.clientHello.serverName
 	}
-	/*
-		if err := hs.checkForResumption(); err != nil {
-			return err
-		}
-		if err := hs.pickCertificate(); err != nil {
-			return err
-		}
-	*/
-	{
-		var cert []byte
-		if len(c.config.Mldsa65Key) > 0 {
-			cert = make([]byte, len(signedCertMldsa65))
-			copy(cert, signedCertMldsa65)
-		} else {
-			cert = make([]byte, len(signedCert))
-			copy(cert, signedCert)
-		}
 
-		h := hmac.New(sha512.New, c.AuthKey)
-		h.Write(ed25519Priv[32:])
-		h.Sum(cert[:len(cert)-64])
-
-		if len(c.config.Mldsa65Key) > 0 {
-			h.Write(hs.clientHello.original)
-			h.Write(hs.hello.original)
-			key, err := mldsa65.Scheme().UnmarshalBinaryPrivateKey(c.config.Mldsa65Key)
-			if err != nil {
-				return fmt.Errorf("REALITY: invalid Mldsa65Key: %w", err)
-			}
-			mldsa65.SignTo(key.(*mldsa65.PrivateKey), h.Sum(nil), nil, false, cert[126:]) // fixed location
-		}
-
-		hs.cert = &Certificate{
-			Certificate: [][]byte{cert},
-			PrivateKey:  ed25519Priv,
-		}
-		hs.sigAlg = Ed25519
+	var peerPub = peerData
+	if hs.hello.serverShare.group == X25519MLKEM768 {
+		peerPub = peerData[mlkem.EncapsulationKeySize768:]
 	}
+
+	key, _ := generateECDHEKey(c.config.rand(), X25519)
+	copy(hs.hello.serverShare.data, key.PublicKey().Bytes())
+	peerKey, _ := key.Curve().NewPublicKey(peerPub)
+	hs.sharedKey, _ = key.ECDH(peerKey)
+
+	if hs.hello.serverShare.group == X25519MLKEM768 {
+		k, _ := mlkem.NewEncapsulationKey768(peerData[:mlkem.EncapsulationKeySize768])
+		mlkemSharedSecret, ciphertext := k.Encapsulate()
+		hs.sharedKey = append(mlkemSharedSecret, hs.sharedKey...)
+		copy(hs.hello.serverShare.data, append(ciphertext, hs.hello.serverShare.data[:32]...))
+	}
+
+	c.serverName = hs.clientHello.serverName
+
+	// Certificate preparation
+	var cert []byte
+	if len(c.config.Mldsa65Key) > 0 {
+		cert = make([]byte, len(signedCertMldsa65))
+		copy(cert, signedCertMldsa65)
+	} else {
+		cert = make([]byte, len(signedCert))
+		copy(cert, signedCert)
+	}
+
+	h := hmac.New(sha512.New, c.AuthKey)
+	h.Write(ed25519Priv[32:])
+	h.Sum(cert[:len(cert)-64])
+
+	if len(c.config.Mldsa65Key) > 0 {
+		h.Write(hs.clientHello.original)
+		h.Write(hs.hello.original)
+		key, err := mldsa65.Scheme().UnmarshalBinaryPrivateKey(c.config.Mldsa65Key)
+		if err != nil {
+			return fmt.Errorf("REALITY: invalid Mldsa65Key: %w", err)
+		}
+		mldsa65.SignTo(key.(*mldsa65.PrivateKey), h.Sum(nil), nil, false, cert[126:]) // fixed location
+	}
+
+	hs.cert = &Certificate{
+		Certificate: [][]byte{cert},
+		PrivateKey:  ed25519Priv,
+	}
+	hs.sigAlg = Ed25519
+
+	return nil
+}
+
+// sendHandshake sends the server handshake messages after prepareHandshake()
+// completes. This is separated to allow overlapping prepareHandshake() with
+// target reads.
+func (hs *serverHandshakeStateTLS13) sendHandshake() error {
+	c := hs.c
+
 	c.buffering = true
 	if err := hs.sendServerParameters(); err != nil {
 		return err
@@ -226,6 +225,13 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	c.isHandshakeComplete.Store(true)
 
 	return nil
+}
+
+func (hs *serverHandshakeStateTLS13) handshake() error {
+	if err := hs.prepareHandshake(); err != nil {
+		return err
+	}
+	return hs.sendHandshake()
 }
 
 func (hs *serverHandshakeStateTLS13) processClientHello() error {
@@ -855,7 +861,8 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 	c := hs.c
 
 	if hs.echContext != nil {
-		copy(hs.hello.random[32-8:], make([]byte, 8))
+		var zero8 [8]byte
+		copy(hs.hello.random[32-8:], zero8[:])
 		echTranscript := cloneHash(hs.transcript, hs.suite.hash)
 		echTranscript.Write(hs.clientHello.original)
 		if err := transcriptMsg(hs.hello, echTranscript); err != nil {
@@ -1154,11 +1161,11 @@ func (c *Conn) sendSessionTicket(earlyData bool, extra [][]byte) error {
 	// ticket_age_add is a random 32-bit value. See RFC 8446, section 4.6.1
 	// The value is not stored anywhere; we never need to check the ticket age
 	// because 0-RTT is not supported.
-	ageAdd := make([]byte, 4)
-	if _, err := c.config.rand().Read(ageAdd); err != nil {
+	var ageAddBuf [4]byte
+	if _, err := c.config.rand().Read(ageAddBuf[:]); err != nil {
 		return err
 	}
-	m.ageAdd = binary.LittleEndian.Uint32(ageAdd)
+	m.ageAdd = binary.LittleEndian.Uint32(ageAddBuf[:])
 
 	if earlyData {
 		// RFC 9001, Section 4.6.1

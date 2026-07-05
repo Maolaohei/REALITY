@@ -996,6 +996,65 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 	return true
 }
 
+// parseQuick is a fast path for REALITY that parses only the fields needed
+// for the server handshake: vers, random, sessionId, cipherSuite,
+// compressionMethod, supportedVersions, and keyShare (group only).
+// All other extensions are skipped. This avoids the overhead of the full
+// unmarshal() extension loop and seenExts map allocation.
+func (m *serverHelloMsg) parseQuick(data []byte) bool {
+	*m = serverHelloMsg{original: data}
+	s := cryptobyte.String(data)
+
+	if !s.Skip(4) || // message type and uint24 length field
+		!s.ReadUint16(&m.vers) || !s.ReadBytes(&m.random, 32) ||
+		!readUint8LengthPrefixed(&s, &m.sessionId) ||
+		!s.ReadUint16(&m.cipherSuite) ||
+		!s.ReadUint8(&m.compressionMethod) {
+		return false
+	}
+
+	if s.Empty() {
+		return true
+	}
+
+	var extensions cryptobyte.String
+	if !s.ReadUint16LengthPrefixed(&extensions) || !s.Empty() {
+		return false
+	}
+
+	// Parse only the extensions we need; skip everything else.
+	for !extensions.Empty() {
+		var extType uint16
+		var extData cryptobyte.String
+		if !extensions.ReadUint16(&extType) ||
+			!extensions.ReadUint16LengthPrefixed(&extData) {
+			return false
+		}
+		switch extType {
+		case extensionSupportedVersions:
+			if !extData.ReadUint16(&m.supportedVersion) {
+				return false
+			}
+		case extensionKeyShare:
+			if len(extData) == 2 {
+				// HelloRetryRequest: just the selected group
+				if !extData.ReadUint16((*uint16)(&m.selectedGroup)) {
+					return false
+				}
+			} else {
+				if !extData.ReadUint16((*uint16)(&m.serverShare.group)) ||
+					!readUint16LengthPrefixed(&extData, &m.serverShare.data) {
+					return false
+				}
+			}
+		default:
+			// Skip unknown/unneeded extensions.
+		}
+	}
+
+	return true
+}
+
 func (m *serverHelloMsg) originalBytes() []byte {
 	return m.original
 }

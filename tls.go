@@ -46,7 +46,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -156,18 +155,7 @@ func NewRatelimitedConn(conn net.Conn, limit *LimitFallback) net.Conn {
 	}
 }
 
-// ProfileTTL is the time-to-live for cached RealityProfile entries.
-const ProfileTTL = 30 * time.Minute
 
-// DefaultCacheDir returns the platform-appropriate default directory for
-// persistent profile storage. Returns empty string if the user cache dir
-// cannot be determined.
-func DefaultCacheDir() string {
-	if d, err := os.UserCacheDir(); err == nil {
-		return filepath.Join(d, "REALITY")
-	}
-	return ""
-}
 
 var (
 	// maxRecordSize is the buffer size for reading TLS handshake records from
@@ -211,35 +199,18 @@ var (
 			return &buf
 		},
 	}
+
+	// plainTextBufPool reuses buffers for post-handshake record plaintext.
+	// Sizes vary (typically <1KB), so we pool by capacity class.
+	plainTextBufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 0, 1024)
+			return &buf
+		},
+	}
 )
 
-// RealityProfile is the unified cache entry for REALITY handshake profiles.
-// Combines output record lengths, fingerprint, and metadata in one structure.
-type RealityProfile struct {
-	RecordLens    [7]int
-	Fingerprint   uint64
-	CipherSuite   uint16
-	ALPN          string
-	TLSVersion    uint16 // TLS 1.2 or 1.3 - different versions have different record layouts
-	RecordCount   int
-	CapturedAt    time.Time
-}
 
-// IsExpired checks if the profile has exceeded the TTL.
-func (p *RealityProfile) IsExpired() bool {
-	return time.Since(p.CapturedAt) > ProfileTTL
-}
-
-// targetFingerprintCache caches the target server's TLS capabilities.
-// Updated in background; reduces synchronous ProbeTarget frequency.
-type targetFingerprintCache struct {
-	CipherSuite       uint16
-	ALPN              string
-	SupportedVersions []uint16
-	KeyShareGroup     uint16
-	SignatureSchemes  []SignatureScheme
-	LastUpdated       time.Time
-}
 
 // bigEndianUint16 decodes a big-endian 16-bit unsigned integer from b.
 // This is equivalent to the previous Value() helper for 2-byte slices,
@@ -260,6 +231,16 @@ func computeFingerprint(cipherSuite uint16, alpn string, serverHelloLen, extensi
 	h.Write(buf[:])
 	binary.BigEndian.PutUint16(buf[:], uint16(extensionsLen))
 	h.Write(buf[:])
+	return h.Sum64()
+}
+
+// computeR0Hash computes FNV-64a hash of the raw ServerHello record bytes
+// (excluding the 5-byte TLS record header). Used to detect content changes
+// even when the record length stays the same (e.g., cert chain rotation,
+// OCSP update, cipher suite swap at same length).
+func computeR0Hash(serverHelloBytes []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(serverHelloBytes)
 	return h.Sum64()
 }
 
@@ -304,25 +285,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		fmt.Printf("REALITY remoteAddr: %v\n", remoteAddr)
 	}
 
-	// Initialize event handlers and persistent store on first call.
-	if profileStore == nil {
-		cacheDir := config.CacheDir
-		if cacheDir == "-" {
-			cacheDir = ""
-		}
-		if cacheDir == "" {
-			cacheDir = DefaultCacheDir()
-		}
-		if cacheDir != "" {
-			store := InitPersistentStore(cacheDir)
-			store.StartPeriodicSave(5 * time.Minute)
-			// Register event handlers for cache/persist/refresh.
-			RegisterAllHandlers(show)
-			// Warmup: proactively probe all known targets in background.
-			WarmupProfiles(cacheDir)
-		}
-	}
-
 	// Initialize replay guard once (uses MaxTimeDiff as the dedup window).
 	if globalReplayGuard == nil {
 		window := config.MaxTimeDiff
@@ -333,10 +295,6 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			globalReplayGuard = NewReplayGuard(window, 0)
 		}
 	}
-
-	// Trigger automatic pre-build probe on first connection.
-	// This starts a background probe + periodic refresh for the target.
-	ensureAutoProbe(config)
 
 	// Ensure post-handshake record detection is running so that the
 	// 30-second polling loop can find the data it needs.
@@ -379,6 +337,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	copying := false
 	clientHelloReady := make(chan struct{})
 	authFailed := make(chan struct{}, 1)
+	prepareDone := make(chan error, 1) // signals prepareHandshake() completion
 
 	waitGroup := new(sync.WaitGroup)
 	waitGroup.Add(2)
@@ -513,27 +472,53 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				break f
 			default:
 			}
-			n, err := target.Read(buf)
-			if n == 0 {
-				if err != nil {
-					conn.Close()
-					waitGroup.Done()
-					return
-				}
-				continue
-			}
-			// Guard against OOM from malicious target sending excessive data.
+
+			// Batch read optimization: try to read more data in one syscall.
 			// TLS 1.3 handshake is at most 7 records × 16KB = 112KB.
-			// Use 64KB as a safe hard limit (covers normal handshake with margin).
-			if len(s2cSaved)+n > maxRecordSize {
-				break f
+			// We use 64KB as a safe limit per read.
+			if len(s2cSaved) == 0 || handshakeLen == 0 {
+				// Try to read a full buffer to reduce syscalls.
+				n, err := io.ReadFull(target, buf)
+				if n == 0 {
+					if err != nil {
+						conn.Close()
+						waitGroup.Done()
+						return
+					}
+					continue
+				}
+				// Guard against OOM from malicious target sending excessive data.
+				if len(s2cSaved)+n > maxRecordSize {
+					break f
+				}
+				s2cSaved = append(s2cSaved, buf[:n]...)
+			} else {
+				// We need more data for the current record, read incrementally.
+				remaining := handshakeLen - len(s2cSaved)
+				if remaining > len(buf) {
+					remaining = len(buf)
+				}
+				n, err := target.Read(buf[:remaining])
+				if n == 0 {
+					if err != nil {
+						conn.Close()
+						waitGroup.Done()
+						return
+					}
+					continue
+				}
+				if len(s2cSaved)+n > maxRecordSize {
+					break f
+				}
+				s2cSaved = append(s2cSaved, buf[:n]...)
 			}
+
 			mutex.Lock()
-			s2cSaved = append(s2cSaved, buf[:n]...)
 			if hs.c.conn != conn {
 				copying = true // if the target already sent some data, just start bidirectional direct forwarding
 				break
 			}
+			var r0Hash uint64
 			for i, t := range types {
 				if hs.c.out.handshakeLen[i] != 0 {
 					continue
@@ -574,60 +559,26 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				}
 			if i == 0 {
 				hs.hello = new(serverHelloMsg)
-				if !hs.hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) ||
+				if !hs.hello.parseQuick(s2cSaved[recordHeaderLen:handshakeLen]) ||
 					hs.hello.vers != VersionTLS12 || hs.hello.supportedVersion != VersionTLS13 ||
 					cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil {
 					break f
 				}
 
-				// Cache fast path: commit cached RecordLens immediately after R0
-				// without waiting for R1-R6. This saves the RTT needed to download
-				// the Certificate record (~3-5KB) from the target.
-				clientALPN := ""
-				clientSN := ""
-				if hs.clientHello != nil {
-					clientSN = hs.clientHello.serverName
-					if len(hs.clientHello.alpnProtocols) > 0 {
-						clientALPN = hs.clientHello.alpnProtocols[0]
-					}
+				r0Hash = computeR0Hash(s2cSaved[recordHeaderLen:handshakeLen])
+
+				if show {
+					fmt.Printf("REALITY remoteAddr: %v\tServerHello received, CipherSuite: 0x%04X, R0Hash: 0x%X\n", remoteAddr, hs.hello.cipherSuite, r0Hash)
 				}
-				cachedLens, _, cacheHit := globalCacheManager.FindCachedProfileByDest(
-					config.Dest, clientSN, hs.hello.cipherSuite, clientALPN, VersionTLS13)
-				if cacheHit && ValidateRecordLens(cachedLens) {
-					// Commit immediately — trust the cache. If wrong, the
-					// client handshake will fail and next connection uses slow path.
-					hs.c.out.handshakeLen[0] = handshakeLen
-					for ci := 1; ci < 7; ci++ {
-						hs.c.out.handshakeLen[ci] = cachedLens[ci]
-					}
-					s2cSaved = s2cSaved[handshakeLen:]
-					handshakeLen = 0
-					if show {
-						fmt.Printf("REALITY remoteAddr: %v\tcache hit — using cached RecordLens (skipping R1-R6)\n", remoteAddr)
-					}
-					break
+
+				// Pipeline: start CPU work (ECDH, cert prep) in parallel with reading R1-R6.
+				<-clientHelloReady
+				if hs.c.conn != conn {
+					break f
 				}
-				// Cache miss or validation failed — trigger async re-probe.
-				// Use DoProbe singleflight to deduplicate concurrent probes
-				// for the same dest (multiple connections hit cache miss).
-				if !cacheHit {
-					// True cache miss — probe with singleflight dedup.
-					clientSN := ""
-					if hs.clientHello != nil {
-						clientSN = hs.clientHello.serverName
-					}
-					profileKey := CacheKey(config.Dest, clientSN, clientALPN, VersionTLS13)
-					go globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
-						return probeTargetRaw(config.Dest, clientSN, alpnToInt(clientALPN))
-					})
-				} else {
-					// Validation failed — invalidate and re-probe.
-					clientSN := ""
-					if hs.clientHello != nil {
-						clientSN = hs.clientHello.serverName
-					}
-					globalCacheManager.InvalidateAndReprobe(config.Dest, clientSN, clientALPN)
-				}
+				go func() {
+					prepareDone <- hs.prepareHandshake()
+				}()
 			}
 				hs.c.out.handshakeLen[i] = handshakeLen
 				s2cSaved = s2cSaved[handshakeLen:]
@@ -635,14 +586,19 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			start := time.Now()
 
-			// Capture the handshakeLen values that encrypt() will use.
-			// encrypt() zeros these after use, so we must copy before hs.handshake().
 			var usedLen [7]int
 			copy(usedLen[:], hs.c.out.handshakeLen[:])
 
-			err = hs.handshake()
+			// Pipeline: wait for prepareHandshake() to complete (started after R0).
+			if err := <-prepareDone; err != nil {
+				if show {
+					fmt.Printf("REALITY remoteAddr: %v\tprepareHandshake() err: %v\n", remoteAddr, err)
+				}
+				break
+			}
+			err = hs.sendHandshake()
 			if show {
-				fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
+				fmt.Printf("REALITY remoteAddr: %v\tsendHandshake() err: %v\n", remoteAddr, err)
 			}
 			if err != nil {
 				break
@@ -684,7 +640,13 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 								maxPtLen = ptLen
 							}
 						}
-						plainText := make([]byte, maxPtLen)
+						plainTextPtr := plainTextBufPool.Get().(*[]byte)
+						if cap(*plainTextPtr) < maxPtLen {
+							*plainTextPtr = make([]byte, maxPtLen)
+						} else {
+							*plainTextPtr = (*plainTextPtr)[:maxPtLen]
+						}
+						plainText := *plainTextPtr
 						for _, length := range postHandshakeRecordsLens {
 							pt := plainText[:length-16]
 							pt[0] = 23
@@ -700,6 +662,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 								fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
 							}
 						}
+						plainTextBufPool.Put(plainTextPtr)
 					}
 				}
 				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
@@ -708,48 +671,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			hs.c.isHandshakeComplete.Store(true)
 
-			// Cache the RealityProfile for future connections (READ-ONLY, after handshake).
-			alpn := ""
-			if len(hs.clientHello.alpnProtocols) > 0 {
-				alpn = hs.clientHello.alpnProtocols[0]
+			if show {
+				fmt.Printf("REALITY remoteAddr: %v\thandshake completed successfully\n", remoteAddr)
 			}
-			recordCount := 0
-			for _, l := range usedLen {
-				if l > 0 {
-					recordCount++
-				}
-			}
-			now := time.Now()
-			profile := &RealityProfile{
-				RecordLens:   usedLen,
-				Fingerprint:  computeFingerprint(hs.hello.cipherSuite, alpn, usedLen[0], usedLen[2]),
-				CipherSuite:  hs.hello.cipherSuite,
-				ALPN:         alpn,
-				TLSVersion:   hs.c.vers,
-				RecordCount:  recordCount,
-				CapturedAt:   now,
-			}
-
-			// Build fingerprint for cache.
-			fp := &targetFingerprintCache{
-				CipherSuite:       hs.hello.cipherSuite,
-				ALPN:              alpn,
-				SupportedVersions: hs.clientHello.supportedVersions,
-				KeyShareGroup:     uint16(hs.hello.serverShare.group),
-				SignatureSchemes:  hs.clientHello.supportedSignatureAlgorithms,
-				LastUpdated:       now,
-			}
-
-			// Emit event -- cache/persist/refresh handlers process it.
-			globalEventBus.Emit(Event{
-				Type:        EventHandshakeComplete,
-				Dest:        config.Dest,
-				ServerName:  hs.clientHello.serverName,
-				ALPN:        alpn,
-				TLSVersion:  hs.c.vers,
-				Profile:     profile,
-				Fingerprint: fp,
-			})
 			break
 		}
 		mutex.Unlock()
