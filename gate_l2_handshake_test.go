@@ -474,7 +474,7 @@ func TestL2_CacheLogic(t *testing.T) {
 	serverName := "www.google.com"
 	alpn := "h2"
 	tlsVer := uint16(VersionTLS13)
-	key := CacheKey(dest, serverName, alpn, tlsVer)
+	key := CacheKey(serverName, alpn, tlsVer)
 
 	lens := [7]int{1215, 6, 41, 0, 0, 0, 0}
 	fp := computeFingerprint(0x1301, alpn, lens[0], lens[2])
@@ -544,7 +544,7 @@ func TestL2_CacheLogic(t *testing.T) {
 
 	// --- Test 7: Invalid RecordLens → cache miss (defense) ---
 	t.Log("=== Test 7: Invalid RecordLens → miss (defense) ===")
-	badKey := CacheKey(dest, serverName, "grpc", tlsVer)
+	badKey := CacheKey(serverName, "grpc", tlsVer)
 	globalCacheManager.StoreProfile(badKey, &RealityProfile{
 		RecordLens:  [7]int{99999, 6, 41}, // 99999 > maxTLSRecordPayload
 		Fingerprint: fp,
@@ -586,7 +586,7 @@ func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
 	lens := [7]int{1215, 6, 41, 8273, 286, 74, 0}
 
 	// === Reproduce Bug: profile stored with ALPN="" (old probeTargetRaw behavior) ===
-	buggyKey := CacheKey(dest, serverName, "", tlsVer) // ALPN="" in key
+	buggyKey := CacheKey(serverName, "", tlsVer) // ALPN="" in key
 	fp := computeFingerprint(0x1301, "", lens[0], lens[2])
 	globalCacheManager.StoreProfile(buggyKey, &RealityProfile{
 		RecordLens:   lens,
@@ -607,7 +607,7 @@ func TestL2_CacheALPNMismatch_BugReproduction(t *testing.T) {
 	// === Fix: profile stored with ALPN="h2" (new probeTargetRaw behavior) ===
 	globalCacheManager.Reset()
 
-	fixedKey := CacheKey(dest, serverName, "h2", tlsVer)
+	fixedKey := CacheKey(serverName, "h2", tlsVer)
 	fp2 := computeFingerprint(0x1301, "h2", lens[0], lens[2])
 	globalCacheManager.StoreProfile(fixedKey, &RealityProfile{
 		RecordLens:   lens,
@@ -638,7 +638,7 @@ func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
 	alpn := "h2"
 
 	// Store profile for www.microsoft.com
-	keyMS := CacheKey(dest, "www.microsoft.com", alpn, tlsVer)
+	keyMS := CacheKey("www.microsoft.com", alpn, tlsVer)
 	lensMS := [7]int{1215, 6, 41, 8273, 286, 74, 0}
 	globalCacheManager.StoreProfile(keyMS, &RealityProfile{
 		RecordLens:  lensMS,
@@ -649,7 +649,7 @@ func TestL2_CacheServerNameIsolation_BugReproduction(t *testing.T) {
 	})
 
 	// Store profile for a different SNI on the same dest
-	keyOther := CacheKey(dest, "login.live.com", alpn, tlsVer)
+	keyOther := CacheKey("login.live.com", alpn, tlsVer)
 	lensOther := [7]int{1300, 6, 50, 9000, 300, 80, 0}
 	globalCacheManager.StoreProfile(keyOther, &RealityProfile{
 		RecordLens:  lensOther,
@@ -835,7 +835,7 @@ func TestL2_StaleCacheCausesHandshakeFailure(t *testing.T) {
 	newLens := [7]int{1300, 6, 55, 9200, 310, 82, 0}    // actual target response
 
 	// Store stale profile in cache (simulates old probe result)
-	key := CacheKey(dest, serverName, alpn, tlsVer)
+	key := CacheKey(serverName, alpn, tlsVer)
 	globalCacheManager.StoreProfile(key, &RealityProfile{
 		RecordLens:  oldLens,
 		CipherSuite: 0x1301,
@@ -921,7 +921,7 @@ func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
 
 	// Simulate old bug: 5 connections each store profile with ALPN=""
 	for i := 0; i < 5; i++ {
-		buggyKey := CacheKey(dest, serverName, "", tlsVer)
+		buggyKey := CacheKey(serverName, "", tlsVer)
 		lens := [7]int{1200 + i*10, 6, 40 + i, 8000 + i*100, 250 + i*5, 70 + i, 0}
 		globalCacheManager.StoreProfile(buggyKey, &RealityProfile{
 			RecordLens:  lens,
@@ -947,7 +947,7 @@ func TestL2_ALPNMismatchCausesProbeStorm(t *testing.T) {
 
 	// Now with fix: store with correct ALPN
 	globalCacheManager.Reset()
-	fixedKey := CacheKey(dest, serverName, "h2", tlsVer)
+	fixedKey := CacheKey(serverName, "h2", tlsVer)
 	lens := [7]int{1215, 6, 41, 8273, 286, 74, 0}
 	globalCacheManager.StoreProfile(fixedKey, &RealityProfile{
 		RecordLens:  lens,

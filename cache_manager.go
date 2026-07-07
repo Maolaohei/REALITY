@@ -34,8 +34,6 @@ type CacheManager struct {
 	fingerprints sync.Map // map[string]*targetFingerprintCache
 	singleflight sync.Map // map[string]*probeFlight (background refresh)
 	handshakeSF  sync.Map // map[string]*probeFlight (handshake path, short timeout)
-	destIndex    map[string]map[string]struct{} // dest → set of cache keys (secondary index)
-	indexMu      sync.Mutex                     // protects destIndex
 	stats        CacheManagerStats
 	dirty        atomic.Bool
 	maxProfiles  int
@@ -61,45 +59,9 @@ type CacheManagerStats struct {
 
 func NewCacheManager() *CacheManager {
 	return &CacheManager{
-		destIndex:   make(map[string]map[string]struct{}),
 		maxProfiles: 1000,
 		baseTTL:     ProfileTTL,
 	}
-}
-
-// --- Unified index operations ---
-
-// putLocked stores a profile entry and updates the dest secondary index.
-// This is the ONLY way to add entries to the cache. All callers must use this.
-func (m *CacheManager) putLocked(key, dest string, entry *ProfileEntry) {
-	m.entries.Store(key, entry)
-	m.indexMu.Lock()
-	if m.destIndex[dest] == nil {
-		m.destIndex[dest] = make(map[string]struct{})
-	}
-	m.destIndex[dest][key] = struct{}{}
-	m.indexMu.Unlock()
-}
-
-// deleteLocked removes a profile entry and cleans up the dest secondary index.
-// This is the ONLY way to remove entries from the cache. All callers must use this.
-func (m *CacheManager) deleteLocked(key, dest string) {
-	m.entries.Delete(key)
-	m.indexMu.Lock()
-	if keys, ok := m.destIndex[dest]; ok {
-		delete(keys, key)
-		if len(keys) == 0 {
-			delete(m.destIndex, dest)
-		}
-	}
-	m.indexMu.Unlock()
-}
-
-// keysByDest returns all cache keys for a given dest. Caller must not modify the returned map.
-func (m *CacheManager) keysByDest(dest string) map[string]struct{} {
-	m.indexMu.Lock()
-	defer m.indexMu.Unlock()
-	return m.destIndex[dest]
 }
 
 // --- Singleflight ---
@@ -126,8 +88,7 @@ func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (
 }
 
 // GetOrProbeForHandshake retrieves a cached profile or probes the target if
-// no valid cache entry exists. Uses a separate singleflight group with a
-// shorter timeout (5s) to avoid blocking handshake goroutines on slow probes.
+// no valid cache entry exists.
 func (m *CacheManager) GetOrProbeForHandshake(ctx context.Context, key, dest, serverName string, alpn int) (*RealityProfile, error) {
 	// Fast path: check cache first.
 	if val, ok := m.entries.Load(key); ok {
@@ -198,7 +159,6 @@ func (m *CacheManager) GetProfile(key string) (*RealityProfile, bool) {
 			return nil, false
 		}
 		m.entries.Delete(key)
-		m.deleteLocked(key, DestFromKey(key))
 		m.stats.ProfileEntries.Add(-1)
 		return nil, false
 	}
@@ -227,7 +187,6 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 	}
 	_, loaded := m.entries.LoadOrStore(key, entry)
 	if !loaded {
-		m.putLocked(key, DestFromKey(key), entry)
 		m.stats.ProfileEntries.Add(1)
 		m.dirty.Store(true)
 		m.evictIfFull()
@@ -236,9 +195,6 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 }
 
 // HotSwapProfile replaces a profile atomically.
-// The old entry is deleted from the map immediately. Any goroutine that
-// already loaded the old entry continues using it (safe for read-only use);
-// new connections will get the new entry from the map.
 func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
 	newEntry := &ProfileEntry{
 		Profile: newProfile,
@@ -246,7 +202,6 @@ func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
 		TTL:     m.baseTTL,
 	}
 	m.entries.Store(key, newEntry)
-	m.putLocked(key, DestFromKey(key), newEntry)
 	m.stats.HotSwaps.Add(1)
 	m.dirty.Store(true)
 }
@@ -259,6 +214,7 @@ func (m *CacheManager) MarkStale(key string) {
 		defer entry.mu.Unlock()
 		if entry.State == ProfileValid || entry.State == ProfileStale {
 			entry.State = ProfileStale
+			// Adaptive TTL: extend based on stability
 			if entry.StabilityScore < 4 {
 				entry.StabilityScore++
 				entry.TTL = m.baseTTL * time.Duration(1+entry.StabilityScore)
@@ -278,7 +234,6 @@ func (m *CacheManager) MarkNegative(key string) {
 			TTL:       m.baseTTL,
 		}
 		m.entries.Store(key, entry)
-		m.putLocked(key, DestFromKey(key), entry)
 		return
 	}
 	entry := val.(*ProfileEntry)
@@ -301,7 +256,6 @@ func (m *CacheManager) InvalidateProfile(key string) {
 		return
 	}
 	if m.entries.CompareAndDelete(key, val) {
-		m.deleteLocked(key, DestFromKey(key))
 		m.stats.ProfileEntries.Add(-1)
 		m.stats.ProfileInvalidated.Add(1)
 		m.dirty.Store(true)
@@ -316,13 +270,11 @@ func (m *CacheManager) StoreFingerprint(key string, fp *targetFingerprintCache) 
 	m.fingerprints.Store(key, fp)
 }
 
-// ValidateRecordLens checks that a RecordLens array contains sane values:
-// every non-zero length must be between recordHeaderLen and maxTLSRecordPayload.
-// Returns false if any lens is out of range (indicating a corrupt or stale profile).
+// ValidateRecordLens checks that a RecordLens array contains sane values.
 func ValidateRecordLens(lens [7]int) bool {
 	for _, l := range lens {
 		if l == 0 {
-			continue // absent record is OK (e.g. no NewSessionTicket yet)
+			continue
 		}
 		if l < recordHeaderLen || l > maxTLSRecordPayload {
 			return false
@@ -331,48 +283,50 @@ func ValidateRecordLens(lens [7]int) bool {
 	return true
 }
 
-// FindCachedProfileByDest searches for a cached profile matching the given dest,
-// serverName, cipher suite, ALPN, and TLS version. Returns the profile's RecordLens and
-// TLSVersion if found and valid. This is used by Server() to skip target reads
-// when a cached profile is available.
+// FindCachedProfileByDest searches for a cached profile matching the given
+// serverName, cipher suite, ALPN, and TLS version.
 func (m *CacheManager) FindCachedProfileByDest(dest, serverName string, cipherSuite uint16, alpn string, tlsVersion uint16) (lens [7]int, foundTLSVersion uint16, ok bool) {
-	keys := m.keysByDest(dest)
-	for key := range keys {
-		// Parse serverName from cache key to ensure exact SNI match.
-		_, keySN, keyALPN, _ := ParseCacheKey(key)
-		if keySN != serverName || keyALPN != alpn {
-			continue
-		}
-		val, exists := m.entries.Load(key)
-		if !exists {
-			continue
-		}
+	// Fast path: direct key lookup
+	key := CacheKey(serverName, alpn, tlsVersion)
+	if val, found := m.entries.Load(key); found {
 		entry := val.(*ProfileEntry)
 		entry.mu.Lock()
-		if entry.State == ProfileNegative {
+		if entry.State != ProfileNegative &&
+			time.Since(entry.Profile.CapturedAt) < entry.TTL &&
+			entry.Profile.CipherSuite == cipherSuite &&
+			entry.Profile.TLSVersion == tlsVersion &&
+			ValidateRecordLens(entry.Profile.RecordLens) {
+			lens = entry.Profile.RecordLens
+			foundTLSVersion = entry.Profile.TLSVersion
 			entry.mu.Unlock()
-			continue
+			ok = true
+			return
 		}
-		if time.Since(entry.Profile.CapturedAt) >= entry.TTL {
-			entry.mu.Unlock()
-			continue
-		}
-		if entry.Profile.CipherSuite != cipherSuite ||
-			entry.Profile.TLSVersion != tlsVersion {
-			entry.mu.Unlock()
-			continue
-		}
-		if !ValidateRecordLens(entry.Profile.RecordLens) {
-			entry.mu.Unlock()
-			continue
-		}
-		lens = entry.Profile.RecordLens
-		foundTLSVersion = entry.Profile.TLSVersion
 		entry.mu.Unlock()
-		ok = true
-		return
 	}
 	return
+}
+
+// FindFullCachedProfile searches for a cached profile with ServerHello data.
+func (m *CacheManager) FindFullCachedProfile(dest, serverName string, cipherSuites []uint16, alpn string) *RealityProfile {
+	key := CacheKey(serverName, alpn, VersionTLS13)
+	if val, found := m.entries.Load(key); found {
+		entry := val.(*ProfileEntry)
+		entry.mu.Lock()
+		if entry.State != ProfileNegative &&
+			time.Since(entry.Profile.CapturedAt) < entry.TTL &&
+			ValidateRecordLens(entry.Profile.RecordLens) {
+			for _, cs := range cipherSuites {
+				if cs == entry.Profile.CipherSuite {
+					p := *entry.Profile
+					entry.mu.Unlock()
+					return &p
+				}
+			}
+		}
+		entry.mu.Unlock()
+	}
+	return nil
 }
 
 // --- Eviction ---
@@ -392,7 +346,7 @@ func (m *CacheManager) evictIfFull() {
 		return true
 	})
 	if oldestKey != "" {
-		m.deleteLocked(oldestKey, DestFromKey(oldestKey))
+		m.entries.Delete(oldestKey)
 		m.stats.ProfileEntries.Add(-1)
 	}
 }
@@ -441,22 +395,21 @@ func (m *CacheManager) CacheReport() string {
   probe success rate:  %.1f%%`, entries, invalidated, stale, negative, hotSwaps, attempts, successes, successRate)
 }
 
-// InvalidateByDest deletes all cached profiles for a given dest.
-// Used when the cache fast path verification fails, indicating the target
-// has changed (e.g. OCSP/certificate rotation).
-func (m *CacheManager) InvalidateByDest(dest string) {
-	keys := m.keysByDest(dest)
-	for key := range keys {
-		m.InvalidateProfile(key)
-	}
+// InvalidateAll deletes all cached profiles.
+func (m *CacheManager) InvalidateAll() {
+	m.entries.Range(func(key, val any) bool {
+		m.entries.Delete(key)
+		m.stats.ProfileEntries.Add(-1)
+		m.stats.ProfileInvalidated.Add(1)
+		return true
+	})
+	m.dirty.Store(true)
 }
 
-// InvalidateAndReprobe clears cached profiles for a dest and immediately
-// triggers an async re-probe. Uses DoProbe singleflight to prevent
-// concurrent probe storms.
+// InvalidateAndReprobe clears all cached profiles and triggers async re-probe.
 func (m *CacheManager) InvalidateAndReprobe(dest, serverName, alpn string) {
-	m.InvalidateByDest(dest)
-	key := CacheKey(dest, serverName, alpn, VersionTLS13)
+	m.InvalidateAll()
+	key := CacheKey(serverName, alpn, VersionTLS13)
 	go m.DoProbe(key, func() (*RealityProfile, error) {
 		return probeTargetRaw(dest, serverName, alpnToInt(alpn))
 	})
@@ -470,40 +423,8 @@ func (m *CacheManager) ClearDirty() {
 	m.dirty.Store(false)
 }
 
-// CheckConsistency verifies that the entries map and destIndex are in sync.
-// Returns a list of problems (empty = consistent). For testing only.
-func (m *CacheManager) CheckConsistency() []string {
-	var problems []string
-	m.entries.Range(func(k, v any) bool {
-		key := k.(string)
-		dest := DestFromKey(key)
-		m.indexMu.Lock()
-		keys, ok := m.destIndex[dest]
-		m.indexMu.Unlock()
-		if !ok {
-			problems = append(problems, fmt.Sprintf("entry %s: dest %s missing from destIndex", key, dest))
-			return true
-		}
-		if _, exists := keys[key]; !exists {
-			problems = append(problems, fmt.Sprintf("entry %s missing from destIndex[%s]", key, dest))
-		}
-		return true
-	})
-	m.indexMu.Lock()
-	for dest, keys := range m.destIndex {
-		for key := range keys {
-			if _, ok := m.entries.Load(key); !ok {
-				problems = append(problems, fmt.Sprintf("dangling destIndex entry: dest=%s key=%s", dest, key))
-			}
-		}
-	}
-	m.indexMu.Unlock()
-	return problems
-}
-
 // Reset clears all cache state for test isolation.
 func (m *CacheManager) Reset() {
-	// Delete all entries one by one to ensure sync.Map internal state is clean.
 	var keys []any
 	m.entries.Range(func(key, _ any) bool {
 		keys = append(keys, key)
@@ -524,9 +445,6 @@ func (m *CacheManager) Reset() {
 		m.handshakeSF.Delete(key)
 		return true
 	})
-	m.indexMu.Lock()
-	m.destIndex = make(map[string]map[string]struct{})
-	m.indexMu.Unlock()
 	m.stats.ProfileEntries.Store(0)
 	m.stats.ProfileInvalidated.Store(0)
 	m.stats.FingerprintChanged.Store(0)

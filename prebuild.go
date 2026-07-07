@@ -124,7 +124,7 @@ func WarmupProfiles(dir string) {
 
 					alpnIndex := alpnToInt(parts[2])
 
-					profileKey := CacheKey(dest, serverName, parts[2], VersionTLS13)
+					profileKey := CacheKey(serverName, parts[2], VersionTLS13)
 					globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
 						return probeTargetRaw(dest, serverName, alpnIndex)
 					})

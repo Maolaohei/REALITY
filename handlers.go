@@ -5,7 +5,7 @@ import "fmt"
 // RegisterCacheHandlers subscribes CacheManager to handshake events.
 func RegisterCacheHandlers(bus *EventBus) {
 	bus.On(EventHandshakeComplete, func(e Event) {
-		profileKey := CacheKey(e.Dest, e.ServerName, e.ALPN, e.TLSVersion)
+		profileKey := CacheKey(e.ServerName, e.ALPN, e.TLSVersion)
 
 		// Store profile in cache.
 		if globalCacheManager.StoreProfile(profileKey, e.Profile) {

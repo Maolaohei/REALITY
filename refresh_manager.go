@@ -47,7 +47,7 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 	// Determine serverName: use entry's if set, otherwise fall back to dest host.
 	sn := serverName
 	if sn == "" {
-		sn = DestFromKey(entry.cacheKey)
+		sn = entry.serverName
 	}
 
 	result, err := ProbeTargetViaUTLS(ctx, dest, sn, alpnToInt(entry.alpn), 0)
@@ -225,7 +225,7 @@ func (m *RefreshManager) AddTarget(dest, serverName, alpn string) {
 		dest:     dest,
 		serverName: serverName,
 		alpn:     alpn,
-		cacheKey: CacheKey(dest, serverName, alpn, VersionTLS13),
+		cacheKey: CacheKey(serverName, alpn, VersionTLS13),
 		stopCh:   make(chan struct{}),
 	}
 	entry.timer = time.AfterFunc(randomRefreshInterval(), func() {
@@ -296,7 +296,7 @@ func (m *RefreshManager) FormatStats() string {
 
 // invalidateCache removes cached profiles for a target.
 func invalidateCache(dest, serverName, alpn string) {
-	profileKey := CacheKey(dest, serverName, alpn, VersionTLS13)
+	profileKey := CacheKey(serverName, alpn, VersionTLS13)
 	globalCacheManager.InvalidateProfile(profileKey)
 }
 

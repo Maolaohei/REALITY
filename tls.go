@@ -616,7 +616,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					if hs.clientHello != nil {
 						clientSN = hs.clientHello.serverName
 					}
-					profileKey := CacheKey(config.Dest, clientSN, clientALPN, VersionTLS13)
+					profileKey := CacheKey(clientSN, clientALPN, VersionTLS13)
 					go globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
 						return probeTargetRaw(config.Dest, clientSN, alpnToInt(clientALPN))
 					})

@@ -5,29 +5,10 @@ import (
 	"time"
 )
 
-// BenchmarkCacheInvalidateByDest measures the old invalidation path.
-func BenchmarkCacheInvalidateByDest(b *testing.B) {
-	m := NewCacheManager()
-	for i := 0; i < 100; i++ {
-		key := CacheKey("1.2.3.4:443", "example.com", "h2", VersionTLS13)
-		m.StoreProfile(key, &RealityProfile{
-			RecordLens:  [7]int{1215, 6, 41, 8273, 286, 74, 0},
-			CipherSuite: 0x1301,
-			ALPN:        "h2",
-			TLSVersion:  VersionTLS13,
-			CapturedAt:  time.Now(),
-		})
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		m.InvalidateByDest("1.2.3.4:443")
-	}
-}
-
 // BenchmarkCacheGetProfile measures cache lookup latency.
 func BenchmarkCacheGetProfile(b *testing.B) {
 	m := NewCacheManager()
-	key := CacheKey("1.2.3.4:443", "example.com", "h2", VersionTLS13)
+	key := CacheKey("example.com", "h2", VersionTLS13)
 	m.StoreProfile(key, &RealityProfile{
 		RecordLens:  [7]int{1215, 6, 41, 8273, 286, 74, 0},
 		CipherSuite: 0x1301,
@@ -44,7 +25,7 @@ func BenchmarkCacheGetProfile(b *testing.B) {
 // BenchmarkFindCachedProfileByDest measures the cache fast path lookup.
 func BenchmarkFindCachedProfileByDest(b *testing.B) {
 	m := NewCacheManager()
-	key := CacheKey("1.2.3.4:443", "example.com", "h2", VersionTLS13)
+	key := CacheKey("example.com", "h2", VersionTLS13)
 	m.StoreProfile(key, &RealityProfile{
 		RecordLens:  [7]int{1215, 6, 41, 8273, 286, 74, 0},
 		CipherSuite: 0x1301,
