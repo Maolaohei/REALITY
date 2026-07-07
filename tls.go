@@ -501,7 +501,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		defer recordBufPool.Put(s2cSavedPtr)
 		handshakeLen := 0
 
-		// Read from target and cache the result.
+		// Read from target.
 		// Set idle deadline on target to prevent permanent hangs if target
 		// becomes unresponsive during handshake.
 		target.SetReadDeadline(time.Now().Add(mirrorIdleTimeout))
@@ -531,7 +531,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			mutex.Lock()
 			s2cSaved = append(s2cSaved, buf[:n]...)
 			if hs.c.conn != conn {
-				copying = true // if the target already sent some data, just start bidirectional direct forwarding
+				copying = true
 				break
 			}
 			for i, t := range types {

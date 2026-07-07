@@ -207,7 +207,7 @@ func parseRecordLens(data []byte) (lens [7]int, cipherSuite uint16, ok bool) {
 
 // ProbeTargetViaUTLS probes the target server using a real uTLS ClientHello
 // and returns the captured record lengths and cipher suite. This is the single
-// trusted probe implementation used by RefreshManager and prebuild.
+// trusted probe implementation used by prebuild.
 //
 // Parameters:
 //   - ctx: context for timeout/cancellation
