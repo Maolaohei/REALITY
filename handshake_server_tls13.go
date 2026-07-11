@@ -203,7 +203,11 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if err := hs.sendServerFinished(); err != nil {
 		return err
 	}
-	if hs.c.out.handshakeLen[6] != 0 {
+	// REALITY: skip synthetic NewSessionTicket emission.
+	// RecordLens[6] is retained in the profile for fingerprinting, but writing a
+	// camouflage NST as app-data here breaks strict clients' first application Read
+	// (local error: tls: unexpected message) after Handshake returns.
+	if false && hs.c.out.handshakeLen[6] != 0 {
 		if _, err := c.writeRecord(recordTypeHandshake, []byte{typeNewSessionTicket}); err != nil {
 			return err
 		}
@@ -215,18 +219,8 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		return err
 	}
 	return nil
-
-	if err := hs.readClientCertificate(); err != nil {
-		return err
-	}
-	if err := hs.readClientFinished(); err != nil {
-		return err
-	}
-
-	c.isHandshakeComplete.Store(true)
-
-	return nil
 }
+
 
 func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	c := hs.c
@@ -1084,17 +1078,11 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 }
 
 func (hs *serverHandshakeStateTLS13) shouldSendSessionTickets() bool {
-	if hs.c.config.SessionTicketsDisabled {
-		return false
-	}
-
-	// QUIC tickets are sent by QUICConn.SendSessionTicket, not automatically.
-	if hs.c.quic != nil {
-		return false
-	}
-
-	// Don't send tickets the client wouldn't use. See RFC 8446, Section 4.2.9.
-	return slices.Contains(hs.clientHello.pskModes, pskModeDHE)
+	// REALITY always disables real NewSessionTicket emission.
+	// Camouflage may still *measure* R6 lengths from the target, but sending our own
+	// NST under application traffic keys desyncs strict TLS clients after Handshake
+	// and causes immediate disconnects on first application Read.
+	return false
 }
 
 func (hs *serverHandshakeStateTLS13) sendSessionTickets() error {

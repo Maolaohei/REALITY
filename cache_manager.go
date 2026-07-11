@@ -55,6 +55,10 @@ type CacheManagerStats struct {
 	HotSwaps           atomic.Uint64
 	ProbeAttempts      atomic.Uint64
 	ProbeSuccesses     atomic.Uint64
+	L1Hits             atomic.Uint64
+	L2Hits             atomic.Uint64
+	L2Fails            atomic.Uint64
+	Quarantines        atomic.Uint64
 }
 
 func NewCacheManager() *CacheManager {
@@ -283,29 +287,6 @@ func ValidateRecordLens(lens [7]int) bool {
 	return true
 }
 
-// FindCachedProfileByDest searches for a cached profile matching the given
-// serverName, cipher suite, ALPN, and TLS version.
-func (m *CacheManager) FindCachedProfileByDest(dest, serverName string, cipherSuite uint16, alpn string, tlsVersion uint16) (lens [7]int, foundTLSVersion uint16, ok bool) {
-	// Fast path: direct key lookup
-	key := CacheKey(serverName, alpn, tlsVersion)
-	if val, found := m.entries.Load(key); found {
-		entry := val.(*ProfileEntry)
-		entry.mu.Lock()
-		if entry.State != ProfileNegative &&
-			time.Since(entry.Profile.CapturedAt) < entry.TTL &&
-			entry.Profile.CipherSuite == cipherSuite &&
-			entry.Profile.TLSVersion == tlsVersion &&
-			ValidateRecordLens(entry.Profile.RecordLens) {
-			lens = entry.Profile.RecordLens
-			foundTLSVersion = entry.Profile.TLSVersion
-			entry.mu.Unlock()
-			ok = true
-			return
-		}
-		entry.mu.Unlock()
-	}
-	return
-}
 
 // FindFullCachedProfile searches for a cached profile with ServerHello data.
 func (m *CacheManager) FindFullCachedProfile(dest, serverName string, cipherSuites []uint16, alpn string) *RealityProfile {
@@ -406,14 +387,6 @@ func (m *CacheManager) InvalidateAll() {
 	m.dirty.Store(true)
 }
 
-// InvalidateAndReprobe clears all cached profiles and triggers async re-probe.
-func (m *CacheManager) InvalidateAndReprobe(dest, serverName, alpn string) {
-	m.InvalidateAll()
-	key := CacheKey(serverName, alpn, VersionTLS13)
-	go m.DoProbe(key, func() (*RealityProfile, error) {
-		return probeTargetRaw(dest, serverName, alpnToInt(alpn))
-	})
-}
 
 func (m *CacheManager) IsDirty() bool {
 	return m.dirty.Load()
@@ -453,6 +426,10 @@ func (m *CacheManager) Reset() {
 	m.stats.HotSwaps.Store(0)
 	m.stats.ProbeAttempts.Store(0)
 	m.stats.ProbeSuccesses.Store(0)
+	m.stats.L1Hits.Store(0)
+	m.stats.L2Hits.Store(0)
+	m.stats.L2Fails.Store(0)
+	m.stats.Quarantines.Store(0)
 	m.dirty.Store(false)
 }
 

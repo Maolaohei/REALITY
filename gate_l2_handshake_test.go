@@ -496,6 +496,7 @@ func TestL2_CacheLogic(t *testing.T) {
 		ALPN:        alpn,
 		TLSVersion:  tlsVer,
 		CapturedAt:  time.Now(),
+		Dest:        dest,
 	})
 
 	gotLens, gotVer, hit := globalCacheManager.FindCachedProfileByDest(dest, serverName, 0x1301, alpn, tlsVer)

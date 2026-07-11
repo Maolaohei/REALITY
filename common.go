@@ -568,6 +568,10 @@ type Config struct {
 	// If empty, persistence is disabled.
 	CacheDir string
 
+	// AmortizeMode controls RA handshake amortize (L0/L1/L2/Auto).
+	// Zero value (AmortizeDefault) resolves to AmortizeL2 (zero-dial when evidence-rich; else L1/L0).
+	AmortizeMode AmortizeMode
+
 	LimitFallbackUpload   LimitFallback
 	LimitFallbackDownload LimitFallback
 
@@ -985,6 +989,7 @@ func (c *Config) Clone() *Config {
 		MaxClientVer:                        c.MaxClientVer,
 		MaxTimeDiff:                         c.MaxTimeDiff,
 		ShortIds:                            c.ShortIds,
+		AmortizeMode:                       c.AmortizeMode,
 		LimitFallbackUpload:                 c.LimitFallbackUpload,
 		LimitFallbackDownload:               c.LimitFallbackDownload,
 		Rand:                                c.Rand,
