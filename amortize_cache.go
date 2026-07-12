@@ -41,6 +41,11 @@ func (m *CacheManager) LookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 			continue
 		}
 		entry := val.(*ProfileEntry)
+		// Lock-free fast-path: skip rejected states without taking the mutex.
+		s := ProfileState(entry.atomicState.Load())
+		if s == ProfileNegative || s == ProfileQuarantined || s == ProfileSuspect {
+			continue
+		}
 		entry.mu.Lock()
 		if entry.State == ProfileNegative || entry.State == ProfileQuarantined {
 			entry.mu.Unlock()
@@ -59,6 +64,7 @@ func (m *CacheManager) LookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 		expired := time.Since(p.CapturedAt) >= entry.TTL
 		if expired && entry.State == ProfileValid {
 			entry.State = ProfileStale
+			entry.atomicState.Store(int32(ProfileStale))
 		}
 		stale := entry.State == ProfileStale || expired
 
@@ -224,6 +230,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 			merged.Source = "live"
 			entry.Profile = &merged
 			entry.State = ProfileValid
+			entry.atomicState.Store(int32(ProfileValid))
 			entry.TTL = m.baseTTL
 			entry.FailCount = 0
 			entry.mu.Unlock()
@@ -241,6 +248,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 				}
 				entry.Profile = &cp
 				entry.State = ProfileValid
+				entry.atomicState.Store(int32(ProfileValid))
 				entry.FailCount = 0
 				entry.TTL = m.baseTTL
 				m.stats.HotSwaps.Add(1)
@@ -254,6 +262,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 		cp.Evidence = 1
 		entry.Profile = &cp
 		entry.State = ProfileSuspect
+		entry.atomicState.Store(int32(ProfileSuspect))
 		entry.FailCount = 1
 		entry.mu.Unlock()
 		m.dirty.Store(true)
@@ -270,6 +279,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 		State:   ProfileValid,
 		TTL:     m.baseTTL,
 	}
+	entry.atomicState.Store(int32(ProfileValid))
 	if _, loaded := m.entries.LoadOrStore(key, entry); !loaded {
 		m.stats.ProfileEntries.Add(1)
 		m.dirty.Store(true)
@@ -312,6 +322,7 @@ func (m *CacheManager) Quarantine(key, reason string) {
 			NextRetry: time.Now().Add(5 * time.Minute),
 			TTL:       m.baseTTL,
 		}
+		entry.atomicState.Store(int32(ProfileQuarantined))
 		m.entries.Store(key, entry)
 		m.stats.Quarantines.Add(1)
 		m.dirty.Store(true)
@@ -320,6 +331,7 @@ func (m *CacheManager) Quarantine(key, reason string) {
 	entry := val.(*ProfileEntry)
 	entry.mu.Lock()
 	entry.State = ProfileQuarantined
+	entry.atomicState.Store(int32(ProfileQuarantined))
 	entry.FailCount = MaxL2FailWindow
 	entry.NextRetry = time.Now().Add(5 * time.Minute)
 	entry.mu.Unlock()
@@ -349,6 +361,7 @@ func (m *CacheManager) NoteHandshakeFailure(key string, path AmortizePath) {
 	}
 	if fc >= MaxL2FailWindow {
 		entry.State = ProfileQuarantined
+		entry.atomicState.Store(int32(ProfileQuarantined))
 		entry.NextRetry = time.Now().Add(5 * time.Minute)
 		entry.mu.Unlock()
 		m.stats.Quarantines.Add(1)
@@ -357,6 +370,7 @@ func (m *CacheManager) NoteHandshakeFailure(key string, path AmortizePath) {
 	}
 	if entry.State == ProfileValid {
 		entry.State = ProfileSuspect
+		entry.atomicState.Store(int32(ProfileSuspect))
 	}
 	entry.mu.Unlock()
 	m.dirty.Store(true)

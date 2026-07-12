@@ -30,7 +30,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"hash/fnv"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
@@ -203,6 +202,21 @@ var (
 			return &buf
 		},
 	}
+
+	// drainBufPool reuses 4 KiB buffers for the background drain goroutine
+	// in Server(), avoiding a per-connection heap allocation.
+	drainBufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 4096)
+			return &buf
+		},
+	}
+)
+
+// FNV-1a 64-bit constants for inline hashing (avoids hash/fnv allocs).
+const (
+	fnv64Offset = 14695981039346656037
+	fnv64Prime  = 1099511628211
 )
 
 // RealityProfile is the unified cache entry for REALITY handshake profiles.
@@ -259,16 +273,21 @@ func bigEndianUint16(b []byte) uint16 {
 // computeFingerprint computes FNV64 hash of (CipherSuite, ALPN, ServerHelloLen, ExtensionsLen).
 // Used for cache hit/miss decisions — more robust than comparing individual fields.
 func computeFingerprint(cipherSuite uint16, alpn string, serverHelloLen, extensionsLen int) uint64 {
-	h := fnv.New64a()
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], cipherSuite)
-	h.Write(buf[:])
-	h.Write([]byte(alpn))
-	binary.BigEndian.PutUint16(buf[:], uint16(serverHelloLen))
-	h.Write(buf[:])
-	binary.BigEndian.PutUint16(buf[:], uint16(extensionsLen))
-	h.Write(buf[:])
-	return h.Sum64()
+	var h uint64 = fnv64Offset
+	mixU16 := func(v uint16) {
+		h ^= uint64(v >> 8)
+		h *= fnv64Prime
+		h ^= uint64(v & 0xff)
+		h *= fnv64Prime
+	}
+	mixU16(cipherSuite)
+	for i := 0; i < len(alpn); i++ {
+		h ^= uint64(alpn[i])
+		h *= fnv64Prime
+	}
+	mixU16(uint16(serverHelloLen))
+	mixU16(uint16(extensionsLen))
+	return h
 }
 
 // bigEndianUint24 decodes a big-endian 24-bit unsigned integer from b.

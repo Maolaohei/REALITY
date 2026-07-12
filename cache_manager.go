@@ -22,6 +22,7 @@ type ProfileEntry struct {
 	mu             sync.Mutex
 	Profile        *RealityProfile
 	State          ProfileState
+	atomicState    atomic.Int32
 	FailCount      int
 	NextRetry      time.Time
 	TTL            time.Duration
@@ -155,6 +156,7 @@ func (m *CacheManager) GetProfile(key string) (*RealityProfile, bool) {
 			return entry.Profile, false
 		}
 		entry.State = ProfileStale
+		entry.atomicState.Store(int32(ProfileStale))
 		m.stats.StaleServed.Add(1)
 		return entry.Profile, true
 
@@ -194,6 +196,7 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 		State:   ProfileValid,
 		TTL:     m.baseTTL,
 	}
+	entry.atomicState.Store(int32(ProfileValid))
 	_, loaded := m.entries.LoadOrStore(key, entry)
 	if !loaded {
 		m.stats.ProfileEntries.Add(1)
@@ -210,6 +213,7 @@ func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
 		State:   ProfileValid,
 		TTL:     m.baseTTL,
 	}
+	newEntry.atomicState.Store(int32(ProfileValid))
 	m.entries.Store(key, newEntry)
 	m.stats.HotSwaps.Add(1)
 	m.dirty.Store(true)
@@ -223,6 +227,7 @@ func (m *CacheManager) MarkStale(key string) {
 		defer entry.mu.Unlock()
 		if entry.State == ProfileValid || entry.State == ProfileStale {
 			entry.State = ProfileStale
+			entry.atomicState.Store(int32(ProfileStale))
 			// Adaptive TTL: extend based on stability
 			if entry.StabilityScore < 4 {
 				entry.StabilityScore++
@@ -246,6 +251,7 @@ func (m *CacheManager) MarkNegative(key string) {
 			NextRetry: time.Now().Add(time.Minute),
 			TTL:       m.baseTTL,
 		}
+		entry.atomicState.Store(int32(ProfileNegative))
 		m.entries.Store(key, entry)
 		return
 	}
@@ -259,6 +265,7 @@ func (m *CacheManager) MarkNegative(key string) {
 		backoff = 30 * time.Minute
 	}
 	entry.State = ProfileNegative
+	entry.atomicState.Store(int32(ProfileNegative))
 	entry.NextRetry = time.Now().Add(backoff)
 }
 

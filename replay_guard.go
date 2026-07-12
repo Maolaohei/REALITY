@@ -11,7 +11,7 @@ const defaultReplayGuardMaxEntries = 100000
 // ReplayGuard deduplicates ClientHello.random prefixes within a time window.
 // Prevents resource-wasting replays within the MaxTimeDiff window.
 type ReplayGuard struct {
-	seen       sync.Map    // key: [20]byte (random prefix), value: time.Time
+	seen       sync.Map    // key: [20]byte (random prefix), value: int64 (unix nano)
 	window     time.Duration
 	maxEntries int64
 	count      atomic.Int64
@@ -47,14 +47,15 @@ func (g *ReplayGuard) CheckAndMark(randomPrefix [20]byte) bool {
 	}
 
 	now := time.Now()
-	existing, loaded := g.seen.LoadOrStore(randomPrefix, now)
+	nowNano := now.UnixNano()
+	existing, loaded := g.seen.LoadOrStore(randomPrefix, nowNano)
 	if !loaded {
 		g.count.Add(1)
 		return true
 	}
 	// Key exists -- check if it has expired. If so, replace it and allow.
-	if now.Sub(existing.(time.Time)) > g.window {
-		g.seen.Store(randomPrefix, now)
+	if nowNano-existing.(int64) > int64(g.window) {
+		g.seen.Store(randomPrefix, nowNano)
 		return true
 	}
 	return false
@@ -63,9 +64,9 @@ func (g *ReplayGuard) CheckAndMark(randomPrefix [20]byte) bool {
 // sweepExpired removes all entries older than the window. Called inline when
 // the guard is near capacity and periodically by gcLoop.
 func (g *ReplayGuard) sweepExpired() {
-	now := time.Now()
+	nowNano := time.Now().UnixNano()
 	g.seen.Range(func(k, v any) bool {
-		if now.Sub(v.(time.Time)) > g.window {
+		if nowNano-v.(int64) > int64(g.window) {
 			g.seen.Delete(k)
 			g.count.Add(-1)
 		}

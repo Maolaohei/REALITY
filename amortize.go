@@ -1,9 +1,8 @@
 package reality
 
 import (
-	"encoding/binary"
 	"fmt"
-	"hash/fnv"
+	"strconv"
 )
 
 // AmortizeMode controls how aggressively REALITY reuses observed target
@@ -68,17 +67,25 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 	if ch == nil {
 		return "empty"
 	}
-	h := fnv.New64a()
-	var buf [2]byte
-	writeU16 := func(v uint16) {
-		binary.BigEndian.PutUint16(buf[:], v)
-		h.Write(buf[:])
+	var h uint64 = fnv64Offset
+	mixU16 := func(v uint16) {
+		h ^= uint64(v >> 8)
+		h *= fnv64Prime
+		h ^= uint64(v & 0xff)
+		h *= fnv64Prime
+	}
+	mixByte := func(b byte) {
+		h ^= uint64(b)
+		h *= fnv64Prime
 	}
 
 	// Primary ALPN only (first). Empty is distinct from h2/http1.1.
 	alpn := clientALPN(ch)
-	h.Write([]byte(alpn))
-	h.Write([]byte{0})
+	for i := 0; i < len(alpn); i++ {
+		h ^= uint64(alpn[i])
+		h *= fnv64Prime
+	}
+	mixByte(0)
 
 	// Key-share capability flags (order/GREASE independent).
 	var hasX25519, hasMLKEM, hasP256 bool
@@ -104,24 +111,24 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 		}
 	}
 	if hasX25519 {
-		h.Write([]byte{1})
+		mixByte(1)
 	} else {
-		h.Write([]byte{0})
+		mixByte(0)
 	}
 	if hasMLKEM {
-		h.Write([]byte{1})
+		mixByte(1)
 	} else {
-		h.Write([]byte{0})
+		mixByte(0)
 	}
 	if hasP256 {
-		h.Write([]byte{1})
+		mixByte(1)
 	} else {
-		h.Write([]byte{0})
+		mixByte(0)
 	}
 	if len(ch.encryptedClientHello) > 0 {
-		h.Write([]byte{1})
+		mixByte(1)
 	} else {
-		h.Write([]byte{0})
+		mixByte(0)
 	}
 	// Prefer TLS 1.3 bit
 	has13 := false
@@ -132,9 +139,9 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 		}
 	}
 	if has13 {
-		writeU16(VersionTLS13)
+		mixU16(VersionTLS13)
 	}
-	return fmt.Sprintf("%x", h.Sum64())
+	return strconv.FormatUint(h, 16)
 }
 // clientALPN returns the first ALPN protocol or empty string.
 func clientALPN(ch *clientHelloMsg) string {
@@ -252,15 +259,16 @@ func patchServerHelloTemplate(template, newRandom []byte) (*serverHelloMsg, erro
 
 // computeShapeHash fingerprints ServerHello structural fields used for L2 safety.
 func computeShapeHash(cipherSuite uint16, group CurveID, r0Len int, templateLen int) uint64 {
-	h := fnv.New64a()
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], cipherSuite)
-	h.Write(buf[:])
-	binary.BigEndian.PutUint16(buf[:], uint16(group))
-	h.Write(buf[:])
-	binary.BigEndian.PutUint16(buf[:], uint16(r0Len))
-	h.Write(buf[:])
-	binary.BigEndian.PutUint16(buf[:], uint16(templateLen))
-	h.Write(buf[:])
-	return h.Sum64()
+	var h uint64 = fnv64Offset
+	mixU16 := func(v uint16) {
+		h ^= uint64(v >> 8)
+		h *= fnv64Prime
+		h ^= uint64(v & 0xff)
+		h *= fnv64Prime
+	}
+	mixU16(cipherSuite)
+	mixU16(uint16(group))
+	mixU16(uint16(r0Len))
+	mixU16(uint16(templateLen))
+	return h
 }

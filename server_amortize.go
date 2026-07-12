@@ -22,14 +22,14 @@ import (
 
 // detectOnceConfigs tracks which dests have already had detection launched.
 // Each dest gets exactly one DetectPostHandshakeRecordsLens goroutine.
-var detectOnceConfigs sync.Map // map[string]*Config keyed by dest
+var detectOnceConfigs sync.Map // map[string]struct{} keyed by dest
 
 // triggerDetectPostHandshake ensures detection runs at most once per dest.
 func triggerDetectPostHandshake(config *Config) {
 	if config.Dest == "" {
 		return
 	}
-	if _, loaded := detectOnceConfigs.LoadOrStore(config.Dest, config); !loaded {
+	if _, loaded := detectOnceConfigs.LoadOrStore(config.Dest, struct{}{}); !loaded {
 		// First time seeing this dest — launch detection in background.
 		go DetectPostHandshakeRecordsLens(config)
 	}
@@ -146,7 +146,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			conn.Close()
 			return nil, fmt.Errorf("REALITY: L2 amortize failed from %s: %v", remoteAddr, err)
 		}
-		emitHandshakeComplete(config, &hs, pre.Profile.RecordLens, chClass, PathL2, pre.Profile)
+		emitHandshakeComplete(config, &hs, pre.Profile.RecordLens, chClass, alpn, PathL2, pre.Profile)
 		return rc, nil
 	}
 
@@ -169,7 +169,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		return nil, errors.New("REALITY: failed to replay ClientHello to dest: " + err.Error())
 	}
 
-	usedLen, helloMsg, r0Template, capturedPath, err := captureTargetRecords(target, &hs, config, mode, chClass, show, remoteAddr)
+	usedLen, helloMsg, r0Template, capturedPath, err := captureTargetRecords(target, &hs, config, mode, chClass, alpn, show, remoteAddr)
 	if err != nil || helloMsg == nil || usedLen[0] == 0 {
 		// Mirror remaining like legacy failure path.
 		if show {
@@ -207,7 +207,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 	// Drain leftover target data in background (same as legacy).
 	go func() {
-		buf := make([]byte, 4096)
+		bufPtr := drainBufPool.Get().(*[]byte)
+		defer drainBufPool.Put(bufPtr)
+		buf := *bufPtr
 		for {
 			target.SetReadDeadline(time.Now().Add(2 * time.Second))
 			if _, err := target.Read(buf); err != nil {
@@ -227,7 +229,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	hs.c.isHandshakeComplete.Store(true)
 
 	// Build observation profile for amortize.
-	obs := buildObservationProfile(config, &hs, savedLen, chClass, r0Template, "live")
+	obs := buildObservationProfile(config, &hs, savedLen, chClass, alpn, r0Template, "live")
 	// Also store under legacy key for backward-compatible L1 hits.
 	v2Key := CacheKeyV2(config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass)
 	globalCacheManager.StoreObservation(v2Key, obs)
@@ -245,7 +247,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		globalCacheManager.StoreProfile(legacyKey, &legacyObs)
 	}
 
-	emitHandshakeComplete(config, &hs, savedLen, chClass, path, obs)
+	emitHandshakeComplete(config, &hs, savedLen, chClass, alpn, path, obs)
 	if show {
 		fmt.Printf("REALITY remoteAddr: %v\thandshake complete path=%s evidence=%d\n", remoteAddr, path.String(), obs.Evidence)
 	}
@@ -395,8 +397,12 @@ func mirrorAfterFailedAuth(ctx context.Context, conn net.Conn, underlying CloseW
 		defer wg.Done()
 		src := net.Conn(conn)
 		if underlying != nil {
-			src = NewRatelimitedConn(underlying, &config.LimitFallbackUpload)
-		} else {
+			if config.LimitFallbackUpload.BytesPerSec > 0 {
+				src = NewRatelimitedConn(underlying, &config.LimitFallbackUpload)
+			} else {
+				src = underlying
+			}
+		} else if config.LimitFallbackUpload.BytesPerSec > 0 {
 			src = NewRatelimitedConn(conn, &config.LimitFallbackUpload)
 		}
 		_, copyErr := io.Copy(target, src)
@@ -413,7 +419,11 @@ func mirrorAfterFailedAuth(ctx context.Context, conn net.Conn, underlying CloseW
 	if underlying != nil {
 		dst = underlying
 	}
-	_, _ = io.Copy(dst, NewRatelimitedConn(target, &config.LimitFallbackDownload))
+	if config.LimitFallbackDownload.BytesPerSec > 0 {
+		_, _ = io.Copy(dst, NewRatelimitedConn(target, &config.LimitFallbackDownload))
+	} else {
+		_, _ = io.Copy(dst, target)
+	}
 	if underlying != nil {
 		underlying.CloseWrite()
 	}
@@ -492,7 +502,7 @@ func runL2Handshake(hs *serverHandshakeStateTLS13, profile *RealityProfile, show
 }
 
 // captureTargetRecords reads R0 (always) and R1-R6 (unless L1 cache hit).
-func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config *Config, mode AmortizeMode, chClass string, show bool, remoteAddr string) (usedLen [7]int, hello *serverHelloMsg, r0Template []byte, path AmortizePath, err error) {
+func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config *Config, mode AmortizeMode, chClass, alpn string, show bool, remoteAddr string) (usedLen [7]int, hello *serverHelloMsg, r0Template []byte, path AmortizePath, err error) {
 	path = PathL0
 	bufPtr := recordBufPool.Get().(*[]byte)
 	buf := *bufPtr
@@ -503,7 +513,6 @@ func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config
 
 	target.SetReadDeadline(time.Now().Add(mirrorIdleTimeout))
 	handshakeLen := 0
-	alpn := clientALPN(hs.clientHello)
 	const maxTargetReads = 64
 	reads := 0
 
@@ -668,8 +677,7 @@ func injectPostHandshakeRecords(hs *serverHandshakeStateTLS13, config *Config, s
 	_ = remoteAddr
 }
 
-func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, usedLen [7]int, chClass string, r0Template []byte, source string) *RealityProfile {
-	alpn := clientALPN(hs.clientHello)
+func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, usedLen [7]int, chClass, alpn string, r0Template []byte, source string) *RealityProfile {
 	recordCount := 0
 	for _, l := range usedLen {
 		if l > 0 {
@@ -705,10 +713,9 @@ func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, used
 	}
 }
 
-func emitHandshakeComplete(config *Config, hs *serverHandshakeStateTLS13, usedLen [7]int, chClass string, path AmortizePath, obs *RealityProfile) {
-	alpn := clientALPN(hs.clientHello)
+func emitHandshakeComplete(config *Config, hs *serverHandshakeStateTLS13, usedLen [7]int, chClass, alpn string, path AmortizePath, obs *RealityProfile) {
 	if obs == nil {
-		obs = buildObservationProfile(config, hs, usedLen, chClass, nil, "live")
+		obs = buildObservationProfile(config, hs, usedLen, chClass, alpn, nil, "live")
 	}
 	fp := &targetFingerprintCache{
 		CipherSuite:       obs.CipherSuite,

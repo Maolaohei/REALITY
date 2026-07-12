@@ -1018,15 +1018,6 @@ var outBufPool = sync.Pool{
 	},
 }
 
-// additionalBufPool pools the 13-byte additionalData buffers for decrypt.
-// This avoids heap allocation in the hot decrypt path.
-var additionalBufPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 0, 13) // seq(8) + version(3) + length(2) = 13 bytes max
-		return &buf
-	},
-}
-
 // writeRecordLocked writes a TLS record with the given type and payload to the
 // connection and updates the record layer state.
 func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
