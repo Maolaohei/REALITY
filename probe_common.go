@@ -239,14 +239,3 @@ func ProbeTargetViaUTLS(ctx context.Context, dest, serverName string, alpn int, 
 		RecordCount: recordCount,
 	}, nil
 }
-
-// probeQuickCheck probes the target and only reads ServerHello + CCS + EE
-// (records 0-2) for a fast CipherSuite and record length comparison.
-// Returns the partial record lens and cipher suite.
-func probeQuickCheck(ctx context.Context, dest, serverName string, alpn int, xver byte) (lens [7]int, cipherSuite uint16, ok bool) {
-	data, err := dialAndProbe(ctx, dest, serverName, alpn, xver)
-	if err != nil {
-		return
-	}
-	return parseRecordLens(data)
-}

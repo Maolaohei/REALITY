@@ -24,6 +24,24 @@ type ProfileFile struct {
 	Profiles map[string]*PersistProfileEntry      `json:"profiles"`
 }
 
+// profileFileCurrentVersion is the current on-disk schema version.
+// Bump this when the PersistProfileEntry struct changes and add a
+// migration case in migrateProfileFile.
+const profileFileCurrentVersion = 1
+
+// migrateProfileFile applies in-place migrations from older schema versions
+// to the current version. Each case should transform the file and fall through
+// to the next version.
+func migrateProfileFile(file *ProfileFile) {
+	// No migrations needed yet — version 1 is the initial schema.
+	// Future example:
+	//   for file.Version < 2 {
+	//       // apply v1 -> v2 transformation
+	//       file.Version = 2
+	//   }
+	_ = file
+}
+
 // PersistProfileEntry is the serialized form of RealityProfile for disk storage.
 type PersistProfileEntry struct {
 	RecordLens  [7]int   `json:"record_lens"`
@@ -69,7 +87,7 @@ func (s *PersistentProfileStore) Save() {
 	defer s.mu.Unlock()
 
 	file := ProfileFile{
-		Version:  1,
+		Version:  profileFileCurrentVersion,
 		SavedAt:  time.Now(),
 		Profiles: make(map[string]*PersistProfileEntry),
 	}
@@ -126,6 +144,16 @@ func (s *PersistentProfileStore) load() {
 	var file ProfileFile
 	if err := json.Unmarshal(data, &file); err != nil {
 		return
+	}
+
+	// Reject files from an unknown future version.
+	if file.Version > profileFileCurrentVersion {
+		return
+	}
+
+	// Apply migrations from older versions to current.
+	if file.Version < profileFileCurrentVersion {
+		migrateProfileFile(&file)
 	}
 
 	// Don't load expired entries

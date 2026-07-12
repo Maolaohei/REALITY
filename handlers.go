@@ -5,15 +5,17 @@ import "fmt"
 // RegisterCacheHandlers subscribes CacheManager to handshake events.
 func RegisterCacheHandlers(bus *EventBus) {
 	bus.On(EventHandshakeComplete, func(e Event) {
-		profileKey := CacheKey(e.ServerName, e.ALPN, e.TLSVersion)
-
-		// Store profile in cache.
-		if globalCacheManager.StoreProfile(profileKey, e.Profile) {
-			// New entry — also store fingerprint.
-			if e.Fingerprint != nil {
-				fpKey := e.Dest + "|" + e.ServerName + "|" + e.ALPN
-				globalCacheManager.StoreFingerprint(fpKey, e.Fingerprint)
-			}
+		// Use StoreObservation for evidence-counting and mismatch debounce.
+		// Server() already stores via StoreObservation, but the handler also
+		// fires for legacy code paths that don't store directly.
+		if e.Profile != nil {
+			profileKey := CacheKey(e.ServerName, e.ALPN, e.TLSVersion)
+			globalCacheManager.StoreObservation(profileKey, e.Profile)
+		}
+		// Store fingerprint regardless of cache state.
+		if e.Fingerprint != nil {
+			fpKey := e.Dest + "|" + e.ServerName + "|" + e.ALPN
+			globalCacheManager.StoreFingerprint(fpKey, e.Fingerprint)
 		}
 	})
 }

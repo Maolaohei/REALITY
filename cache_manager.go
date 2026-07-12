@@ -68,6 +68,11 @@ func NewCacheManager() *CacheManager {
 	}
 }
 
+// maxTTLMultiplier caps how much a profile's TTL can grow via stability
+// scoring. Prevents stale profiles from being served as Valid for too long
+// without a RefreshManager heartbeat.
+const maxTTLMultiplier = 2
+
 // --- Singleflight ---
 
 func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (*RealityProfile, error) {
@@ -221,7 +226,11 @@ func (m *CacheManager) MarkStale(key string) {
 			// Adaptive TTL: extend based on stability
 			if entry.StabilityScore < 4 {
 				entry.StabilityScore++
-				entry.TTL = m.baseTTL * time.Duration(1+entry.StabilityScore)
+				mult := 1 + entry.StabilityScore
+				if mult > maxTTLMultiplier {
+					mult = maxTTLMultiplier
+				}
+				entry.TTL = m.baseTTL * time.Duration(mult)
 			}
 		}
 	}
@@ -316,18 +325,47 @@ func (m *CacheManager) evictIfFull() {
 	if int(m.stats.ProfileEntries.Load()) <= m.maxProfiles {
 		return
 	}
-	var oldestKey string
-	var oldestTime time.Time
+	// Eviction priority: Negative > Stale > oldest Valid.
+	// This protects fresh active profiles from being evicted by
+	// transient scan bursts.
+	var (
+		negativeKey string
+		staleKey    string
+		oldestKey   string
+		oldestTime  time.Time
+	)
 	m.entries.Range(func(key, val any) bool {
 		entry := val.(*ProfileEntry)
-		if oldestKey == "" || entry.Profile.CapturedAt.Before(oldestTime) {
-			oldestKey = key.(string)
-			oldestTime = entry.Profile.CapturedAt
+		entry.mu.Lock()
+		state := entry.State
+		entry.mu.Unlock()
+		switch state {
+		case ProfileNegative:
+			if negativeKey == "" {
+				negativeKey = key.(string)
+			}
+		case ProfileStale:
+			if staleKey == "" {
+				staleKey = key.(string)
+			}
+		default:
+			if oldestKey == "" || entry.Profile.CapturedAt.Before(oldestTime) {
+				oldestKey = key.(string)
+				oldestTime = entry.Profile.CapturedAt
+			}
 		}
 		return true
 	})
-	if oldestKey != "" {
-		m.entries.Delete(oldestKey)
+	// Pick the best candidate to evict.
+	evictKey := negativeKey
+	if evictKey == "" {
+		evictKey = staleKey
+	}
+	if evictKey == "" {
+		evictKey = oldestKey
+	}
+	if evictKey != "" {
+		m.entries.Delete(evictKey)
 		m.stats.ProfileEntries.Add(-1)
 	}
 }

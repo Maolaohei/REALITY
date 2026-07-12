@@ -18,6 +18,23 @@ import (
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
+
+
+// detectOnceConfigs tracks which dests have already had detection launched.
+// Each dest gets exactly one DetectPostHandshakeRecordsLens goroutine.
+var detectOnceConfigs sync.Map // map[string]*Config keyed by dest
+
+// triggerDetectPostHandshake ensures detection runs at most once per dest.
+func triggerDetectPostHandshake(config *Config) {
+	if config.Dest == "" {
+		return
+	}
+	if _, loaded := detectOnceConfigs.LoadOrStore(config.Dest, config); !loaded {
+		// First time seeing this dest — launch detection in background.
+		go DetectPostHandshakeRecordsLens(config)
+	}
+}
+
 // Server establishes a REALITY camouflage TLS connection as the server side.
 //
 // Amortize paths:
@@ -50,7 +67,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 	initServerSideOnce(config, show)
 	ensureAutoProbe(config)
-	go DetectPostHandshakeRecordsLens(config)
+	triggerDetectPostHandshake(config)
 
 	raw := conn
 	if pc, ok := conn.(*proxyproto.Conn); ok {
@@ -63,7 +80,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			conn:   conn,
 			config: config,
 		},
-		ctx: context.Background(),
+		ctx: ctx,
 	}
 
 	// --- Phase 1: read ClientHello (no RA dial yet) ---
@@ -159,8 +176,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			fmt.Printf("REALITY remoteAddr: %v\ttarget capture failed: %v\n", remoteAddr, err)
 		}
 		if underlying != nil {
-			go io.Copy(target, NewRatelimitedConn(underlying, &config.LimitFallbackUpload))
-			io.Copy(underlying, NewRatelimitedConn(target, &config.LimitFallbackDownload))
+			go func() { _, _ = io.Copy(target, NewRatelimitedConn(underlying, &config.LimitFallbackUpload)) }()
+			_, _ = io.Copy(underlying, NewRatelimitedConn(target, &config.LimitFallbackDownload))
 			underlying.CloseWrite()
 		}
 		conn.Close()
@@ -258,14 +275,13 @@ func initServerSideOnce(config *Config, show bool) {
 			WarmupProfiles(cacheDir)
 		}
 	}
-	if globalReplayGuard == nil {
-		window := config.MaxTimeDiff
-		if window == 0 {
-			window = 90 * time.Second
-		}
-		if window > 0 {
-			globalReplayGuard = NewReplayGuard(window, 0)
-		}
+	// Replay guard init: use sync.Once to prevent concurrent creation races.
+	window := config.MaxTimeDiff
+	if window == 0 {
+		window = 90 * time.Second
+	}
+	if window > 0 {
+		InitGlobalReplayGuard(window)
 	}
 }
 
@@ -397,7 +413,7 @@ func mirrorAfterFailedAuth(ctx context.Context, conn net.Conn, underlying CloseW
 	if underlying != nil {
 		dst = underlying
 	}
-	io.Copy(dst, NewRatelimitedConn(target, &config.LimitFallbackDownload))
+	_, _ = io.Copy(dst, NewRatelimitedConn(target, &config.LimitFallbackDownload))
 	if underlying != nil {
 		underlying.CloseWrite()
 	}
@@ -545,8 +561,11 @@ func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config
 			}
 			if i == 2 && handshakeLen > 512 {
 				// Large EE: same special-case as legacy (buffer, break early for this record).
+				// Do NOT use the pool buffer here — it will be returned to the pool
+				// via defer while handshakeBuf is still live in the Conn. Instead
+				// allocate a dedicated slice that the caller owns.
 				usedLen[i] = handshakeLen
-				hs.c.out.handshakeBuf = buf[:0]
+				hs.c.out.handshakeBuf = make([]byte, 0, handshakeLen)
 				// continue reading until full record consumed below
 			}
 			if i == 6 && handshakeLen > 0 {

@@ -157,8 +157,8 @@ func (c *CCSDetectConn) Write(b []byte) (n int, err error) {
 			defer hasAlert.Store(true)
 			buf := make([]byte, 512)
 			for {
-				_, err = c.Conn.Read(buf)
-				if err != nil {
+				_, readErr := c.Conn.Read(buf)
+				if readErr != nil {
 					return
 				}
 				if buf[0] == 0x15 {

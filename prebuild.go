@@ -33,7 +33,7 @@ func ProbeTarget(ctx context.Context, config *Config) (*RealityProfile, error) {
 
 var (
 	probeOnces sync.Map
-	warmupOnce sync.Once
+	warmupDirs  sync.Map // per-dir dedup so WarmupProfiles can run for different dirs
 )
 
 func ensureAutoProbe(config *Config) {
@@ -83,54 +83,74 @@ func probeTargetRaw(dest, serverName string, alpnIndex int) (*RealityProfile, er
 		TLSVersion:   VersionTLS13,
 		RecordCount:  result.RecordCount,
 		CapturedAt:   time.Now(),
+		Dest:         dest,
+		ServerName:   serverName,
+		Source:       "probe",
 	}, nil
 }
 
 func WarmupProfiles(dir string) {
-	warmupOnce.Do(func() {
-		go func() {
-			if profileStore == nil {
-				return
-			}
-			var keys []string
-			globalCacheManager.entries.Range(func(key, val any) bool {
-				keys = append(keys, key.(string))
-				return true
-			})
-			if len(keys) == 0 {
-				return
-			}
+	// Per-directory dedup: each dir gets one warmup pass, resettable for tests.
+	if _, loaded := warmupDirs.LoadOrStore(dir, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		if profileStore == nil {
+			return
+		}
+		var keys []string
+		globalCacheManager.entries.Range(func(key, val any) bool {
+			keys = append(keys, key.(string))
+			return true
+		})
+		if len(keys) == 0 {
+			return
+		}
 
-			sem := make(chan struct{}, 5)
-			var wg sync.WaitGroup
-			for _, key := range keys {
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(k string) {
-					defer wg.Done()
-					defer func() { <-sem }()
+		sem := make(chan struct{}, 5)
+		var wg sync.WaitGroup
+		for _, key := range keys {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(k string) {
+				defer wg.Done()
+				defer func() { <-sem }()
 
-					// Parse dest, serverName, alpn from cache key.
-					// Format: "dest|serverName|alpn|0x0303"
-					parts := strings.SplitN(k, "|", 4)
-					if len(parts) < 3 {
-						return
-					}
-					dest := parts[0]
-					serverName := parts[1]
-					if dest == "" {
-						return
-					}
+				// Parse cache key. Supports both legacy (3 parts: serverName|alpn|ver)
+				// and V2 (5 parts: dest|serverName|alpn|ver|chClass) formats.
+				parts := strings.SplitN(k, "|", 5)
+				var dest, serverName, alpnStr string
+				if len(parts) >= 5 {
+					dest = parts[0]
+					serverName = parts[1]
+					alpnStr = parts[2]
+				} else if len(parts) >= 3 {
+					// Legacy key: serverName|alpn|ver -- dest unknown, skip.
+					return
+				} else {
+					return
+				}
+				if dest == "" {
+					return
+				}
 
-					alpnIndex := alpnToInt(parts[2])
+				alpnIndex := alpnToInt(alpnStr)
 
-					profileKey := CacheKey(serverName, parts[2], VersionTLS13)
-					globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
-						return probeTargetRaw(dest, serverName, alpnIndex)
-					})
-				}(key)
-			}
-			wg.Wait()
-		}()
+				profileKey := k // reuse the original V2 key for DoProbe lookup
+				globalCacheManager.DoProbe(profileKey, func() (*RealityProfile, error) {
+					return probeTargetRaw(dest, serverName, alpnIndex)
+				})
+			}(key)
+		}
+		wg.Wait()
+	}()
+}
+
+// ResetWarmupForTesting clears the warmup dedup map so WarmupProfiles can
+// be called again in subsequent test runs. Only for use in tests.
+func ResetWarmupForTesting() {
+	warmupDirs.Range(func(key, _ any) bool {
+		warmupDirs.Delete(key)
+		return true
 	})
 }

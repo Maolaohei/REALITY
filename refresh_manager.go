@@ -204,9 +204,35 @@ func (m *RefreshManager) Stop() {
 	m.mu.Lock()
 	if m.cancel != nil {
 		m.cancel()
+		m.cancel = nil
 	}
 	m.mu.Unlock()
 	m.wg.Wait()
+
+	// Clear targets and reset started flag so Start() can be called again.
+	m.mu.Lock()
+	m.targets = make(map[string]*refreshEntry)
+	m.started = false
+	m.mu.Unlock()
+}
+
+// GracefulShutdown stops the refresh manager and flushes the profile store
+// to disk. Call this on process exit (e.g. via signal handler or defer) to
+// ensure cached profiles are persisted.
+func (m *RefreshManager) GracefulShutdown() {
+	m.Stop()
+	if profileStore != nil {
+		profileStore.StopPeriodicSave()
+		profileStore.SaveOnShutdown()
+	}
+}
+
+// GracefulShutdownRefreshManager stops the global refresh manager and flushes
+// profiles. Safe to call when the manager has not been initialized.
+func GracefulShutdownRefreshManager() {
+	if globalRefreshManager != nil {
+		globalRefreshManager.GracefulShutdown()
+	}
 }
 
 // AddTarget registers a target for background refresh. If already registered,
