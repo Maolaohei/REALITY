@@ -22,6 +22,16 @@ type LookupResult struct {
 // LookupAmortize selects L0/L1/L2 based on mode and cached evidence.
 // chClass may be empty for legacy callers (falls back to legacy key).
 func (m *CacheManager) LookupAmortize(mode AmortizeMode, dest, serverName, alpn string, tlsVersion uint16, chClass string, liveCipher uint16, liveGroup CurveID) LookupResult {
+	return m.lookupAmortize(mode, dest, serverName, alpn, tlsVersion, chClass, "", liveCipher, liveGroup)
+}
+
+// LookupAmortizeSoft is like LookupAmortize but also probes softChClass for L1-only
+// dual-key fallback when the exact CH class misses (A5). Soft hits never L2.
+func (m *CacheManager) LookupAmortizeSoft(mode AmortizeMode, dest, serverName, alpn string, tlsVersion uint16, chClass, softChClass string, liveCipher uint16, liveGroup CurveID) LookupResult {
+	return m.lookupAmortize(mode, dest, serverName, alpn, tlsVersion, chClass, softChClass, liveCipher, liveGroup)
+}
+
+func (m *CacheManager) lookupAmortize(mode AmortizeMode, dest, serverName, alpn string, tlsVersion uint16, chClass, softChClass string, liveCipher uint16, liveGroup CurveID) LookupResult {
 	mode = ResolveAmortizeMode(mode)
 	if mode == AmortizeL0 {
 		return LookupResult{Path: PathL0}
@@ -31,6 +41,10 @@ func (m *CacheManager) LookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 	var keys []string
 	if chClass != "" {
 		keys = append(keys, CacheKeyV2(dest, serverName, alpn, tlsVersion, chClass))
+	}
+	// A5: soft class dual-key (exact miss recovery). Soft keys are L1-only.
+	if softChClass != "" && softChClass != chClass {
+		keys = append(keys, CacheKeyV2(dest, serverName, alpn, tlsVersion, softChClass))
 	}
 	// Legacy key for backward compatibility (L1 only; never L2).
 	keys = append(keys, CacheKey(serverName, alpn, tlsVersion))
@@ -65,8 +79,9 @@ func (m *CacheManager) LookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 		}
 		stale := entry.State == ProfileStale || expired
 
-		// L2 only on non-stale non-suspect V2 keys with full evidence (Wave-2 S1-lite).
-		if !suspect && !stale && !IsLegacyCacheKey(key) && profileL2Eligible(p) {
+		// L2 only on non-stale non-suspect V2 exact keys with full evidence (Wave-2 S1-lite).
+		// Soft dual-key hits are L1-only (A5) so presence-bit shards never zero-dial on soft match.
+		if !suspect && !stale && !IsLegacyCacheKey(key) && !isSoftCacheKey(key) && profileL2Eligible(p) {
 			if mode == AmortizeL2 || mode == AmortizeAuto {
 				if clientPolicyCompatible(p, liveCipher, liveGroup) {
 					cp := *p

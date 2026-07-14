@@ -47,6 +47,7 @@ type certPlanCacheKey struct {
 	mode    uint8
 	chainN  int
 	padHint int
+	metaFP  uint32 // dest leaf/chain meta fingerprint (0 = none)
 }
 
 var (
@@ -66,11 +67,23 @@ var (
 //
 // Hard invariant: grown plans must never make encrypt padding negative.
 // Split uses outer-record math; coalesced uses residual inner capacity.
+// GetCertPlan returns a plan sized for budget (no dest meta / shape hint).
 func GetCertPlan(budget int, mldsa bool, mode uint8) *CertPlan {
+	return GetCertPlanFor(budget, mldsa, mode, "", nil)
+}
+
+// GetCertPlanFor sizes a plan under budget, optionally using dest-learned leaf
+// metadata (A1) and chain-shape hints (A2). Auth remains Ed25519+HMAC.
+func GetCertPlanFor(budget int, mldsa bool, mode uint8, dest string, shape *CertShapeHint) *CertPlan {
 	if budget < 0 {
 		budget = 0
 	}
-	key := certPlanCacheKey{budget: budget, mldsa: mldsa, mode: mode}
+	meta := GetDestCertMeta(dest)
+	if shape == nil {
+		shape = ShapeHintFromMeta(meta)
+	}
+	mfp := metaFingerprint(meta)
+	key := certPlanCacheKey{budget: budget, mldsa: mldsa, mode: mode, metaFP: mfp}
 	certPlanMu.RLock()
 	if p, ok := certPlanCache[key]; ok {
 		certPlanMu.RUnlock()
@@ -78,21 +91,15 @@ func GetCertPlan(budget int, mldsa bool, mode uint8) *CertPlan {
 	}
 	certPlanMu.RUnlock()
 
-	p, err := buildCertPlan(budget, mldsa, mode)
+	p, err := buildCertPlan(budget, mldsa, mode, meta, shape)
 	if err != nil {
-		// Fall back to process-global minimal certs (init path).
 		return fallbackCertPlan(mldsa)
 	}
-	// Never cache a grown plan that cannot fit the observed Certificate record.
-	// Minimal leaf may still exceed a pathological tiny budget (target cert smaller
-	// than Ed25519 leaf+HMAC); encrypt will fail in that case - caller must keep
-	// dest TLS1.3 capture lens honest. Prefer minimal over oversized growth.
 	if budget > 0 {
 		over := false
 		if mode == RecordModeSplit {
 			over = !certPlanFitsBudget(p, budget)
 		} else if mode == RecordModeCoalesced {
-			// budget is residual INNER capacity.
 			over = !certPlanFitsInnerBudget(p, budget)
 		}
 		if over {
@@ -100,7 +107,6 @@ func GetCertPlan(budget int, mldsa bool, mode uint8) *CertPlan {
 			if min != nil && min.InnerMsgLen < p.InnerMsgLen {
 				p = min
 			}
-			// Do not cache oversize-for-budget plans.
 			return p
 		}
 	}
@@ -156,17 +162,19 @@ func MaxCertInnerForBudget(budget int) int {
 	return max
 }
 
-// coalescedFlightOverhead estimates non-Certificate handshake bytes in the
-// post-SH coalesced flight (EE + CertificateVerify + Finished) for typical
-// REALITY success paths: ALPN EE, Ed25519 CertificateVerify, TLS1.3 Finished.
-// Conservative (slightly high) so residual cert budget never overshoots R2.
-//
-// EE (h2 ALPN typical): ~32-48
-// CertificateVerify (Ed25519): 4 + 2 + 2 + 64 = 72
-// Finished (SHA256): 4 + 32 = 36
-// Plus small headroom for ALPN length variance.
+// C1 calibrated coalesced flight overhead (handshake message bytes only).
+// Measured against REALITY success-path marshalled sizes:
+//   EE (ALPN "h2"):            ~16-48 (use 40 typical + 40 headroom)
+//   CertificateVerify Ed25519: 4 + 2 + 2 + 64 = 72
+//   Finished SHA-256:          4 + 32 = 36
+// Baseline 40+72+36=148; +40 ALPN variance => 188. SafetyInner 48.
+// Only raise these constants if live EE grows; never lower without re-proof.
 const (
-	coalescedEECVFinishedOverhead = 48 + 72 + 36 + 32 // = 188
+	coalescedEETypical            = 40
+	coalescedCVEd25519            = 72
+	coalescedFinishedSHA256       = 36
+	coalescedEEHeadroom           = 40
+	coalescedEECVFinishedOverhead = coalescedEETypical + coalescedCVEd25519 + coalescedFinishedSHA256 + coalescedEEHeadroom // 188
 	coalescedSafetyInner          = 48
 )
 
@@ -192,6 +200,13 @@ func CoalescedCertBudget(r2Outer int) int {
 		return 0
 	}
 	return maxCert
+}
+
+// MeasureCoalescedFlightOverhead returns the conservative overhead constants
+// used by CoalescedCertBudget (for tests / calibration reports).
+func MeasureCoalescedFlightOverhead() (ee, cv, finished, headroom, total, safety int) {
+	return coalescedEETypical, coalescedCVEd25519, coalescedFinishedSHA256,
+		coalescedEEHeadroom, coalescedEECVFinishedOverhead, coalescedSafetyInner
 }
 
 // ResetCertPlanCacheForTesting clears the plan cache.
@@ -230,7 +245,7 @@ func fallbackCertPlan(mldsa bool) *CertPlan {
 	}
 }
 
-func buildCertPlan(budget int, mldsa bool, mode uint8) (*CertPlan, error) {
+func buildCertPlan(budget int, mldsa bool, mode uint8, meta *DestCertMeta, shape *CertShapeHint) (*CertPlan, error) {
 	if ed25519Priv == nil || len(ed25519Priv) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("ed25519 key not initialized")
 	}
@@ -241,7 +256,7 @@ func buildCertPlan(budget int, mldsa bool, mode uint8) (*CertPlan, error) {
 	if mldsa {
 		extVal = make([]byte, mldsa65SigSize)
 	}
-	leaf, err := createLeaf(pub, ed25519Priv, extVal, 0)
+	leaf, err := createLeaf(pub, ed25519Priv, extVal, 0, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -267,14 +282,14 @@ func buildCertPlan(budget int, mldsa bool, mode uint8) (*CertPlan, error) {
 	}
 
 	if targetInner > 0 {
-		leaf, chain = growCertsToward(pub, ed25519Priv, leaf, mldsa, targetInner)
+		leaf, chain = growCertsToward(pub, ed25519Priv, leaf, mldsa, targetInner, meta, shape)
 	}
 
 	// If growth still overshot, discard fillers and keep minimal leaf.
 	if targetInner > 0 {
 		inner := estimateCertMsgLen(leaf, chain)
 		if maxInner > 0 && inner > maxInner {
-			leaf, err = createLeaf(pub, ed25519Priv, extVal, 0)
+			leaf, err = createLeaf(pub, ed25519Priv, extVal, 0, meta)
 			if err != nil {
 				return nil, err
 			}
@@ -312,37 +327,65 @@ func buildCertPlan(budget int, mldsa bool, mode uint8) (*CertPlan, error) {
 	}, nil
 }
 
-func createLeaf(pub ed25519.PublicKey, priv ed25519.PrivateKey, extVal []byte, subjectPad int) ([]byte, error) {
+func createLeaf(pub ed25519.PublicKey, priv ed25519.PrivateKey, extVal []byte, subjectPad int, meta *DestCertMeta) ([]byte, error) {
 	// Realistic-ish leaf metadata (NotBefore/NotAfter/Serial/KU/EKU/SAN).
 	// Auth still overwrites the Ed25519 signature slot with HMAC; these fields
-	// only improve passive certificate-shape fidelity.
-	now := time.Now().UTC()
+	// only improve passive certificate-shape fidelity (A1: prefer dest meta).
+	now := truncatedPlanTime() // B3: minute-truncated for plan cache stability
 	serial := big.NewInt(now.UnixNano())
 	if serial.Sign() <= 0 {
 		serial = big.NewInt(1)
 	}
 	notBefore := now.Add(-30 * 24 * time.Hour)
 	notAfter := now.Add(365 * 24 * time.Hour)
-
+	org := "Cloud"
 	cn := "www.example.com"
-	if subjectPad > 0 {
+	dns := []string{cn}
+
+	if meta != nil {
+		if meta.CN != "" {
+			cn = meta.CN
+		}
+		if meta.Organization != "" {
+			org = meta.Organization
+		}
+		if !meta.NotBefore.IsZero() && !meta.NotAfter.IsZero() && meta.NotAfter.After(meta.NotBefore) {
+			notBefore = meta.NotBefore
+			notAfter = meta.NotAfter
+			if notAfter.Before(now) {
+				notBefore = now.Add(-30 * 24 * time.Hour)
+				notAfter = now.Add(365 * 24 * time.Hour)
+			}
+		}
+		if len(meta.DNSNames) > 0 {
+			dns = append([]string(nil), meta.DNSNames...)
+			if cn == "www.example.com" || cn == "" {
+				cn = meta.DNSNames[0]
+			}
+		} else if meta.CN != "" {
+			dns = []string{meta.CN}
+		}
+	}
+
+	if subjectPad > 0 && meta == nil {
 		pad := make([]byte, subjectPad)
 		for i := range pad {
 			pad[i] = 'a'
 		}
 		cn = string(pad)
+		dns = []string{cn}
 	}
 
 	tpl := x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: cn, Organization: []string{"Cloud"}},
+		Subject:               pkix.Name{CommonName: cn, Organization: []string{org}},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
-		DNSNames:              []string{cn},
+		DNSNames:              dns,
 	}
 	if len(extVal) > 0 {
 		// REALITY auth OID first so legacy Extensions[0] readers still work.
@@ -354,41 +397,58 @@ func createLeaf(pub ed25519.PublicKey, priv ed25519.PrivateKey, extVal []byte, s
 	return x509.CreateCertificate(rand.Reader, &tpl, &tpl, pub, priv)
 }
 
-func growCertsToward(pub ed25519.PublicKey, priv ed25519.PrivateKey, leaf []byte, mldsa bool, targetInner int) ([]byte, [][]byte) {
+func growCertsToward(pub ed25519.PublicKey, priv ed25519.PrivateKey, leaf []byte, mldsa bool, targetInner int, meta *DestCertMeta, shape *CertShapeHint) ([]byte, [][]byte) {
 	chain := [][]byte{}
 	cur := estimateCertMsgLen(leaf, chain)
 	if cur >= targetInner {
 		return leaf, chain
 	}
 
-	// 1) Subject padding on leaf (up to 256 bytes of CN). Accept only if still <= target.
-	for step := 32; step <= 256 && cur < targetInner; step += 32 {
-		extVal := []byte{}
-		if mldsa {
-			extVal = make([]byte, mldsa65SigSize)
+	// Max intermediate count (not including leaf). Default 3; dest shape may prefer fewer (A2).
+	maxIntermediates := 3
+	if shape != nil && shape.PreferredChainDepth > 0 {
+		wantInter := shape.PreferredChainDepth - 1
+		if wantInter < 0 {
+			wantInter = 0
 		}
-		nl, err := createLeaf(pub, priv, extVal, step)
-		if err != nil {
-			break
+		if wantInter < maxIntermediates {
+			maxIntermediates = wantInter
 		}
-		nCur := estimateCertMsgLen(nl, chain)
-		if nCur > targetInner {
-			break
-		}
-		leaf = nl
-		cur = nCur
 	}
 
-	// 2) Intermediate fillers (up to 3) for CDN-like chain shape.
-	// Binary-search each filler so residual budget is consumed tightly.
-	for len(chain) < 3 && cur < targetInner {
+	// 1) Subject padding on leaf only when no dest meta (meta CN is identity).
+	if meta == nil {
+		for step := 32; step <= 256 && cur < targetInner; step += 32 {
+			extVal := []byte{}
+			if mldsa {
+				extVal = make([]byte, mldsa65SigSize)
+			}
+			nl, err := createLeaf(pub, priv, extVal, step, meta)
+			if err != nil {
+				break
+			}
+			nCur := estimateCertMsgLen(nl, chain)
+			if nCur > targetInner {
+				break
+			}
+			leaf = nl
+			cur = nCur
+		}
+	}
+
+	// 2) Intermediate fillers for CDN-like chain shape (A2 dest sizes when known).
+	for len(chain) < maxIntermediates && cur < targetInner {
 		need := targetInner - cur
-		// TLS entry overhead ~5; refuse tiny residuals that cannot hold a cert.
 		if need < 96 {
 			break
 		}
-		// Prefer one large filler when residual is big; leave room for DER noise.
 		want := need - 8
+		if shape != nil && len(shape.TargetChainLens) > len(chain)+1 {
+			hint := shape.TargetChainLens[len(chain)+1]
+			if hint > 64 && hint < want {
+				want = hint
+			}
+		}
 		if want < 64 {
 			break
 		}
@@ -401,7 +461,6 @@ func growCertsToward(pub ed25519.PublicKey, priv ed25519.PrivateKey, leaf []byte
 		if nCur > targetInner {
 			break
 		}
-		// Reject trivial progress that wastes a chain slot without meaningful length.
 		if nCur-cur < 48 {
 			break
 		}
@@ -409,24 +468,36 @@ func growCertsToward(pub ed25519.PublicKey, priv ed25519.PrivateKey, leaf []byte
 		cur = nCur
 	}
 
-	// 3) Length-only extension padding on the leaf when still short.
-	// Safe without ML-DSA: ML-DSA keeps a fixed 3309-byte value and residual
-	// after chain growth is left for AEAD record padding (intentional).
-	if cur < targetInner && !mldsa {
+	// 3) Length-only extension padding. C2: ML-DSA keeps first mldsa65SigSize
+	// bytes as the auth slot; extra bytes after that are length noise only.
+	if cur < targetInner {
 		need := targetInner - cur
 		if need > 16 {
-			// Binary search pad length for tight fit under targetInner.
 			lo, hi := 8, need-8
 			if hi > 4000 {
 				hi = 4000
+			}
+			if mldsa {
+				lo = mldsa65SigSize + 8
+				hi = mldsa65SigSize + (need - 8)
+				if hi > mldsa65SigSize+4000 {
+					hi = mldsa65SigSize + 4000
+				}
+				if hi < lo {
+					hi = lo
+				}
 			}
 			bestLeaf := leaf
 			bestCur := cur
 			for lo <= hi {
 				mid := (lo + hi) / 2
 				extVal := make([]byte, mid)
-				nl, err := createLeaf(pub, priv, extVal, 0)
+				nl, err := createLeaf(pub, priv, extVal, 0, meta)
 				if err != nil {
+					hi = mid - 1
+					continue
+				}
+				if mldsa && locateMLDSAOffset(nl) < 0 {
 					hi = mid - 1
 					continue
 				}
@@ -604,6 +675,7 @@ func MaterializeCert(plan *CertPlan, authKey []byte, mldsaKey []byte, clientHell
 	if plan == nil || len(plan.LeafDER) == 0 {
 		return nil, fmt.Errorf("nil cert plan")
 	}
+	// B1: one leaf copy (HMAC mutates signature slot); intermediate DERs are shared.
 	leaf := make([]byte, len(plan.LeafDER))
 	copy(leaf, plan.LeafDER)
 
@@ -611,16 +683,13 @@ func MaterializeCert(plan *CertPlan, authKey []byte, mldsaKey []byte, clientHell
 	if off < 0 || off+64 > len(leaf) {
 		off = len(leaf) - 64
 	}
-	// Hot path: one HMAC-SHA512; no intermediate DER copies.
 	h := hmac.New(sha512.New, authKey)
 	if len(ed25519Priv) >= 64 {
 		h.Write(ed25519Priv[32:])
 	}
-	sum := h.Sum(nil)
-	copy(leaf[off:off+64], sum)
+	copy(leaf[off:off+64], h.Sum(nil))
 
 	if len(mldsaKey) > 0 && plan.MLDSAOffset >= 0 && plan.MLDSALen > 0 {
-		// Continue same HMAC state with CH||SH (matches handshake_server_tls13).
 		h.Write(clientHelloOrig)
 		h.Write(serverHelloOrig)
 		key, err := mldsa65.Scheme().UnmarshalBinaryPrivateKey(mldsaKey)

@@ -1,4 +1,4 @@
-package reality
+﻿package reality
 
 import (
 	"context"
@@ -105,6 +105,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	// --- Phase 3: path selection ---
 	alpn := clientALPN(hs.clientHello)
 	chClass := ClassifyClientHello(hs.clientHello)
+	softClass := SoftClassifyClientHello(hs.clientHello)
 	mode := ResolveAmortizeMode(config.AmortizeMode)
 
 	// Unsuitable dest: mirror even after auth (anti-probe; no synthetic TLS1.3 success).
@@ -124,7 +125,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	}
 
 	// Pre-lookup without live cipher (for L2 eligibility).
-	pre := globalCacheManager.LookupAmortize(mode, config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass, 0, 0)
+	pre := globalCacheManager.LookupAmortizeSoft(mode, config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass, softClass, 0, 0)
 	path := pre.Path
 	profileKey := pre.Key
 	if profileKey == "" {
@@ -187,7 +188,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		return nil, errors.New("REALITY: failed to replay ClientHello to dest: " + err.Error())
 	}
 
-	usedLen, helloMsg, r0Template, capturedPath, err := captureTargetRecords(target, &hs, config, mode, chClass, alpn, show, remoteAddr)
+	usedLen, helloMsg, r0Template, capturedPath, err := captureTargetRecords(target, &hs, config, mode, chClass, softClass, alpn, show, remoteAddr)
 	if err != nil || helloMsg == nil || usedLen[0] == 0 {
 		// Mirror remaining like legacy failure path.
 		NoteDestCaptureFailure(config.Dest, classifyCaptureError(err))
@@ -253,6 +254,24 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	// Also store under legacy key for backward-compatible L1 hits.
 	v2Key := CacheKeyV2(config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass)
 	globalCacheManager.StoreObservation(v2Key, obs)
+	// A5: also index under soft class for L1 dual-key recovery.
+	if softClass != "" && softClass != chClass {
+		softObs := *obs
+		softObs.CHClass = softClass
+		// Soft keys are L1-only (isSoftCacheKey); keep evidence ladder conservative.
+		if softObs.LiveEvidence > 1 {
+			softObs.LiveEvidence = 1
+		}
+		if softObs.Evidence > 1 {
+			softObs.Evidence = 1
+		}
+		softKey := CacheKeyV2(config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, softClass)
+		globalCacheManager.StoreObservation(softKey, &softObs)
+	}
+	// B2: warm common CertPlan entries for this dest after live observation.
+	if config.Dest != "" {
+		go WarmCertPlansForDest(config.Dest)
+	}
 	// Legacy key for FindCachedProfileByDest / older L1 path.
 	legacyKey := CacheKey(hs.clientHello.serverName, alpn, VersionTLS13)
 	legacyObs := *obs
@@ -522,7 +541,7 @@ func runL2Handshake(hs *serverHandshakeStateTLS13, profile *RealityProfile, show
 }
 
 // captureTargetRecords reads R0 (always) and R1-R6 (unless L1 cache hit).
-func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config *Config, mode AmortizeMode, chClass, alpn string, show bool, remoteAddr string) (usedLen [7]int, hello *serverHelloMsg, r0Template []byte, path AmortizePath, err error) {
+func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config *Config, mode AmortizeMode, chClass, softClass, alpn string, show bool, remoteAddr string) (usedLen [7]int, hello *serverHelloMsg, r0Template []byte, path AmortizePath, err error) {
 	path = PathL0
 	bufPtr := recordBufPool.Get().(*[]byte)
 	buf := *bufPtr
@@ -590,7 +609,7 @@ func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config
 			}
 			if i == 2 && handshakeLen > 512 {
 				// Large EE: same special-case as legacy (buffer, break early for this record).
-				// Do NOT use the pool buffer here ?it will be returned to the pool
+				// Do NOT use the pool buffer here - it will be returned to the pool
 				// via defer while handshakeBuf is still live in the Conn. Instead
 				// allocate a dedicated slice that the caller owns.
 				usedLen[i] = handshakeLen
@@ -619,7 +638,7 @@ func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config
 
 				// L1 fast path after live R0.
 				if ResolveAmortizeMode(mode) != AmortizeL0 {
-					res := globalCacheManager.LookupAmortize(mode, config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass, hello.cipherSuite, hello.serverShare.group)
+					res := globalCacheManager.LookupAmortizeSoft(mode, config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass, softClass, hello.cipherSuite, hello.serverShare.group)
 					if res.Path == PathL1 && res.Profile != nil && ValidateRecordLens(res.Profile.RecordLens) {
 						for ci := 1; ci < 7; ci++ {
 							usedLen[ci] = res.Profile.RecordLens[ci]

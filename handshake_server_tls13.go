@@ -185,7 +185,17 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 			// still targets handshakeLen[2]; cert growth only consumes residual.
 			budget = CoalescedCertBudget(c.out.handshakeLen[2])
 		}
-		plan := GetCertPlan(budget, mldsa, mode)
+		dest := ""
+		if c.config != nil {
+			dest = c.config.Dest
+			if dest == "" {
+				dest = c.config.ServerName
+			}
+		}
+		if dest == "" && hs.clientHello != nil {
+			dest = hs.clientHello.serverName
+		}
+		plan := GetCertPlanFor(budget, mldsa, mode, dest, nil)
 		// Hard guard: never emit a plan that makes encrypt padding negative.
 		if plan != nil && budget > 0 {
 			if mode == RecordModeSplit && !certPlanFitsBudget(plan, budget) {

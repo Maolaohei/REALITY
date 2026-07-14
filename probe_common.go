@@ -3,6 +3,7 @@ package reality
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,9 @@ type ProbeResult struct {
 	CipherSuite uint16
 	RecordLens  [7]int
 	RecordCount int
+	// CertMeta is display-only leaf/chain shape learned from the probe peer
+	// certificates (A1/A2). Never used for REALITY authentication.
+	CertMeta *DestCertMeta
 }
 
 // probeConn is a net.Conn wrapper that captures all bytes read from the server
@@ -97,17 +101,17 @@ func selectFingerprintAndALPN(alpn int) (utls.ClientHelloID, []string) {
 // to send a real ClientHello, and captures the raw server response bytes.
 // The caller must provide ctx for timeout/cancellation, dest for the target
 // address, serverName for SNI, and alpn for ALPN selection (0/1/2).
-func dialAndProbe(ctx context.Context, dest, serverName string, alpn int, xver byte) ([]byte, error) {
+func dialAndProbe(ctx context.Context, dest, serverName string, alpn int, xver byte) (data []byte, peerCerts []*x509.Certificate, err error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", dest)
 	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
+		return nil, nil, fmt.Errorf("dial: %w", err)
 	}
 
 	if xver == 1 || xver == 2 {
 		if _, err = proxyproto.HeaderProxyFromAddrs(xver, conn.LocalAddr(), conn.RemoteAddr()).WriteTo(conn); err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("proxy proto: %w", err)
+			return nil, nil, fmt.Errorf("proxy proto: %w", err)
 		}
 	}
 
@@ -122,7 +126,11 @@ func dialAndProbe(ctx context.Context, dest, serverName string, alpn int, xver b
 
 	if err = uConn.Handshake(); err != nil {
 		pConn.Close()
-		return nil, fmt.Errorf("utls handshake: %w", err)
+		return nil, nil, fmt.Errorf("utls handshake: %w", err)
+	}
+	// Learn peer cert chain for A1/A2 fidelity (display-only).
+	if st := uConn.ConnectionState(); len(st.PeerCertificates) > 0 {
+		peerCerts = st.PeerCertificates
 	}
 
 	// Drain any remaining server data (post-handshake records like
@@ -136,7 +144,7 @@ func dialAndProbe(ctx context.Context, dest, serverName string, alpn int, xver b
 	}
 
 	pConn.Close()
-	return pConn.capturedBytes(), nil
+	return pConn.capturedBytes(), peerCerts, nil
 }
 
 // parseRecordLens parses TLS record lengths from raw captured bytes.
@@ -197,7 +205,7 @@ func parseRecordLens(data []byte) (lens [7]int, cipherSuite uint16, ok bool) {
 		if recordIndex >= 7 {
 			break
 		}
-		// No more data available — partial capture, accept what we have.
+		// No more data available 鈥?partial capture, accept what we have.
 		break
 	}
 
@@ -216,7 +224,7 @@ func parseRecordLens(data []byte) (lens [7]int, cipherSuite uint16, ok bool) {
 //   - alpn: ALPN selector (0=none, 1=http/1.1, 2=h2+http/1.1)
 //   - xver: PROXY protocol version (0=disabled, 1=v1, 2=v2)
 func ProbeTargetViaUTLS(ctx context.Context, dest, serverName string, alpn int, xver byte) (*ProbeResult, error) {
-	data, err := dialAndProbe(ctx, dest, serverName, alpn, xver)
+	data, peerCerts, err := dialAndProbe(ctx, dest, serverName, alpn, xver)
 	if err != nil {
 		return nil, err
 	}
@@ -233,9 +241,23 @@ func ProbeTargetViaUTLS(ctx context.Context, dest, serverName string, alpn int, 
 		}
 	}
 
+	var meta *DestCertMeta
+	if len(peerCerts) > 0 {
+		// Index by dest and by SNI/serverName for handshake lookup.
+		meta = LearnDestCertMetaFromChain(dest, peerCerts)
+		if serverName != "" && serverName != dest {
+			LearnDestCertMetaFromChain(serverName, peerCerts)
+		}
+		// B2: warm CertPlans after probe-learned meta so first success path is hot.
+		if dest != "" {
+			go WarmCertPlansForDest(dest)
+		}
+	}
+
 	return &ProbeResult{
 		CipherSuite: cs,
 		RecordLens:  lens,
 		RecordCount: recordCount,
+		CertMeta:    meta,
 	}, nil
 }

@@ -386,3 +386,261 @@ func BenchmarkMaterializeCert(b *testing.B) {
 		}
 	}
 }
+
+
+func TestDestCertMeta_MaterializeLeafFields(t *testing.T) {
+	if initErr != nil {
+		t.Fatalf("init: %v", initErr)
+	}
+	ResetCertPlanCacheForTesting()
+	ResetDestCertMetaForTesting()
+	meta := &DestCertMeta{
+		CN:           "cdn.example.net",
+		DNSNames:     []string{"cdn.example.net", "www.cdn.example.net"},
+		Organization: "Example Org",
+		NotBefore:    time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
+		NotAfter:     time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		ChainDepth:   2,
+		ChainLens:    []int{900, 1100},
+		LeafLen:      900,
+	}
+	NoteDestCertMeta("cdn.example.net:443", meta)
+	plan := GetCertPlanFor(0, false, RecordModeSplit, "cdn.example.net:443", nil)
+	if plan == nil {
+		t.Fatal("nil plan")
+	}
+	authKey := make([]byte, 32)
+	for i := range authKey {
+		authKey[i] = byte(i + 3)
+	}
+	chain, err := MaterializeCert(plan, authKey, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(chain[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cert.Subject.CommonName != "cdn.example.net" {
+		t.Fatalf("CN=%q", cert.Subject.CommonName)
+	}
+	if len(cert.Subject.Organization) == 0 || cert.Subject.Organization[0] != "Example Org" {
+		t.Fatalf("Org=%v", cert.Subject.Organization)
+	}
+	found := false
+	for _, d := range cert.DNSNames {
+		if d == "cdn.example.net" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("SAN missing: %v", cert.DNSNames)
+	}
+	pub, ok := cert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		t.Fatal("not ed25519")
+	}
+	h := hmac.New(sha512.New, authKey)
+	h.Write(pub)
+	if !hmac.Equal(h.Sum(nil), cert.Signature) {
+		t.Fatal("HMAC auth broken under dest meta")
+	}
+}
+
+func TestCertShapeHint_PrefersDestDepth(t *testing.T) {
+	if initErr != nil {
+		t.Fatalf("init: %v", initErr)
+	}
+	ResetCertPlanCacheForTesting()
+	ResetDestCertMetaForTesting()
+	meta := &DestCertMeta{CN: "leafonly.example", ChainDepth: 1, ChainLens: []int{800}}
+	NoteDestCertMeta("leafonly.example:443", meta)
+	budget := 4000
+	plan := GetCertPlanFor(budget, false, RecordModeSplit, "leafonly.example:443", ShapeHintFromMeta(meta))
+	if plan == nil {
+		t.Fatal("nil plan")
+	}
+	if len(plan.ChainDERs) > 0 {
+		t.Fatalf("expected no intermediates under depth=1, got %d", len(plan.ChainDERs))
+	}
+}
+
+func TestSoftClassifyClientHello_DualKey(t *testing.T) {
+	base := &clientHelloMsg{
+		cipherSuites:                 []uint16{0x1301, 0x1302},
+		supportedCurves:              []CurveID{X25519},
+		keyShares:                    []keyShare{{group: X25519, data: make([]byte, 32)}},
+		supportedVersions:            []uint16{VersionTLS13},
+		supportedSignatureAlgorithms: []SignatureScheme{Ed25519},
+		alpnProtocols:                []string{"h2"},
+		serverName:                   "soft.example",
+	}
+	exactNone := ClassifyClientHello(base)
+	softNone := SoftClassifyClientHello(base)
+	if softNone == "" || softNone[:2] != "s:" {
+		t.Fatalf("soft class missing s: prefix: %q", softNone)
+	}
+	if softNone == exactNone {
+		t.Fatal("soft class must differ from exact (prefix)")
+	}
+	withSCT := *base
+	withSCT.scts = true
+	withOCSP := *base
+	withOCSP.ocspStapling = true
+	if ClassifyClientHello(&withSCT) == exactNone {
+		t.Fatal("exact SCT should differ")
+	}
+	if ClassifyClientHello(&withOCSP) == exactNone {
+		t.Fatal("exact OCSP should differ")
+	}
+	softSCT := SoftClassifyClientHello(&withSCT)
+	softOCSP := SoftClassifyClientHello(&withOCSP)
+	if softSCT != softOCSP {
+		t.Fatalf("soft should collapse SCT/OCSP: %q vs %q", softSCT, softOCSP)
+	}
+	if softSCT == softNone {
+		t.Fatal("soft with SCT/OCSP should differ from no-status soft")
+	}
+	key := CacheKeyV2("d:443", "sni", "h2", VersionTLS13, softSCT)
+	if !isSoftCacheKey(key) {
+		t.Fatal("expected soft cache key")
+	}
+	exactKey := CacheKeyV2("d:443", "sni", "h2", VersionTLS13, exactNone)
+	if isSoftCacheKey(exactKey) {
+		t.Fatal("exact key must not be soft")
+	}
+}
+
+func TestLookupAmortizeSoft_L1OnlyNeverL2(t *testing.T) {
+	m := NewCacheManager()
+	dest := "soft-l2.example:443"
+	sni := "soft-l2.example"
+	alpn := "h2"
+	exact := "c:exact-test"
+	soft := "s:soft-test"
+	p := &RealityProfile{
+		RecordLens:          [7]int{200, 6, 40, 500, 100, 60, 0},
+		CipherSuite:         0x1301,
+		KeyShareGroup:       X25519,
+		TLSVersion:          VersionTLS13,
+		ALPN:                alpn,
+		Dest:                dest,
+		ServerName:          sni,
+		CHClass:             soft,
+		Evidence:            10,
+		LiveEvidence:        10,
+		Stability:           10,
+		ServerHelloTemplate: []byte{0x01, 0x02},
+		Source:              "live",
+		CapturedAt:          time.Now(),
+		RecordMode:          RecordModeSplit,
+	}
+	softKey := CacheKeyV2(dest, sni, alpn, VersionTLS13, soft)
+	m.StoreObservation(softKey, p)
+	res := m.LookupAmortizeSoft(AmortizeAuto, dest, sni, alpn, VersionTLS13, exact, soft, 0x1301, X25519)
+	if res.Path != PathL1 {
+		t.Fatalf("soft dual-key want L1 got %v", res.Path)
+	}
+	if res.Profile == nil {
+		t.Fatal("nil profile on soft hit")
+	}
+	res2 := m.LookupAmortize(AmortizeAuto, dest, sni, alpn, VersionTLS13, soft, 0x1301, X25519)
+	if res2.Path == PathL2 {
+		t.Fatal("soft cache key must never promote L2")
+	}
+}
+
+func TestMeasureCoalescedFlightOverhead_Constants(t *testing.T) {
+	ee, cv, fin, head, total, safety := MeasureCoalescedFlightOverhead()
+	if ee != 40 || cv != 72 || fin != 36 || head != 40 {
+		t.Fatalf("components ee=%d cv=%d fin=%d head=%d", ee, cv, fin, head)
+	}
+	if total != 188 {
+		t.Fatalf("total=%d want 188", total)
+	}
+	if safety != 48 {
+		t.Fatalf("safety=%d want 48", safety)
+	}
+	if total != ee+cv+fin+head {
+		t.Fatal("total mismatch sum")
+	}
+}
+
+func TestCertPlan_MLDSAGrowthPastMinimal(t *testing.T) {
+	if initErr != nil {
+		t.Fatalf("init: %v", initErr)
+	}
+	ResetCertPlanCacheForTesting()
+	minimal := GetCertPlan(0, true, RecordModeSplit)
+	if minimal == nil {
+		t.Fatal("nil minimal mldsa")
+	}
+	if minimal.MLDSAOffset < 0 {
+		t.Fatal("minimal mldsa offset missing")
+	}
+	plan := GetCertPlan(4500, true, RecordModeSplit)
+	if plan == nil {
+		t.Fatal("nil grown mldsa")
+	}
+	if plan.InnerMsgLen <= minimal.InnerMsgLen {
+		t.Fatalf("expected ML-DSA growth under large budget: plan=%d min=%d", plan.InnerMsgLen, minimal.InnerMsgLen)
+	}
+	if plan.MLDSAOffset < 0 {
+		t.Fatal("grown plan lost MLDSA offset")
+	}
+	if !certPlanFitsBudget(plan, 4500) {
+		t.Fatalf("grown plan overshoots budget: inner=%d", plan.InnerMsgLen)
+	}
+	authKey := make([]byte, 32)
+	chain, err := MaterializeCert(plan, authKey, nil, []byte{1}, []byte{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain) == 0 {
+		t.Fatal("empty chain")
+	}
+	cert, err := x509.ParseCertificate(chain[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cert.PublicKey.(ed25519.PublicKey); !ok {
+		t.Fatal("not ed25519 after ML-DSA growth")
+	}
+}
+
+func TestWarmCertPlansForDest_PopulatesCache(t *testing.T) {
+	if initErr != nil {
+		t.Fatalf("init: %v", initErr)
+	}
+	ResetCertPlanCacheForTesting()
+	ResetDestCertMetaForTesting()
+	NoteDestCertMeta("warm.example:443", &DestCertMeta{CN: "warm.example", ChainDepth: 2})
+	before := certPlanWarmCount.Load()
+	WarmCertPlansForDest("warm.example:443")
+	after := certPlanWarmCount.Load()
+	if after <= before {
+		t.Fatal("warm counter did not advance")
+	}
+	p1 := GetCertPlanFor(1500, false, RecordModeSplit, "warm.example:443", nil)
+	p2 := GetCertPlanFor(1500, false, RecordModeSplit, "warm.example:443", nil)
+	if p1 == nil || p2 == nil {
+		t.Fatal("nil plan after warm")
+	}
+	if p1 != p2 {
+		t.Fatal("expected cached plan pointer reuse")
+	}
+}
+
+func TestTruncatedPlanTime_MinuteStable(t *testing.T) {
+	old := certPlanTimeNow
+	defer func() { certPlanTimeNow = old }()
+	certPlanTimeNow = func() time.Time {
+		return time.Date(2026, 7, 15, 12, 34, 56, 789, time.UTC)
+	}
+	got := truncatedPlanTime()
+	want := time.Date(2026, 7, 15, 12, 34, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}

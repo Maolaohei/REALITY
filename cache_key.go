@@ -106,3 +106,12 @@ func trimPrefix(s, prefix string) string {
 	}
 	return s
 }
+
+// isSoftCacheKey reports whether a V2 key's chClass is a soft dual-key class (A5).
+func isSoftCacheKey(key string) bool {
+	_, _, _, _, ch, ok := ParseCacheKeyV2(key)
+	if !ok {
+		return false
+	}
+	return len(ch) >= 2 && ch[0] == 's' && ch[1] == ':'
+}
