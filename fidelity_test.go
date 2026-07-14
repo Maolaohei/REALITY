@@ -191,18 +191,83 @@ func TestCertPlan_GrowUnderLargeBudget(t *testing.T) {
 		t.Fatalf("init: %v", initErr)
 	}
 	ResetCertPlanCacheForTesting()
-	// Large RSA-like outer cert record should allow growth but still fit.
-	budget := 2500
-	plan := GetCertPlan(budget, false, RecordModeSplit)
-	if plan == nil {
-		t.Fatal("nil")
-	}
-	if !certPlanFitsBudget(plan, budget) {
-		t.Fatalf("does not fit inner=%d", plan.InnerMsgLen)
-	}
 	minimal := GetCertPlan(0, false, RecordModeSplit)
-	if plan.InnerMsgLen <= minimal.InnerMsgLen {
-		// Growth is best-effort; not fatal if residual too small after safety.
-		t.Logf("no growth: plan=%d minimal=%d (ok if safety margin)", plan.InnerMsgLen, minimal.InnerMsgLen)
+	if minimal == nil {
+		t.Fatal("nil minimal")
+	}
+
+	// Large RSA-like outer cert records must grow and still fit budget.
+	for _, budget := range []int{1500, 2500, 4000} {
+		ResetCertPlanCacheForTesting()
+		plan := GetCertPlan(budget, false, RecordModeSplit)
+		if plan == nil {
+			t.Fatalf("budget=%d nil", budget)
+		}
+		if !certPlanFitsBudget(plan, budget) {
+			t.Fatalf("budget=%d does not fit inner=%d", budget, plan.InnerMsgLen)
+		}
+		maxInner := MaxCertInnerForBudget(budget)
+		if plan.InnerMsgLen <= minimal.InnerMsgLen {
+			t.Fatalf("budget=%d expected growth: plan=%d minimal=%d", budget, plan.InnerMsgLen, minimal.InnerMsgLen)
+		}
+		// Fill at least 70% of usable inner capacity (safety margin is 32 bytes).
+		// Residual may remain for AEAD record padding; do not require 100%.
+		minFill := (maxInner * 7) / 10
+		if plan.InnerMsgLen < minFill {
+			t.Fatalf("budget=%d underfilled: inner=%d minFill=%d maxInner=%d",
+				budget, plan.InnerMsgLen, minFill, maxInner)
+		}
+		// Materialized length must match estimate and stay under maxInner.
+		authKey := make([]byte, 32)
+		chain, err := MaterializeCert(plan, authKey, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("budget=%d materialize: %v", budget, err)
+		}
+		m := estimateCertMsgLen(chain[0], chain[1:])
+		if m > maxInner {
+			t.Fatalf("budget=%d materialized %d > max %d", budget, m, maxInner)
+		}
+		if m != plan.InnerMsgLen {
+			t.Fatalf("budget=%d materialize len %d != plan.InnerMsgLen %d", budget, m, plan.InnerMsgLen)
+		}
+	}
+}
+
+func TestCertPlan_AuthInvariantEd25519HMAC(t *testing.T) {
+	if initErr != nil {
+		t.Fatalf("init: %v", initErr)
+	}
+	ResetCertPlanCacheForTesting()
+	// Grown chain still authenticates via leaf Ed25519 HMAC only.
+	plan := GetCertPlan(3000, false, RecordModeSplit)
+	authKey := make([]byte, 32)
+	for i := range authKey {
+		authKey[i] = byte(i + 3)
+	}
+	chain, err := MaterializeCert(plan, authKey, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain) < 1 {
+		t.Fatal("empty chain")
+	}
+	cert, err := x509.ParseCertificate(chain[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, ok := cert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		t.Fatal("leaf must remain Ed25519")
+	}
+	h := hmac.New(sha512.New, authKey)
+	h.Write(pub)
+	if !hmac.Equal(h.Sum(nil), cert.Signature) {
+		t.Fatal("HMAC slot mismatch on grown cert")
+	}
+	// Fillers (if any) are not auth material; ensure they parse.
+	for i := 1; i < len(chain); i++ {
+		if _, err := x509.ParseCertificate(chain[i]); err != nil {
+			t.Fatalf("filler[%d] parse: %v", i, err)
+		}
 	}
 }

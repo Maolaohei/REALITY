@@ -80,7 +80,7 @@ func GetCertPlan(budget int, mldsa bool, mode uint8) *CertPlan {
 	}
 	// Never cache a grown plan that cannot fit the observed Certificate record.
 	// Minimal leaf may still exceed a pathological tiny budget (target cert smaller
-	// than Ed25519 leaf+HMAC); encrypt will fail in that case — caller must keep
+	// than Ed25519 leaf+HMAC); encrypt will fail in that case - caller must keep
 	// dest TLS1.3 capture lens honest. Prefer minimal over oversized growth.
 	if mode == RecordModeSplit && budget > 0 && !certPlanFitsBudget(p, budget) {
 		min := fallbackCertPlan(mldsa)
@@ -290,80 +290,127 @@ func growCertsToward(pub ed25519.PublicKey, priv ed25519.PrivateKey, leaf []byte
 		cur = nCur
 	}
 
-	// 2) Intermediate fillers (1-2 certs) for CDN-like chain shape.
-	// Never append a filler that pushes over targetInner.
-	for len(chain) < 2 && cur < targetInner {
+	// 2) Intermediate fillers (up to 3) for CDN-like chain shape.
+	// Binary-search each filler so residual budget is consumed tightly.
+	for len(chain) < 3 && cur < targetInner {
 		need := targetInner - cur
-		// Each chain entry adds 3+len+2 overhead in TLS1.3 cert msg.
-		fill := need - 32 // leave room for DER/TLS entry overhead
-		if fill < 64 {
+		// TLS entry overhead ~5; refuse tiny residuals that cannot hold a cert.
+		if need < 96 {
 			break
 		}
-		if fill > 1200 {
-			fill = 1200
+		// Prefer one large filler when residual is big; leave room for DER noise.
+		want := need - 8
+		if want < 64 {
+			break
 		}
-		fc, err := createFillerCert(fill)
-		if err != nil {
+		fc, actual, ok := createFillerCertFit(want, need-5)
+		if !ok || actual <= 0 {
 			break
 		}
 		trial := append(append([][]byte{}, chain...), fc)
 		nCur := estimateCertMsgLen(leaf, trial)
 		if nCur > targetInner {
-			// Try a smaller filler once.
-			smaller := fill / 2
-			if smaller < 64 {
-				break
-			}
-			fc2, err2 := createFillerCert(smaller)
-			if err2 != nil {
-				break
-			}
-			trial2 := append(append([][]byte{}, chain...), fc2)
-			n2 := estimateCertMsgLen(leaf, trial2)
-			if n2 > targetInner {
-				break
-			}
-			chain = trial2
-			cur = n2
-			continue
+			break
+		}
+		// Reject trivial progress that wastes a chain slot without meaningful length.
+		if nCur-cur < 48 {
+			break
 		}
 		chain = trial
 		cur = nCur
 	}
 
-	// 3) Length-only extension padding if still short and not using ML-DSA capacity fully.
+	// 3) Length-only extension padding on the leaf when still short.
+	// Safe without ML-DSA: ML-DSA keeps a fixed 3309-byte value and residual
+	// after chain growth is left for AEAD record padding (intentional).
 	if cur < targetInner && !mldsa {
 		need := targetInner - cur
 		if need > 16 {
-			pad := need - 16
-			if pad > 2000 {
-				pad = 2000
+			// Binary search pad length for tight fit under targetInner.
+			lo, hi := 8, need-8
+			if hi > 4000 {
+				hi = 4000
 			}
-			// Shrink pad until estimate fits.
-			for tries := 0; tries < 6; tries++ {
-				extVal := make([]byte, pad)
+			bestLeaf := leaf
+			bestCur := cur
+			for lo <= hi {
+				mid := (lo + hi) / 2
+				extVal := make([]byte, mid)
 				nl, err := createLeaf(pub, priv, extVal, 0)
 				if err != nil {
-					break
+					hi = mid - 1
+					continue
 				}
 				nCur := estimateCertMsgLen(nl, chain)
 				if nCur <= targetInner {
-					leaf = nl
-					cur = nCur
-					break
-				}
-				pad = pad * 3 / 4
-				if pad < 8 {
-					break
+					bestLeaf = nl
+					bestCur = nCur
+					lo = mid + 1
+				} else {
+					hi = mid - 1
 				}
 			}
+			leaf = bestLeaf
+			cur = bestCur
 		}
 	}
+
+	_ = cur
 	return leaf, chain
 }
 
+// createFillerCertFit builds a filler cert whose DER length is as close as
+// possible to want, but never makes the TLS cert entry exceed maxEntry.
+// Returns der, actualLen, ok.
+func createFillerCertFit(want, maxEntry int) ([]byte, int, bool) {
+	if maxEntry < 64 {
+		return nil, 0, false
+	}
+	if want > maxEntry {
+		want = maxEntry
+	}
+	if want < 64 {
+		want = 64
+	}
+	// Map desired DER length to CN pad via binary search (ASN.1 overhead varies).
+	lo, hi := 0, want
+	if hi > 1800 {
+		hi = 1800
+	}
+	var best []byte
+	bestLen := 0
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		fc, err := createFillerCert(mid + 200) // createFillerCert uses approxLen-200 as CN
+		if err != nil {
+			hi = mid - 1
+			continue
+		}
+		n := len(fc)
+		if n <= maxEntry {
+			if n >= bestLen {
+				best = fc
+				bestLen = n
+			}
+			if n < want {
+				lo = mid + 1
+			} else {
+				best = fc
+				bestLen = n
+				hi = mid - 1
+			}
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best == nil || bestLen == 0 {
+		return nil, 0, false
+	}
+	return best, bestLen, true
+}
+
 func createFillerCert(approxLen int) ([]byte, error) {
-	// Independent throwaway key ? not used for auth.
+	// Independent throwaway key - not used for auth.
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err

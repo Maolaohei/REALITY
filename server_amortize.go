@@ -628,7 +628,7 @@ func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config
 						usedLen[0] = handshakeLen
 						path = PathL1
 						if show {
-							fmt.Printf("REALITY remoteAddr: %v\tcache hit ?using cached RecordLens (skipping R1-R6)\n", remoteAddr)
+							fmt.Printf("REALITY remoteAddr: %v\tcache hit - using cached RecordLens (skipping R1-R6)\n", remoteAddr)
 						}
 						return usedLen, hello, r0Template, path, nil
 					}
