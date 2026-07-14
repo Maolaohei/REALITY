@@ -1,4 +1,4 @@
-﻿package reality
+package reality
 
 import (
 	"testing"
@@ -60,6 +60,7 @@ func TestLookupAmortize_L1AndL2(t *testing.T) {
 		CHClass:             chClass,
 		KeyShareGroup:       X25519,
 		ServerHelloTemplate: tpl,
+		ShapeHash:           computeShapeHash(0x1301, X25519, 100, len(tpl)),
 		Evidence:            MinL2Evidence,
 		Source:              "live",
 	}
@@ -130,6 +131,7 @@ func TestQuarantine_BlocksLookup(t *testing.T) {
 		CapturedAt:          time.Now(),
 		KeyShareGroup:       X25519,
 		ServerHelloTemplate: make([]byte, 40),
+		ShapeHash:           computeShapeHash(0x1301, X25519, 100, 40),
 		Evidence:            5,
 	}
 	m.StoreObservation(key, p)
@@ -181,6 +183,8 @@ func TestProfileL2Eligible_Gates(t *testing.T) {
 		KeyShareGroup:       X25519,
 		ServerHelloTemplate: make([]byte, 20),
 		Evidence:            MinL2Evidence,
+		ShapeHash:           computeShapeHash(0x1301, X25519, 100, 20),
+		CapturedAt:          time.Now(),
 	}
 	if !profileL2Eligible(p) {
 		t.Fatal("should be eligible")
@@ -188,6 +192,16 @@ func TestProfileL2Eligible_Gates(t *testing.T) {
 	p.AcceptsHRR = true
 	if profileL2Eligible(p) {
 		t.Fatal("HRR not eligible")
+	}
+	p.AcceptsHRR = false
+	p.ShapeHash = 0
+	if profileL2Eligible(p) {
+		t.Fatal("missing ShapeHash not eligible")
+	}
+	p.ShapeHash = computeShapeHash(0x1301, X25519, 100, 20)
+	p.CapturedAt = time.Now().Add(-MaxL2ProfileAge - time.Minute)
+	if profileL2Eligible(p) {
+		t.Fatal("stale CapturedAt not eligible for L2")
 	}
 }
 
@@ -217,5 +231,111 @@ func TestResolveAmortizeMode_Default(t *testing.T) {
 	}
 	if ResolveAmortizeMode(AmortizeL1) != AmortizeL1 {
 		t.Fatal("explicit L1 must stay L1")
+	}
+}
+
+func TestQuarantine_CalibrationLadder(t *testing.T) {
+	m := NewCacheManager()
+	key := CacheKeyV2("3.3.3.3:443", "c.com", "h2", VersionTLS13, "c")
+	tpl := make([]byte, 40)
+	tpl[0] = typeServerHello
+	base := &RealityProfile{
+		RecordLens:          [7]int{100, 6, 40, 1000, 200, 50, 0},
+		CipherSuite:         0x1301,
+		ALPN:                "h2",
+		TLSVersion:          VersionTLS13,
+		CapturedAt:          time.Now(),
+		Dest:                "3.3.3.3:443",
+		ServerName:          "c.com",
+		CHClass:             "c",
+		KeyShareGroup:       X25519,
+		ServerHelloTemplate: tpl,
+		ShapeHash:           computeShapeHash(0x1301, X25519, 100, len(tpl)),
+		Evidence:            5,
+		Source:              "live",
+	}
+	m.StoreObservation(key, base)
+	m.Quarantine(key, "test-ladder")
+
+	// Still in cooldown: observation ignored, lookup L0.
+	obs := *base
+	obs.CapturedAt = time.Now()
+	obs.Evidence = 1
+	m.StoreObservation(key, &obs)
+	res := m.LookupAmortize(AmortizeAuto, "3.3.3.3:443", "c.com", "h2", VersionTLS13, "c", 0, 0)
+	if res.Path != PathL0 {
+		t.Fatalf("in-cooldown want L0, got %s", res.Path)
+	}
+
+	// Expire cooldown and calibrate with live observation.
+	val, _ := m.entries.Load(key)
+	entry := val.(*ProfileEntry)
+	entry.mu.Lock()
+	entry.NextRetry = time.Now().Add(-time.Second)
+	entry.mu.Unlock()
+
+	obs2 := *base
+	obs2.CapturedAt = time.Now()
+	obs2.Evidence = 1
+	m.StoreObservation(key, &obs2)
+	if m.stats.Calibrations.Load() < 1 {
+		t.Fatal("expected calibration counter")
+	}
+	// GetProfile returns (profile, isStale); valid fresh profiles yield isStale=false.
+	got, _ := m.GetProfile(key)
+	if got == nil || got.Evidence != 1 {
+		t.Fatalf("after calibrate evidence want 1, got %#v", got)
+	}
+	res = m.LookupAmortize(AmortizeAuto, "3.3.3.3:443", "c.com", "h2", VersionTLS13, "c", 0, 0)
+	if res.Path == PathL2 {
+		t.Fatal("single calibration observation must not L2")
+	}
+	if res.Path != PathL1 {
+		t.Fatalf("want L1 after calibration, got %s", res.Path)
+	}
+
+	// Second matching live observation rebuilds L2 eligibility.
+	obs3 := *base
+	obs3.CapturedAt = time.Now()
+	m.StoreObservation(key, &obs3)
+	res = m.LookupAmortize(AmortizeAuto, "3.3.3.3:443", "c.com", "h2", VersionTLS13, "c", 0, 0)
+	if res.Path != PathL2 {
+		t.Fatalf("want L2 after rebuild evidence, got %s", res.Path)
+	}
+}
+
+func TestProfileL2Eligible_AgeGate_LookupFallsToL1(t *testing.T) {
+	m := NewCacheManager()
+	chClass := "age1"
+	key := CacheKeyV2("9.9.9.9:443", "age.example", "h2", VersionTLS13, chClass)
+	tpl := make([]byte, 80)
+	tpl[0] = typeServerHello
+	p := &RealityProfile{
+		RecordLens:          [7]int{100, 6, 40, 1000, 200, 50, 0},
+		CipherSuite:         0x1301,
+		ALPN:                "h2",
+		TLSVersion:          VersionTLS13,
+		CapturedAt:          time.Now().Add(-MaxL2ProfileAge - time.Minute),
+		Dest:                "9.9.9.9:443",
+		ServerName:          "age.example",
+		CHClass:             chClass,
+		KeyShareGroup:       X25519,
+		ServerHelloTemplate: tpl,
+		ShapeHash:           computeShapeHash(0x1301, X25519, 100, len(tpl)),
+		Evidence:            MinL2Evidence + 3,
+		Source:              "live",
+	}
+	m.StoreObservation(key, p)
+	// Force age after store (StoreObservation uses obs.CapturedAt).
+	if gp, _ := m.GetProfile(key); gp != nil {
+		gp.CapturedAt = time.Now().Add(-MaxL2ProfileAge - time.Minute)
+		m.HotSwapProfile(key, gp)
+	}
+	res := m.LookupAmortize(AmortizeAuto, "9.9.9.9:443", "age.example", "h2", VersionTLS13, chClass, 0, 0)
+	if res.Path == PathL2 {
+		t.Fatal("aged profile must not L2")
+	}
+	if res.Path != PathL1 {
+		t.Fatalf("want L1 for aged but otherwise valid profile, got %s", res.Path)
 	}
 }

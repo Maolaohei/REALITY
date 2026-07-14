@@ -60,6 +60,7 @@ type CacheManagerStats struct {
 	L2Hits             atomic.Uint64
 	L2Fails            atomic.Uint64
 	Quarantines        atomic.Uint64
+	Calibrations       atomic.Uint64
 }
 
 func NewCacheManager() *CacheManager {
@@ -410,6 +411,12 @@ func (m *CacheManager) CacheReport() string {
 		successRate = float64(successes) / float64(attempts) * 100
 	}
 
+	l1 := m.stats.L1Hits.Load()
+	l2 := m.stats.L2Hits.Load()
+	l2f := m.stats.L2Fails.Load()
+	quar := m.stats.Quarantines.Load()
+	calib := m.stats.Calibrations.Load()
+
 	return fmt.Sprintf(`REALITY cache report:
   active profiles:     %d
   invalidated:         %d
@@ -418,7 +425,12 @@ func (m *CacheManager) CacheReport() string {
   hot swaps:           %d
   probe attempts:      %d
   probe successes:     %d
-  probe success rate:  %.1f%%`, entries, invalidated, stale, negative, hotSwaps, attempts, successes, successRate)
+  probe success rate:  %.1f%%
+  amortize L1 hits:    %d
+  amortize L2 hits:    %d
+  amortize L2 fails:   %d
+  quarantines:         %d
+  calibrations:        %d`, entries, invalidated, stale, negative, hotSwaps, attempts, successes, successRate, l1, l2, l2f, quar, calib)
 }
 
 // InvalidateAll deletes all cached profiles.
@@ -475,6 +487,7 @@ func (m *CacheManager) Reset() {
 	m.stats.L2Hits.Store(0)
 	m.stats.L2Fails.Store(0)
 	m.stats.Quarantines.Store(0)
+	m.stats.Calibrations.Store(0)
 	m.dirty.Store(false)
 }
 

@@ -3,6 +3,7 @@ package reality
 import (
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // AmortizeMode controls how aggressively REALITY reuses observed target
@@ -54,6 +55,16 @@ const MinL2Evidence = 2
 
 // MaxL2FailWindow is how many recent L2 handshake failures on a key trigger quarantine.
 const MaxL2FailWindow = 2
+
+// MaxL2ProfileAge is the maximum age of CapturedAt for L2 zero-dial.
+// Older profiles remain usable for L1 (stale-while-revalidate) but must not
+// skip RA dial without a recent live confirmation of shape.
+const MaxL2ProfileAge = 10 * time.Minute
+
+// QuarantineCooldown is how long a key stays unusable after L2/L1 fail storm.
+// After this window, the next live observation starts a calibration ladder
+// (Evidence reset -> L1 until MinL2Evidence again -> L2).
+const QuarantineCooldown = 5 * time.Minute
 
 // isGREASE reports TLS GREASE values (RFC 8701): 0x0a0a, 0x1a1a, ... 0xfafa.
 func isGREASE(v uint16) bool {
@@ -143,6 +154,7 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 	}
 	return strconv.FormatUint(h, 16)
 }
+
 // clientALPN returns the first ALPN protocol or empty string.
 func clientALPN(ch *clientHelloMsg) string {
 	if ch == nil || len(ch.alpnProtocols) == 0 {
@@ -190,6 +202,11 @@ func ResolveAmortizeMode(mode AmortizeMode) AmortizeMode {
 }
 
 // profileL2Eligible reports whether p may be used for zero-dial.
+// Gates (all required):
+//   - consecutive evidence ≥ MinL2Evidence
+//   - non-HRR path with cipher/group/template/lens
+//   - structural ShapeHash present (prevents partial/legacy templates)
+//   - CapturedAt within MaxL2ProfileAge (stale profiles fall back to L1)
 func profileL2Eligible(p *RealityProfile) bool {
 	if p == nil {
 		return false
@@ -207,6 +224,12 @@ func profileL2Eligible(p *RealityProfile) bool {
 		return false
 	}
 	if !ValidateRecordLens(p.RecordLens) || p.RecordLens[0] == 0 {
+		return false
+	}
+	if p.ShapeHash == 0 {
+		return false
+	}
+	if p.CapturedAt.IsZero() || time.Since(p.CapturedAt) > MaxL2ProfileAge {
 		return false
 	}
 	return true

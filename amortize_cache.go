@@ -200,7 +200,27 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 		entry := val.(*ProfileEntry)
 		entry.mu.Lock()
 		if entry.State == ProfileQuarantined {
+			// After cooldown, allow a live observation to start calibration
+			// (Evidence=1 => L1 only until MinL2Evidence rebuilds).
+			if time.Now().Before(entry.NextRetry) {
+				entry.mu.Unlock()
+				return
+			}
+			cp := *obs
+			cp.Evidence = 1
+			if cp.Stability < 1 {
+				cp.Stability = 1
+			}
+			cp.Source = "live"
+			entry.Profile = &cp
+			entry.State = ProfileValid
+			entry.atomicState.Store(int32(ProfileValid))
+			entry.FailCount = 0
+			entry.NextRetry = time.Time{}
+			entry.TTL = m.baseTTL
 			entry.mu.Unlock()
+			m.stats.Calibrations.Add(1)
+			m.dirty.Store(true)
 			return
 		}
 		cur := entry.Profile
@@ -312,14 +332,16 @@ func profilesMatch(a, b *RealityProfile) bool {
 	return true
 }
 
-// Quarantine marks a key as unusable for L1/L2 until invalidated/reprobed.
+// Quarantine marks a key as unusable for L1/L2 until cooldown elapses.
+// After QuarantineCooldown, the next live StoreObservation starts calibration
+// with Evidence=1 (L0/L1 only until MinL2Evidence is rebuilt).
 func (m *CacheManager) Quarantine(key, reason string) {
 	val, ok := m.entries.Load(key)
 	if !ok {
 		entry := &ProfileEntry{
 			State:     ProfileQuarantined,
 			FailCount: MaxL2FailWindow,
-			NextRetry: time.Now().Add(5 * time.Minute),
+			NextRetry: time.Now().Add(QuarantineCooldown),
 			TTL:       m.baseTTL,
 		}
 		entry.atomicState.Store(int32(ProfileQuarantined))
@@ -333,7 +355,13 @@ func (m *CacheManager) Quarantine(key, reason string) {
 	entry.State = ProfileQuarantined
 	entry.atomicState.Store(int32(ProfileQuarantined))
 	entry.FailCount = MaxL2FailWindow
-	entry.NextRetry = time.Now().Add(5 * time.Minute)
+	entry.NextRetry = time.Now().Add(QuarantineCooldown)
+	// Drop evidence so post-cooldown recovery cannot immediately L2.
+	if entry.Profile != nil {
+		cp := *entry.Profile
+		cp.Evidence = 0
+		entry.Profile = &cp
+	}
 	entry.mu.Unlock()
 	m.stats.Quarantines.Add(1)
 	m.dirty.Store(true)
@@ -362,7 +390,12 @@ func (m *CacheManager) NoteHandshakeFailure(key string, path AmortizePath) {
 	if fc >= MaxL2FailWindow {
 		entry.State = ProfileQuarantined
 		entry.atomicState.Store(int32(ProfileQuarantined))
-		entry.NextRetry = time.Now().Add(5 * time.Minute)
+		entry.NextRetry = time.Now().Add(QuarantineCooldown)
+		if entry.Profile != nil {
+			cp := *entry.Profile
+			cp.Evidence = 0
+			entry.Profile = &cp
+		}
 		entry.mu.Unlock()
 		m.stats.Quarantines.Add(1)
 		m.dirty.Store(true)
