@@ -264,10 +264,125 @@ func TestCertPlan_AuthInvariantEd25519HMAC(t *testing.T) {
 	if !hmac.Equal(h.Sum(nil), cert.Signature) {
 		t.Fatal("HMAC slot mismatch on grown cert")
 	}
+	// P2 metadata: not bare Serial=1 / zero times.
+	if cert.SerialNumber == nil || cert.SerialNumber.Sign() <= 0 {
+		t.Fatal("expected non-trivial serial")
+	}
+	if cert.NotBefore.IsZero() || cert.NotAfter.IsZero() || !cert.NotAfter.After(cert.NotBefore) {
+		t.Fatal("expected realistic validity window")
+	}
+	if len(cert.DNSNames) == 0 && cert.Subject.CommonName == "" {
+		t.Fatal("expected SAN or CN")
+	}
 	// Fillers (if any) are not auth material; ensure they parse.
 	for i := 1; i < len(chain); i++ {
 		if _, err := x509.ParseCertificate(chain[i]); err != nil {
 			t.Fatalf("filler[%d] parse: %v", i, err)
+		}
+	}
+}
+
+func TestCoalescedCertBudget_Math(t *testing.T) {
+	if CoalescedCertBudget(400) != 0 {
+		t.Fatal("small R2 must yield 0 residual")
+	}
+	if CoalescedCertBudget(512) != 0 {
+		t.Fatal("boundary R2 must yield 0 residual")
+	}
+	// Large coalesced R2 must leave room for a non-trivial cert after EE+CV+Finished.
+	b := CoalescedCertBudget(2500)
+	if b < 500 {
+		t.Fatalf("expected residual cert budget, got %d", b)
+	}
+	// Invariant: residual + overhead + framing <= R2 outer.
+	const aeadTag = 16
+	const contentType = 1
+	maxPlain := 2500 - recordHeaderLen - contentType - aeadTag
+	if b+coalescedEECVFinishedOverhead+coalescedSafetyInner > maxPlain {
+		t.Fatalf("budget overshoots plain capacity: cert=%d overhead=%d safety=%d maxPlain=%d",
+			b, coalescedEECVFinishedOverhead, coalescedSafetyInner, maxPlain)
+	}
+}
+
+func TestCertPlan_CoalescedResidualGrowth(t *testing.T) {
+	if initErr != nil {
+		t.Fatalf("init: %v", initErr)
+	}
+	ResetCertPlanCacheForTesting()
+	r2 := 3000
+	budget := CoalescedCertBudget(r2)
+	if budget <= 0 {
+		t.Fatalf("no residual for r2=%d", r2)
+	}
+	plan := GetCertPlan(budget, false, RecordModeCoalesced)
+	if plan == nil {
+		t.Fatal("nil plan")
+	}
+	if !certPlanFitsInnerBudget(plan, budget) {
+		t.Fatalf("plan inner %d exceeds residual %d", plan.InnerMsgLen, budget)
+	}
+	minimal := GetCertPlan(0, false, RecordModeCoalesced)
+	if plan.InnerMsgLen <= minimal.InnerMsgLen {
+		t.Fatalf("expected coalesced residual growth: plan=%d min=%d budget=%d",
+			plan.InnerMsgLen, minimal.InnerMsgLen, budget)
+	}
+	// Outer coalesced padding must remain non-negative with conservative overhead.
+	const aeadTag = 16
+	const contentType = 1
+	plain := plan.InnerMsgLen + coalescedEECVFinishedOverhead
+	outerNeed := recordHeaderLen + plain + contentType + aeadTag
+	if outerNeed > r2 {
+		t.Fatalf("would overshoot R2: need=%d r2=%d (padding would be negative)", outerNeed, r2)
+	}
+}
+
+func TestClassifyClientHello_V3_ExtensionBits(t *testing.T) {
+	if CHClassVersion != 3 {
+		t.Fatalf("expected CHClassVersion=3 got %d", CHClassVersion)
+	}
+	base := &clientHelloMsg{
+		cipherSuites:                 []uint16{0x1301, 0x1302},
+		supportedCurves:              []CurveID{X25519},
+		keyShares:                    []keyShare{{group: X25519, data: make([]byte, 32)}},
+		supportedVersions:            []uint16{VersionTLS13},
+		supportedSignatureAlgorithms: []SignatureScheme{Ed25519},
+		alpnProtocols:                []string{"h2"},
+		serverName:                   "a.example",
+	}
+	a := ClassifyClientHello(base)
+	// SCT presence should change class (coarse bit).
+	withSCT := *base
+	withSCT.scts = true
+	if ClassifyClientHello(&withSCT) == a {
+		t.Fatal("scts bit should change class")
+	}
+	// OCSP presence should change class.
+	withOCSP := *base
+	withOCSP.ocspStapling = true
+	if ClassifyClientHello(&withOCSP) == a {
+		t.Fatal("ocsp bit should change class")
+	}
+	// Extension order is not modeled; only presence. Same fields => same class.
+	if ClassifyClientHello(base) != a {
+		t.Fatal("stable class expected")
+	}
+}
+
+func BenchmarkMaterializeCert(b *testing.B) {
+	if initErr != nil {
+		b.Fatalf("init: %v", initErr)
+	}
+	ResetCertPlanCacheForTesting()
+	plan := GetCertPlan(2500, false, RecordModeSplit)
+	authKey := make([]byte, 32)
+	for i := range authKey {
+		authKey[i] = byte(i)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := MaterializeCert(plan, authKey, nil, nil, nil); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

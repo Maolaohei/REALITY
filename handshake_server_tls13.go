@@ -165,7 +165,8 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	*/
 	{
 		// Fidelity CertPlan: template leaf (+ optional chain) under Ed25519+HMAC,
-		// sized toward observed Certificate record budget. Success path remains TLS 1.3 only.
+		// sized toward observed Certificate / coalesced R2 residual budget.
+		// Success path remains TLS 1.3 only.
 		mldsa := len(c.config.Mldsa65Key) > 0
 		mode := RecordModeSplit
 		// handshakeLen is copied before handshake(); slot 1 non-zero arms padding path.
@@ -178,13 +179,20 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		budget := 0
 		if mode == RecordModeSplit {
 			budget = c.out.handshakeLen[3]
+		} else {
+			// P1: residual Certificate capacity inside coalesced R2 after
+			// conservatively reserving EE+CV+Finished (+safety). Outer pad
+			// still targets handshakeLen[2]; cert growth only consumes residual.
+			budget = CoalescedCertBudget(c.out.handshakeLen[2])
 		}
-		// Coalesced residual is handled by record padding to R2; keep cert minimal (budget=0).
 		plan := GetCertPlan(budget, mldsa, mode)
-		// Hard guard: if the Certificate message cannot fit the observed outer lens,
-		// fall back to historical minimal leaf. padding < 0 in encrypt is fatal EOF.
-		if plan != nil && mode == RecordModeSplit && budget > 0 && !certPlanFitsBudget(plan, budget) {
-			plan = fallbackCertPlan(mldsa)
+		// Hard guard: never emit a plan that makes encrypt padding negative.
+		if plan != nil && budget > 0 {
+			if mode == RecordModeSplit && !certPlanFitsBudget(plan, budget) {
+				plan = fallbackCertPlan(mldsa)
+			} else if mode == RecordModeCoalesced && !certPlanFitsInnerBudget(plan, budget) {
+				plan = fallbackCertPlan(mldsa)
+			}
 		}
 		if plan == nil {
 			// Last-resort historical path.

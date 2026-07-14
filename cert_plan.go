@@ -12,6 +12,7 @@ import (
 	"hash"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 )
@@ -54,13 +55,17 @@ var (
 )
 
 // GetCertPlan returns a plan sized for the given record budget.
-// budget is the target Certificate record outer length (split mode). When 0,
-// or in coalesced mode, the plan stays minimal (historical leaf size).
+//
+// Split mode (RecordModeSplit):
+//   budget = observed Certificate outer record length (handshakeLen[3]).
+// Coalesced mode (RecordModeCoalesced):
+//   budget = residual Certificate-message capacity inside the coalesced R2
+//   flight after reserving EE+CV+Finished (see CoalescedCertBudget).
+// When budget is 0, the plan stays minimal (historical leaf size).
 // mldsa enables ML-DSA extension capacity on the leaf.
 //
-// Hard invariant for split mode: plan.InnerMsgLen must fit inside budget with
-// AEAD framing so conn.encrypt padding never goes negative:
-//   budget >= recordHeaderLen + InnerMsgLen + 1(ctype) + aeadTag
+// Hard invariant: grown plans must never make encrypt padding negative.
+// Split uses outer-record math; coalesced uses residual inner capacity.
 func GetCertPlan(budget int, mldsa bool, mode uint8) *CertPlan {
 	if budget < 0 {
 		budget = 0
@@ -82,16 +87,22 @@ func GetCertPlan(budget int, mldsa bool, mode uint8) *CertPlan {
 	// Minimal leaf may still exceed a pathological tiny budget (target cert smaller
 	// than Ed25519 leaf+HMAC); encrypt will fail in that case - caller must keep
 	// dest TLS1.3 capture lens honest. Prefer minimal over oversized growth.
-	if mode == RecordModeSplit && budget > 0 && !certPlanFitsBudget(p, budget) {
-		min := fallbackCertPlan(mldsa)
-		if min != nil {
-			// Only replace if minimal is smaller / better chance to fit.
-			if min.InnerMsgLen < p.InnerMsgLen {
+	if budget > 0 {
+		over := false
+		if mode == RecordModeSplit {
+			over = !certPlanFitsBudget(p, budget)
+		} else if mode == RecordModeCoalesced {
+			// budget is residual INNER capacity.
+			over = !certPlanFitsInnerBudget(p, budget)
+		}
+		if over {
+			min := fallbackCertPlan(mldsa)
+			if min != nil && min.InnerMsgLen < p.InnerMsgLen {
 				p = min
 			}
+			// Do not cache oversize-for-budget plans.
+			return p
 		}
-		// Do not cache oversize-for-budget plans.
-		return p
 	}
 	certPlanMu.Lock()
 	certPlanCache[key] = p
@@ -101,6 +112,7 @@ func GetCertPlan(budget int, mldsa bool, mode uint8) *CertPlan {
 
 // certPlanFitsBudget reports whether the Certificate handshake message fits
 // into an outer TLS record of length budget with AEAD overhead and ctype.
+// Used for split-mode Certificate records (handshakeLen[3]).
 func certPlanFitsBudget(p *CertPlan, budget int) bool {
 	if p == nil || budget <= 0 {
 		return true
@@ -116,8 +128,21 @@ func certPlanFitsBudget(p *CertPlan, budget int) bool {
 	return minOuter <= budget
 }
 
+// certPlanFitsInnerBudget reports whether plan.InnerMsgLen <= maxInner.
+// Used for coalesced residual capacity (already handshake-message bytes).
+func certPlanFitsInnerBudget(p *CertPlan, maxInner int) bool {
+	if p == nil || maxInner <= 0 {
+		return true
+	}
+	inner := p.InnerMsgLen
+	if inner <= 0 {
+		inner = estimateCertMsgLen(p.LeafDER, p.ChainDERs)
+	}
+	return inner <= maxInner
+}
+
 // MaxCertInnerForBudget returns the largest Certificate message length that
-// still leaves non-negative padding for a target outer record length.
+// still leaves non-negative padding for a target outer record length (split).
 func MaxCertInnerForBudget(budget int) int {
 	if budget <= 0 {
 		return 0
@@ -129,6 +154,44 @@ func MaxCertInnerForBudget(budget int) int {
 		return 0
 	}
 	return max
+}
+
+// coalescedFlightOverhead estimates non-Certificate handshake bytes in the
+// post-SH coalesced flight (EE + CertificateVerify + Finished) for typical
+// REALITY success paths: ALPN EE, Ed25519 CertificateVerify, TLS1.3 Finished.
+// Conservative (slightly high) so residual cert budget never overshoots R2.
+//
+// EE (h2 ALPN typical): ~32-48
+// CertificateVerify (Ed25519): 4 + 2 + 2 + 64 = 72
+// Finished (SHA256): 4 + 32 = 36
+// Plus small headroom for ALPN length variance.
+const (
+	coalescedEECVFinishedOverhead = 48 + 72 + 36 + 32 // = 188
+	coalescedSafetyInner          = 48
+)
+
+// CoalescedCertBudget derives max Certificate handshake message length that
+// still leaves non-negative AEAD padding when EE+Cert+CV+Finished are sealed
+// as one application_data record of outer length r2Outer.
+//
+// encrypt pads: padding = r2Outer - (recordHeaderLen + plaintext + 1 + tag)
+// plaintext = EE||Cert||CV||Finished (handshake messages only).
+// => maxCertInner = r2Outer - recordHeaderLen - 1 - tag - overheadOthers - safety
+func CoalescedCertBudget(r2Outer int) int {
+	if r2Outer <= 512 {
+		return 0
+	}
+	const aeadTag = 16
+	const contentType = 1
+	maxPlain := r2Outer - recordHeaderLen - contentType - aeadTag
+	if maxPlain <= 0 {
+		return 0
+	}
+	maxCert := maxPlain - coalescedEECVFinishedOverhead - coalescedSafetyInner
+	if maxCert < 0 {
+		return 0
+	}
+	return maxCert
 }
 
 // ResetCertPlanCacheForTesting clears the plan cache.
@@ -184,14 +247,20 @@ func buildCertPlan(budget int, mldsa bool, mode uint8) (*CertPlan, error) {
 	}
 
 	var chain [][]byte
-	// Grow only in split mode when residual budget is clearly larger than a
-	// minimal leaf. Target stays strictly under MaxCertInnerForBudget so
-	// conn.encrypt padding never goes negative (even with DER size noise).
+	// Grow when residual budget is clearly larger than a minimal leaf.
+	// Split: budget is outer Certificate record length.
+	// Coalesced: budget is residual Certificate-message capacity inside R2.
 	targetInner := 0
-	if mode == RecordModeSplit {
-		maxInner := MaxCertInnerForBudget(budget)
-		// Leave headroom for DER estimate error and optional OCSP/SCT hooks.
-		const safety = 32
+	maxInner := 0
+	const safety = 32
+	switch mode {
+	case RecordModeSplit:
+		maxInner = MaxCertInnerForBudget(budget)
+		if maxInner > 256+safety {
+			targetInner = maxInner - safety
+		}
+	case RecordModeCoalesced:
+		maxInner = budget
 		if maxInner > 256+safety {
 			targetInner = maxInner - safety
 		}
@@ -204,7 +273,6 @@ func buildCertPlan(budget int, mldsa bool, mode uint8) (*CertPlan, error) {
 	// If growth still overshot, discard fillers and keep minimal leaf.
 	if targetInner > 0 {
 		inner := estimateCertMsgLen(leaf, chain)
-		maxInner := MaxCertInnerForBudget(budget)
 		if maxInner > 0 && inner > maxInner {
 			leaf, err = createLeaf(pub, ed25519Priv, extVal, 0)
 			if err != nil {
@@ -245,18 +313,39 @@ func buildCertPlan(budget int, mldsa bool, mode uint8) (*CertPlan, error) {
 }
 
 func createLeaf(pub ed25519.PublicKey, priv ed25519.PrivateKey, extVal []byte, subjectPad int) ([]byte, error) {
-	tpl := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+	// Realistic-ish leaf metadata (NotBefore/NotAfter/Serial/KU/EKU/SAN).
+	// Auth still overwrites the Ed25519 signature slot with HMAC; these fields
+	// only improve passive certificate-shape fidelity.
+	now := time.Now().UTC()
+	serial := big.NewInt(now.UnixNano())
+	if serial.Sign() <= 0 {
+		serial = big.NewInt(1)
 	}
+	notBefore := now.Add(-30 * 24 * time.Hour)
+	notAfter := now.Add(365 * 24 * time.Hour)
+
+	cn := "www.example.com"
 	if subjectPad > 0 {
-		// CN padding to grow DER without changing public key.
 		pad := make([]byte, subjectPad)
 		for i := range pad {
 			pad[i] = 'a'
 		}
-		tpl.Subject = pkix.Name{CommonName: string(pad)}
+		cn = string(pad)
+	}
+
+	tpl := x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: cn, Organization: []string{"Cloud"}},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+		DNSNames:              []string{cn},
 	}
 	if len(extVal) > 0 {
+		// REALITY auth OID first so legacy Extensions[0] readers still work.
 		tpl.ExtraExtensions = []pkix.Extension{{
 			Id:    realityAuthOID,
 			Value: extVal,
@@ -510,6 +599,7 @@ func min(a, b int) int {
 // Auth invariant:
 //   - signature slot = HMAC-SHA512(AuthKey, ed25519.pub)
 //   - optional ML-DSA = Sign(HMAC-SHA512(AuthKey, pub||CH||SH)) into REALITY auth extension
+// Performance: only the leaf is copied; intermediate filler DERs are shared.
 func MaterializeCert(plan *CertPlan, authKey []byte, mldsaKey []byte, clientHelloOrig, serverHelloOrig []byte) ([][]byte, error) {
 	if plan == nil || len(plan.LeafDER) == 0 {
 		return nil, fmt.Errorf("nil cert plan")
@@ -521,7 +611,8 @@ func MaterializeCert(plan *CertPlan, authKey []byte, mldsaKey []byte, clientHell
 	if off < 0 || off+64 > len(leaf) {
 		off = len(leaf) - 64
 	}
-	h := newHMACSHA512(authKey)
+	// Hot path: one HMAC-SHA512; no intermediate DER copies.
+	h := hmac.New(sha512.New, authKey)
 	if len(ed25519Priv) >= 64 {
 		h.Write(ed25519Priv[32:])
 	}
@@ -549,9 +640,8 @@ func MaterializeCert(plan *CertPlan, authKey []byte, mldsaKey []byte, clientHell
 
 	out := make([][]byte, 0, 1+len(plan.ChainDERs))
 	out = append(out, leaf)
-	for _, c := range plan.ChainDERs {
-		out = append(out, append([]byte(nil), c...))
-	}
+	// Share intermediate DER slices (immutable after plan build).
+	out = append(out, plan.ChainDERs...)
 	return out, nil
 }
 

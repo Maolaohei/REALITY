@@ -18,7 +18,7 @@ const (
 
 // CHClassVersion identifies the ClassifyClientHello algorithm.
 // Bump when classification inputs change so persisted keys cannot mix.
-const CHClassVersion uint8 = 2
+const CHClassVersion uint8 = 3 // v3: + coarse extension presence bits
 
 // Dest capability states for fallback / suitability tracking.
 const (

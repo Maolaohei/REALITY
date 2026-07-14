@@ -79,6 +79,7 @@ func isGREASE(v uint16) bool {
 //   - TLS 1.3 cipher suite set ? {0x1301,0x1302,0x1303} (sorted, GREASE ignored)
 //   - supported group set flags (X25519 / ML-KEM / P-256)
 //   - coarse signature-algorithm buckets (Ed25519 / ECDSA-P256 / RSA-PSS)
+//   - coarse extension presence (SNI/ALPN/supported_versions/key_share/PSK/ECH/SCT/OCSP)
 // Algorithm version is CHClassVersion; bump when inputs change.
 func ClassifyClientHello(ch *clientHelloMsg) string {
 	if ch == nil {
@@ -215,11 +216,35 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 		mixByte(0)
 	}
 
-	if len(ch.encryptedClientHello) > 0 {
-		mixByte(1)
-	} else {
-		mixByte(0)
+	// Coarse extension presence bits (order-independent). Avoids over-sharding
+	// on extension order while separating major browser/stack classes.
+	var extBits byte
+	if len(ch.serverName) > 0 {
+		extBits |= 1 << 0
 	}
+	if len(ch.alpnProtocols) > 0 {
+		extBits |= 1 << 1
+	}
+	if len(ch.supportedVersions) > 0 {
+		extBits |= 1 << 2
+	}
+	if len(ch.keyShares) > 0 {
+		extBits |= 1 << 3
+	}
+	if len(ch.pskIdentities) > 0 || len(ch.pskModes) > 0 {
+		extBits |= 1 << 4
+	}
+	if len(ch.encryptedClientHello) > 0 {
+		extBits |= 1 << 5
+	}
+	if ch.scts {
+		extBits |= 1 << 6
+	}
+	if ch.ocspStapling {
+		extBits |= 1 << 7
+	}
+	mixByte(extBits)
+
 	// Prefer TLS 1.3 bit
 	has13 := false
 	for _, v := range ch.supportedVersions {

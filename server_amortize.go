@@ -110,12 +110,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	// Unsuitable dest: mirror even after auth (anti-probe; no synthetic TLS1.3 success).
 	if DestShouldMirrorOnly(config.Dest) {
 		if show {
-			fmt.Printf("REALITY remoteAddr: %v\tdest unsuitable ? mirror only\n", remoteAddr)
+			fmt.Printf("REALITY remoteAddr: %v\tdest unsuitable - mirror only (even if auth OK)\n", remoteAddr)
 		}
 		return mirrorAfterFailedAuth(ctx, conn, underlying, config, hs.clientHello, remoteAddr, show,
 			"dest unsuitable for REALITY success path")
 	}
-	// Offline / unsuitable force no amortize (L0 only if we continue ? here offline also mirrors).
+	// Offline/unsuitable force L0-only; unsuitable already mirrored above. Dest must be TLS 1.3 capable for success path.
 	if !DestAllowsAmortize(config.Dest) {
 		mode = AmortizeL0
 		if show {
