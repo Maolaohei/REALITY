@@ -43,7 +43,7 @@ func (m *CacheManager) LookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 		entry := val.(*ProfileEntry)
 		// Lock-free fast-path: skip rejected states without taking the mutex.
 		s := ProfileState(entry.atomicState.Load())
-		if s == ProfileNegative || s == ProfileQuarantined || s == ProfileSuspect {
+		if s == ProfileNegative || s == ProfileQuarantined {
 			continue
 		}
 		entry.mu.Lock()
@@ -51,10 +51,7 @@ func (m *CacheManager) LookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 			entry.mu.Unlock()
 			continue
 		}
-		if entry.State == ProfileSuspect {
-			entry.mu.Unlock()
-			continue
-		}
+		suspect := entry.State == ProfileSuspect
 		p := entry.Profile
 		if p == nil || !ValidateRecordLens(p.RecordLens) {
 			entry.mu.Unlock()
@@ -68,8 +65,8 @@ func (m *CacheManager) LookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 		}
 		stale := entry.State == ProfileStale || expired
 
-		// L2 only on non-stale V2 keys with full evidence.
-		if !stale && !IsLegacyCacheKey(key) && profileL2Eligible(p) {
+		// L2 only on non-stale non-suspect V2 keys with full evidence (Wave-2 S1-lite).
+		if !suspect && !stale && !IsLegacyCacheKey(key) && profileL2Eligible(p) {
 			if mode == AmortizeL2 || mode == AmortizeAuto {
 				if clientPolicyCompatible(p, liveCipher, liveGroup) {
 					cp := *p
@@ -386,6 +383,9 @@ func (m *CacheManager) NoteHandshakeFailure(key string, path AmortizePath) {
 	fc := entry.FailCount
 	if path == PathL2 {
 		m.stats.L2Fails.Add(1)
+		m.stats.L2SoftDemotions.Add(1)
+	} else if path == PathL1 {
+		m.stats.L1Fails.Add(1)
 	}
 	if fc >= MaxL2FailWindow {
 		entry.State = ProfileQuarantined

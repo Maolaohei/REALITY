@@ -1,6 +1,7 @@
 package reality
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -337,5 +338,74 @@ func TestProfileL2Eligible_AgeGate_LookupFallsToL1(t *testing.T) {
 	}
 	if res.Path != PathL1 {
 		t.Fatalf("want L1 for aged but otherwise valid profile, got %s", res.Path)
+	}
+}
+
+func TestLookupAmortize_SuspectAllowsL1(t *testing.T) {
+	m := NewCacheManager()
+	chClass := "s1lite"
+	key := CacheKeyV2("8.8.8.8:443", "s1.example", "h2", VersionTLS13, chClass)
+	tpl := make([]byte, 80)
+	tpl[0] = typeServerHello
+	p := &RealityProfile{
+		RecordLens:          [7]int{100, 6, 40, 1000, 200, 50, 0},
+		CipherSuite:         0x1301,
+		ALPN:                "h2",
+		TLSVersion:          VersionTLS13,
+		CapturedAt:          time.Now(),
+		Dest:                "8.8.8.8:443",
+		ServerName:          "s1.example",
+		CHClass:             chClass,
+		KeyShareGroup:       X25519,
+		ServerHelloTemplate: tpl,
+		ShapeHash:           computeShapeHash(0x1301, X25519, 100, len(tpl)),
+		Evidence:            MinL2Evidence,
+		Source:              "live",
+	}
+	m.StoreObservation(key, p)
+
+	res := m.LookupAmortize(AmortizeAuto, "8.8.8.8:443", "s1.example", "h2", VersionTLS13, chClass, 0, 0)
+	if res.Path != PathL2 {
+		t.Fatalf("want L2 before failure, got %s", res.Path)
+	}
+
+	m.NoteHandshakeFailure(key, PathL2)
+	if m.stats.L2Fails.Load() < 1 || m.stats.L2SoftDemotions.Load() < 1 {
+		t.Fatalf("want L2 fail/soft demotion counters, fails=%d soft=%d",
+			m.stats.L2Fails.Load(), m.stats.L2SoftDemotions.Load())
+	}
+
+	// Soft demotion: next lookup must skip L2 but still serve L1 from Suspect.
+	res = m.LookupAmortize(AmortizeAuto, "8.8.8.8:443", "s1.example", "h2", VersionTLS13, chClass, 0, 0)
+	if res.Path != PathL1 {
+		t.Fatalf("suspect should soft-demote to L1, got %s", res.Path)
+	}
+	if res.Profile == nil {
+		t.Fatal("L1 path should still return profile")
+	}
+}
+
+func TestNoteHandshakeFailure_L1Counter(t *testing.T) {
+	m := NewCacheManager()
+	key := CacheKeyV2("7.7.7.7:443", "l1.example", "h2", VersionTLS13, "c")
+	p := &RealityProfile{
+		RecordLens:          [7]int{100, 6, 40, 1000, 200, 50, 0},
+		CipherSuite:         0x1301,
+		ALPN:                "h2",
+		TLSVersion:          VersionTLS13,
+		CapturedAt:          time.Now(),
+		KeyShareGroup:       X25519,
+		ServerHelloTemplate: make([]byte, 40),
+		ShapeHash:           computeShapeHash(0x1301, X25519, 100, 40),
+		Evidence:            MinL2Evidence,
+	}
+	m.StoreObservation(key, p)
+	m.NoteHandshakeFailure(key, PathL1)
+	if m.stats.L1Fails.Load() != 1 {
+		t.Fatalf("L1Fails=%d", m.stats.L1Fails.Load())
+	}
+	report := m.CacheReport()
+	if !strings.Contains(report, "amortize L1 fails") || !strings.Contains(report, "amortize L2 soft") {
+		t.Fatalf("report missing wave-2 counters: %s", report)
 	}
 }

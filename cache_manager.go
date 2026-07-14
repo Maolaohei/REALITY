@@ -59,6 +59,8 @@ type CacheManagerStats struct {
 	L1Hits             atomic.Uint64
 	L2Hits             atomic.Uint64
 	L2Fails            atomic.Uint64
+	L1Fails            atomic.Uint64
+	L2SoftDemotions    atomic.Uint64
 	Quarantines        atomic.Uint64
 	Calibrations       atomic.Uint64
 }
@@ -414,6 +416,8 @@ func (m *CacheManager) CacheReport() string {
 	l1 := m.stats.L1Hits.Load()
 	l2 := m.stats.L2Hits.Load()
 	l2f := m.stats.L2Fails.Load()
+	l1f := m.stats.L1Fails.Load()
+	l2soft := m.stats.L2SoftDemotions.Load()
 	quar := m.stats.Quarantines.Load()
 	calib := m.stats.Calibrations.Load()
 
@@ -429,8 +433,10 @@ func (m *CacheManager) CacheReport() string {
   amortize L1 hits:    %d
   amortize L2 hits:    %d
   amortize L2 fails:   %d
+  amortize L1 fails:   %d
+  amortize L2 soft:    %d
   quarantines:         %d
-  calibrations:        %d`, entries, invalidated, stale, negative, hotSwaps, attempts, successes, successRate, l1, l2, l2f, quar, calib)
+  calibrations:        %d`, entries, invalidated, stale, negative, hotSwaps, attempts, successes, successRate, l1, l2, l2f, l1f, l2soft, quar, calib)
 }
 
 // InvalidateAll deletes all cached profiles.
@@ -486,6 +492,8 @@ func (m *CacheManager) Reset() {
 	m.stats.L1Hits.Store(0)
 	m.stats.L2Hits.Store(0)
 	m.stats.L2Fails.Store(0)
+	m.stats.L1Fails.Store(0)
+	m.stats.L2SoftDemotions.Store(0)
 	m.stats.Quarantines.Store(0)
 	m.stats.Calibrations.Store(0)
 	m.dirty.Store(false)
