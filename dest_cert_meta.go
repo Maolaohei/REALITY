@@ -22,6 +22,13 @@ type DestCertMeta struct {
 	ChainLens []int
 	LeafLen   int
 	Updated   time.Time
+
+	// Issuer / intermediate display style (D3). Cosmetic only; not a real trust chain.
+	IssuerCN      string
+	IssuerOrg     string
+	IssuerCountry string
+	// IntermediateNames are subject CNs for chain[1..] when learned.
+	IntermediateNames []string
 }
 
 // CertShapeHint steers filler chain growth toward a dest-like shape.
@@ -52,6 +59,9 @@ func NoteDestCertMeta(dest string, meta *DestCertMeta) {
 	if len(meta.ChainLens) > 0 {
 		cp.ChainLens = append([]int(nil), meta.ChainLens...)
 	}
+	if len(meta.IntermediateNames) > 0 {
+		cp.IntermediateNames = append([]string(nil), meta.IntermediateNames...)
+	}
 	destCertMetaMap.Store(dest, &cp)
 }
 
@@ -72,6 +82,9 @@ func GetDestCertMeta(dest string) *DestCertMeta {
 	}
 	if len(src.ChainLens) > 0 {
 		cp.ChainLens = append([]int(nil), src.ChainLens...)
+	}
+	if len(src.IntermediateNames) > 0 {
+		cp.IntermediateNames = append([]string(nil), src.IntermediateNames...)
 	}
 	return &cp
 }
@@ -101,6 +114,41 @@ func LearnDestCertMetaFromChain(dest string, chain []*x509.Certificate) *DestCer
 	}
 	if len(leaf.Subject.Organization) > 0 {
 		meta.Organization = leaf.Subject.Organization[0]
+	}
+	// Issuer style from leaf.Issuer and first intermediate subject (D3).
+	meta.IssuerCN = leaf.Issuer.CommonName
+	if len(leaf.Issuer.Organization) > 0 {
+		meta.IssuerOrg = leaf.Issuer.Organization[0]
+	}
+	if len(leaf.Issuer.Country) > 0 {
+		meta.IssuerCountry = leaf.Issuer.Country[0]
+	}
+	if len(chain) > 1 {
+		meta.IntermediateNames = make([]string, 0, len(chain)-1)
+		for i := 1; i < len(chain); i++ {
+			if chain[i] == nil {
+				continue
+			}
+			cn := chain[i].Subject.CommonName
+			if cn == "" && len(chain[i].Subject.Organization) > 0 {
+				cn = chain[i].Subject.Organization[0]
+			}
+			if cn != "" {
+				meta.IntermediateNames = append(meta.IntermediateNames, cn)
+			}
+			// Prefer first intermediate subject as issuer-style makeup.
+			if i == 1 {
+				if chain[i].Subject.CommonName != "" {
+					meta.IssuerCN = chain[i].Subject.CommonName
+				}
+				if len(chain[i].Subject.Organization) > 0 {
+					meta.IssuerOrg = chain[i].Subject.Organization[0]
+				}
+				if len(chain[i].Subject.Country) > 0 {
+					meta.IssuerCountry = chain[i].Subject.Country[0]
+				}
+			}
+		}
 	}
 	meta.ChainLens = make([]int, 0, len(chain))
 	for _, c := range chain {
@@ -152,6 +200,7 @@ func ShapeHintFromMeta(meta *DestCertMeta) *CertShapeHint {
 }
 
 // metaFingerprint is a coarse cache-key component for CertPlan.
+// Includes issuer-style bits so D3 DN changes invalidate plan cache.
 func metaFingerprint(meta *DestCertMeta) uint32 {
 	if meta == nil {
 		return 0
@@ -161,21 +210,26 @@ func metaFingerprint(meta *DestCertMeta) uint32 {
 		h ^= uint32(b)
 		h *= 16777619
 	}
-	for i := 0; i < len(meta.CN) && i < 64; i++ {
-		mix(meta.CN[i])
+	mixStr := func(str string, max int) {
+		for i := 0; i < len(str) && i < max; i++ {
+			mix(str[i])
+		}
 	}
-	for i := 0; i < len(meta.Organization) && i < 32; i++ {
-		mix(meta.Organization[i])
-	}
+	mixStr(meta.CN, 64)
+	mixStr(meta.Organization, 32)
+	mixStr(meta.IssuerCN, 48)
+	mixStr(meta.IssuerOrg, 32)
+	mixStr(meta.IssuerCountry, 8)
 	mix(byte(meta.ChainDepth))
 	if len(meta.ChainLens) > 0 {
 		mix(byte(meta.ChainLens[0] / 64))
 	}
 	if len(meta.DNSNames) > 0 {
-		dn := meta.DNSNames[0]
-		for i := 0; i < len(dn) && i < 48; i++ {
-			mix(dn[i])
-		}
+		mixStr(meta.DNSNames[0], 48)
+	}
+	if len(meta.IntermediateNames) > 0 {
+		mixStr(meta.IntermediateNames[0], 32)
+		mix(byte(len(meta.IntermediateNames)))
 	}
 	return h
 }
@@ -234,3 +288,131 @@ func WarmCertPlansForDest(dest string) {
 }
 
 var certPlanWarmCount atomic.Uint64
+
+// CloneDestCertMeta returns a deep copy suitable for profile storage (D1).
+func CloneDestCertMeta(meta *DestCertMeta) *DestCertMeta {
+	if meta == nil {
+		return nil
+	}
+	cp := *meta
+	if len(meta.DNSNames) > 0 {
+		cp.DNSNames = append([]string(nil), meta.DNSNames...)
+	}
+	if len(meta.ChainLens) > 0 {
+		cp.ChainLens = append([]int(nil), meta.ChainLens...)
+	}
+	if len(meta.IntermediateNames) > 0 {
+		cp.IntermediateNames = append([]string(nil), meta.IntermediateNames...)
+	}
+	return &cp
+}
+
+// ResolveDestCertMeta prefers profile-attached meta, then dest/SNI global map (D1).
+func ResolveDestCertMeta(profile *RealityProfile, dest, serverName string) *DestCertMeta {
+	if profile != nil && profile.CertMeta != nil {
+		return CloneDestCertMeta(profile.CertMeta)
+	}
+	if m := GetDestCertMeta(dest); m != nil {
+		return m
+	}
+	if serverName != "" && serverName != dest {
+		return GetDestCertMeta(serverName)
+	}
+	return nil
+}
+
+// ---- D2: per-dest coalesced EE plaintext calibration ----
+// Samples are EE handshake-message plaintext sizes observed on split-mode
+// handshakes. Coalesced residual may use p90 EE when samples are sufficient.
+// SafetyInner (48) is never reduced. Overhead never drops below a hard floor.
+
+type destEEStats struct {
+	samples [8]int
+	n       int
+	idx     int
+}
+
+var destEEMap sync.Map // map[string]*destEEStats
+
+var destEEMu sync.Mutex
+
+// NoteDestEEPlain records one observed EE plaintext length for dest (bytes of
+// handshake message only, not outer record). Ignores nonsense sizes.
+func NoteDestEEPlain(dest string, eePlain int) {
+	dest = strings.TrimSpace(dest)
+	if dest == "" || eePlain < 12 || eePlain > 512 {
+		return
+	}
+	v, _ := destEEMap.LoadOrStore(dest, &destEEStats{})
+	st := v.(*destEEStats)
+	destEEMu.Lock()
+	st.samples[st.idx%len(st.samples)] = eePlain
+	st.idx++
+	if st.n < len(st.samples) {
+		st.n++
+	}
+	destEEMu.Unlock()
+}
+
+// GetDestEEPlainP90 returns a conservative high percentile of sampled EE sizes.
+// ok=false when fewer than 3 samples.
+func GetDestEEPlainP90(dest string) (ee int, samples int, ok bool) {
+	dest = strings.TrimSpace(dest)
+	if dest == "" {
+		return 0, 0, false
+	}
+	v, found := destEEMap.Load(dest)
+	if !found {
+		return 0, 0, false
+	}
+	st := v.(*destEEStats)
+	destEEMu.Lock()
+	n := st.n
+	if n <= 0 {
+		destEEMu.Unlock()
+		return 0, 0, false
+	}
+	tmp := make([]int, n)
+	for i := 0; i < n; i++ {
+		tmp[i] = st.samples[i]
+	}
+	destEEMu.Unlock()
+	// insertion sort small
+	for i := 1; i < len(tmp); i++ {
+		j := i
+		for j > 0 && tmp[j-1] > tmp[j] {
+			tmp[j-1], tmp[j] = tmp[j], tmp[j-1]
+			j--
+		}
+	}
+	// p90 index
+	idx := (len(tmp) * 9) / 10
+	if idx >= len(tmp) {
+		idx = len(tmp) - 1
+	}
+	return tmp[idx], n, n >= 3
+}
+
+// ResetDestEEStatsForTesting clears EE calibration.
+func ResetDestEEStatsForTesting() {
+	destEEMu.Lock()
+	defer destEEMu.Unlock()
+	destEEMap.Range(func(k, _ any) bool {
+		destEEMap.Delete(k)
+		return true
+	})
+}
+
+// NoteDestEEFromRecordLens extracts EE plaintext from split-mode lens[2].
+func NoteDestEEFromRecordLens(dest string, lens [7]int, mode uint8) {
+	if mode != RecordModeSplit {
+		return
+	}
+	outer := lens[2]
+	if outer <= recordHeaderLen+1+16 {
+		return
+	}
+	// Outer = header + plaintext + ctype + tag
+	eePlain := outer - recordHeaderLen - 1 - 16
+	NoteDestEEPlain(dest, eePlain)
+}

@@ -27,10 +27,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/Maolaohei/REALITY/fips140tls"
 	"github.com/Maolaohei/REALITY/hpke"
 	"github.com/Maolaohei/REALITY/tls13"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 )
 
 // maxClientPSKIdentities is the number of client PSK identities the server will
@@ -176,15 +176,6 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		} else if c.out.handshakeBuf != nil {
 			mode = RecordModeCoalesced
 		}
-		budget := 0
-		if mode == RecordModeSplit {
-			budget = c.out.handshakeLen[3]
-		} else {
-			// P1: residual Certificate capacity inside coalesced R2 after
-			// conservatively reserving EE+CV+Finished (+safety). Outer pad
-			// still targets handshakeLen[2]; cert growth only consumes residual.
-			budget = CoalescedCertBudget(c.out.handshakeLen[2])
-		}
 		dest := ""
 		if c.config != nil {
 			dest = c.config.Dest
@@ -195,7 +186,23 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		if dest == "" && hs.clientHello != nil {
 			dest = hs.clientHello.serverName
 		}
-		plan := GetCertPlanFor(budget, mldsa, mode, dest, nil)
+		sni := ""
+		if hs.clientHello != nil {
+			sni = hs.clientHello.serverName
+		}
+		// D1: prefer profile-attached CertMeta (L2/persist), else global map.
+		meta := ResolveDestCertMeta(c.amortizeProfile, dest, sni)
+		budget := 0
+		if mode == RecordModeSplit {
+			budget = c.out.handshakeLen[3]
+		} else {
+			// P1/D2: residual Certificate capacity inside coalesced R2 after
+			// conservatively reserving EE+CV+Finished (+safety). Per-dest EE
+			// p90 may raise the EE reserve only; safety never drops below 48.
+			// Outer pad still targets handshakeLen[2]; cert growth residual only.
+			budget = CoalescedCertBudgetForDest(c.out.handshakeLen[2], dest)
+		}
+		plan := GetCertPlanWithMeta(budget, mldsa, mode, dest, meta, ShapeHintFromMeta(meta))
 		// Hard guard: never emit a plan that makes encrypt padding negative.
 		if plan != nil && budget > 0 {
 			if mode == RecordModeSplit && !certPlanFitsBudget(plan, budget) {
@@ -276,7 +283,6 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	}
 	return nil
 }
-
 
 func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	c := hs.c
@@ -1330,5 +1336,3 @@ func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 
 	return nil
 }
-
-

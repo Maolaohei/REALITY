@@ -74,11 +74,20 @@ func GetCertPlan(budget int, mldsa bool, mode uint8) *CertPlan {
 
 // GetCertPlanFor sizes a plan under budget, optionally using dest-learned leaf
 // metadata (A1) and chain-shape hints (A2). Auth remains Ed25519+HMAC.
+// Prefer GetCertPlanWithMeta when profile-attached CertMeta is available (D1).
 func GetCertPlanFor(budget int, mldsa bool, mode uint8, dest string, shape *CertShapeHint) *CertPlan {
+	return GetCertPlanWithMeta(budget, mldsa, mode, dest, nil, shape)
+}
+
+// GetCertPlanWithMeta is GetCertPlanFor with an explicit DestCertMeta override.
+// When meta is nil, falls back to GetDestCertMeta(dest). Shape nil => from meta.
+func GetCertPlanWithMeta(budget int, mldsa bool, mode uint8, dest string, meta *DestCertMeta, shape *CertShapeHint) *CertPlan {
 	if budget < 0 {
 		budget = 0
 	}
-	meta := GetDestCertMeta(dest)
+	if meta == nil {
+		meta = GetDestCertMeta(dest)
+	}
 	if shape == nil {
 		shape = ShapeHintFromMeta(meta)
 	}
@@ -198,6 +207,43 @@ func CoalescedCertBudget(r2Outer int) int {
 	maxCert := maxPlain - coalescedEECVFinishedOverhead - coalescedSafetyInner
 	if maxCert < 0 {
 		return 0
+	}
+	return maxCert
+}
+
+// CoalescedCertBudgetForDest is CoalescedCertBudget with optional per-dest EE
+// calibration (D2). When split-mode samples show a larger EE plaintext p90,
+// residual Certificate capacity is reduced accordingly so coalesced padding
+// never goes negative. SafetyInner (48) is never lowered. Overhead never
+// drops below coalescedEECVFinishedOverhead. When samples are insufficient
+// or p90 <= typical EE, this equals CoalescedCertBudget.
+func CoalescedCertBudgetForDest(r2Outer int, dest string) int {
+	base := CoalescedCertBudget(r2Outer)
+	if base <= 0 {
+		return 0
+	}
+	p90, _, ok := GetDestEEPlainP90(dest)
+	if !ok || p90 <= coalescedEETypical {
+		return base
+	}
+	// Raise EE reserve only; keep headroom + safety; floor total overhead.
+	const aeadTag = 16
+	const contentType = 1
+	maxPlain := r2Outer - recordHeaderLen - contentType - aeadTag
+	if maxPlain <= 0 {
+		return 0
+	}
+	overhead := p90 + coalescedCVEd25519 + coalescedFinishedSHA256 + coalescedEEHeadroom
+	if overhead < coalescedEECVFinishedOverhead {
+		overhead = coalescedEECVFinishedOverhead
+	}
+	maxCert := maxPlain - overhead - coalescedSafetyInner
+	if maxCert < 0 {
+		return 0
+	}
+	// Larger EE => smaller cert budget (never above base).
+	if maxCert > base {
+		return base
 	}
 	return maxCert
 }
@@ -452,7 +498,7 @@ func growCertsToward(pub ed25519.PublicKey, priv ed25519.PrivateKey, leaf []byte
 		if want < 64 {
 			break
 		}
-		fc, actual, ok := createFillerCertFit(want, need-5)
+		fc, actual, ok := createFillerCertFit(want, need-5, meta, len(chain))
 		if !ok || actual <= 0 {
 			break
 		}
@@ -521,8 +567,9 @@ func growCertsToward(pub ed25519.PublicKey, priv ed25519.PrivateKey, leaf []byte
 
 // createFillerCertFit builds a filler cert whose DER length is as close as
 // possible to want, but never makes the TLS cert entry exceed maxEntry.
+// meta/chainIdx drive cosmetic issuer-style DN (D3); auth is unaffected.
 // Returns der, actualLen, ok.
-func createFillerCertFit(want, maxEntry int) ([]byte, int, bool) {
+func createFillerCertFit(want, maxEntry int, meta *DestCertMeta, chainIdx int) ([]byte, int, bool) {
 	if maxEntry < 64 {
 		return nil, 0, false
 	}
@@ -541,7 +588,7 @@ func createFillerCertFit(want, maxEntry int) ([]byte, int, bool) {
 	bestLen := 0
 	for lo <= hi {
 		mid := (lo + hi) / 2
-		fc, err := createFillerCert(mid + 200) // createFillerCert uses approxLen-200 as CN
+		fc, err := createFillerCertStyled(mid+200, meta, chainIdx) // approxLen-200 as CN pad
 		if err != nil {
 			hi = mid - 1
 			continue
@@ -570,7 +617,13 @@ func createFillerCertFit(want, maxEntry int) ([]byte, int, bool) {
 }
 
 func createFillerCert(approxLen int) ([]byte, error) {
-	// Independent throwaway key - not used for auth.
+	return createFillerCertStyled(approxLen, nil, 0)
+}
+
+// createFillerCertStyled builds a cosmetic intermediate-like filler.
+// Display only: CA BasicConstraints + issuer-style DN from meta when present.
+// Keys are throwaway; never used for REALITY auth.
+func createFillerCertStyled(approxLen int, meta *DestCertMeta, chainIdx int) ([]byte, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
@@ -583,14 +636,68 @@ func createFillerCert(approxLen int) ([]byte, error) {
 	if pad > 1800 {
 		pad = 1800
 	}
-	cn := make([]byte, pad)
-	for i := range cn {
-		cn[i] = 'x'
+
+	// Prefer learned intermediate / issuer names; pad only when length-driven.
+	subjCN := ""
+	if meta != nil {
+		if chainIdx >= 0 && chainIdx < len(meta.IntermediateNames) {
+			subjCN = meta.IntermediateNames[chainIdx]
+		}
+		if subjCN == "" {
+			subjCN = meta.IssuerCN
+		}
 	}
+	if subjCN == "" {
+		cn := make([]byte, pad)
+		for i := range cn {
+			cn[i] = 'x'
+		}
+		subjCN = string(cn)
+	} else if pad > len(subjCN)+8 {
+		// Length-match without erasing the readable CN prefix.
+		extra := pad - len(subjCN)
+		if extra > 0 {
+			buf := make([]byte, len(subjCN)+extra)
+			copy(buf, subjCN)
+			for i := len(subjCN); i < len(buf); i++ {
+				buf[i] = 'x'
+			}
+			subjCN = string(buf)
+		}
+	}
+
+	org := ""
+	country := ""
+	if meta != nil {
+		if meta.IssuerOrg != "" {
+			org = meta.IssuerOrg
+		}
+		if meta.IssuerCountry != "" {
+			country = meta.IssuerCountry
+		}
+	}
+	if org == "" {
+		org = "Certificate Authority"
+	}
+
+	subj := pkix.Name{CommonName: subjCN, Organization: []string{org}}
+	if country != "" {
+		subj.Country = []string{country}
+	}
+
+	now := truncatedPlanTime()
 	tpl := x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: string(cn)},
+		SerialNumber:          big.NewInt(int64(2 + chainIdx)),
+		Subject:               subj,
+		NotBefore:             now.Add(-365 * 24 * time.Hour),
+		NotAfter:              now.Add(2 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
 	}
+	// Self-signed filler for size/shape only (CreateCertificate parent == subject).
 	return x509.CreateCertificate(rand.Reader, &tpl, &tpl, pub, priv)
 }
 
@@ -747,6 +854,3 @@ func writeMLDSA(leaf []byte, off, mlen int, authKey, clientHelloOrig, serverHell
 	mldsa65.SignTo(priv, h.Sum(nil), nil, false, dst)
 	return nil
 }
-
-
-

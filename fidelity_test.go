@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha512"
 	"crypto/x509"
+	"strings"
 	"testing"
 	"time"
 )
@@ -387,7 +388,6 @@ func BenchmarkMaterializeCert(b *testing.B) {
 	}
 }
 
-
 func TestDestCertMeta_MaterializeLeafFields(t *testing.T) {
 	if initErr != nil {
 		t.Fatalf("init: %v", initErr)
@@ -642,5 +642,194 @@ func TestTruncatedPlanTime_MinuteStable(t *testing.T) {
 	want := time.Date(2026, 7, 15, 12, 34, 0, 0, time.UTC)
 	if !got.Equal(want) {
 		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestResolveDestCertMeta_ProfilePreferred(t *testing.T) {
+	ResetDestCertMetaForTesting()
+	global := &DestCertMeta{CN: "global.example", Organization: "G"}
+	NoteDestCertMeta("d1.example:443", global)
+	profMeta := &DestCertMeta{CN: "profile.example", Organization: "P", IssuerCN: "P-CA"}
+	prof := &RealityProfile{CertMeta: profMeta}
+	got := ResolveDestCertMeta(prof, "d1.example:443", "profile.example")
+	if got == nil || got.CN != "profile.example" {
+		t.Fatalf("expected profile meta, got %+v", got)
+	}
+	// Without profile, falls back to global map.
+	got2 := ResolveDestCertMeta(nil, "d1.example:443", "")
+	if got2 == nil || got2.CN != "global.example" {
+		t.Fatalf("expected global meta, got %+v", got2)
+	}
+}
+
+func TestGetCertPlanWithMeta_WithoutGlobalMap(t *testing.T) {
+	if initErr != nil {
+		t.Fatalf("init: %v", initErr)
+	}
+	ResetCertPlanCacheForTesting()
+	ResetDestCertMetaForTesting()
+	meta := &DestCertMeta{
+		CN:           "only-profile.example",
+		DNSNames:     []string{"only-profile.example"},
+		Organization: "ProfileOrg",
+		IssuerCN:     "Profile Intermediate CA",
+		IssuerOrg:    "Profile CA Org",
+		ChainDepth:   2,
+		ChainLens:    []int{900, 1000},
+	}
+	// Intentionally do NOT NoteDestCertMeta — meta comes only via profile path.
+	plan := GetCertPlanWithMeta(2500, false, RecordModeSplit, "missing-global:443", meta, ShapeHintFromMeta(meta))
+	if plan == nil {
+		t.Fatal("nil plan")
+	}
+	authKey := make([]byte, 32)
+	for i := range authKey {
+		authKey[i] = byte(i + 7)
+	}
+	chain, err := MaterializeCert(plan, authKey, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(chain[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leaf.Subject.CommonName != "only-profile.example" {
+		t.Fatalf("CN=%q", leaf.Subject.CommonName)
+	}
+	pub, ok := leaf.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		t.Fatal("not ed25519")
+	}
+	h := hmac.New(sha512.New, authKey)
+	h.Write(pub)
+	if !hmac.Equal(h.Sum(nil), leaf.Signature) {
+		t.Fatal("HMAC auth broken under profile-only meta")
+	}
+}
+
+func TestCoalescedCertBudgetForDest_RaisesEEReserve(t *testing.T) {
+	ResetDestEEStatsForTesting()
+	dest := "ee-big.example:443"
+	base := CoalescedCertBudget(2500)
+	if base <= 0 {
+		t.Fatalf("base budget %d", base)
+	}
+	// Without samples, dest-aware equals base.
+	if got := CoalescedCertBudgetForDest(2500, dest); got != base {
+		t.Fatalf("no samples: got %d want %d", got, base)
+	}
+	// Feed large EE samples (p90 path).
+	for i := 0; i < 5; i++ {
+		NoteDestEEPlain(dest, 120)
+	}
+	p90, n, ok := GetDestEEPlainP90(dest)
+	if !ok || n < 3 || p90 < 100 {
+		t.Fatalf("p90=%d n=%d ok=%v", p90, n, ok)
+	}
+	got := CoalescedCertBudgetForDest(2500, dest)
+	if got >= base {
+		t.Fatalf("expected smaller cert budget after large EE: base=%d got=%d", base, got)
+	}
+	// Safety never below 48: recompute bound.
+	const aeadTag = 16
+	const contentType = 1
+	maxPlain := 2500 - recordHeaderLen - contentType - aeadTag
+	overhead := p90 + coalescedCVEd25519 + coalescedFinishedSHA256 + coalescedEEHeadroom
+	if overhead < coalescedEECVFinishedOverhead {
+		overhead = coalescedEECVFinishedOverhead
+	}
+	want := maxPlain - overhead - coalescedSafetyInner
+	if want < 0 {
+		want = 0
+	}
+	if got != want {
+		t.Fatalf("got %d want %d (safety=%d)", got, want, coalescedSafetyInner)
+	}
+	// Never overshoot: cert budget + overhead + safety <= maxPlain
+	if got+overhead+coalescedSafetyInner > maxPlain {
+		t.Fatalf("overshoot residual: cert=%d overhead=%d safety=%d maxPlain=%d", got, overhead, coalescedSafetyInner, maxPlain)
+	}
+}
+
+func TestCreateFillerCertStyled_IssuerStyle(t *testing.T) {
+	meta := &DestCertMeta{
+		IssuerCN:          "Example Intermediate CA",
+		IssuerOrg:         "Example Trust",
+		IssuerCountry:     "US",
+		IntermediateNames: []string{"Example Intermediate CA"},
+	}
+	der, err := createFillerCertStyled(400, meta, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.IsCA {
+		t.Fatal("filler should advertise IsCA for intermediate makeup")
+	}
+	if c.Subject.CommonName == "" || !strings.Contains(c.Subject.CommonName, "Example Intermediate CA") {
+		t.Fatalf("subject CN=%q", c.Subject.CommonName)
+	}
+	if len(c.Subject.Organization) == 0 || c.Subject.Organization[0] != "Example Trust" {
+		t.Fatalf("org=%v", c.Subject.Organization)
+	}
+	// Still Ed25519 throwaway key, not REALITY leaf auth path.
+	if _, ok := c.PublicKey.(ed25519.PublicKey); !ok {
+		t.Fatal("expected ed25519 filler key")
+	}
+}
+
+func TestNoteDestEEFromRecordLens_SplitOnly(t *testing.T) {
+	ResetDestEEStatsForTesting()
+	dest := "lens.example:443"
+	// Outer EE record: header + plain + ctype + tag
+	eePlain := 48
+	outer := recordHeaderLen + eePlain + 1 + 16
+	var lens [7]int
+	lens[2] = outer
+	NoteDestEEFromRecordLens(dest, lens, RecordModeCoalesced)
+	if _, _, ok := GetDestEEPlainP90(dest); ok {
+		t.Fatal("coalesced mode must not sample")
+	}
+	NoteDestEEFromRecordLens(dest, lens, RecordModeSplit)
+	NoteDestEEFromRecordLens(dest, lens, RecordModeSplit)
+	NoteDestEEFromRecordLens(dest, lens, RecordModeSplit)
+	p90, n, ok := GetDestEEPlainP90(dest)
+	if !ok || n < 3 || p90 != eePlain {
+		t.Fatalf("p90=%d n=%d ok=%v", p90, n, ok)
+	}
+}
+
+func TestPersistCertMeta_RoundTrip(t *testing.T) {
+	in := &DestCertMeta{
+		CN:                "persist.example",
+		DNSNames:          []string{"persist.example", "www.persist.example"},
+		Organization:      "Persist Org",
+		NotBefore:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		NotAfter:          time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ChainDepth:        2,
+		ChainLens:         []int{800, 900},
+		LeafLen:           800,
+		IssuerCN:          "Persist Intermediate",
+		IssuerOrg:         "Persist CA",
+		IssuerCountry:     "DE",
+		IntermediateNames: []string{"Persist Intermediate"},
+	}
+	pm := persistCertMetaFrom(in)
+	out := destCertMetaFromPersist(pm)
+	if out == nil || out.CN != in.CN || out.IssuerCN != in.IssuerCN || out.IssuerOrg != in.IssuerOrg {
+		t.Fatalf("roundtrip failed: %+v", out)
+	}
+	if len(out.DNSNames) != 2 || out.DNSNames[0] != "persist.example" {
+		t.Fatalf("dns=%v", out.DNSNames)
+	}
+	if out.ChainDepth != 2 || out.LeafLen != 800 || len(out.ChainLens) != 2 {
+		t.Fatalf("chain shape: %+v", out)
+	}
+	if out.NotBefore.UTC().Year() != 2025 || out.NotAfter.UTC().Year() != 2026 {
+		t.Fatalf("dates %v %v", out.NotBefore, out.NotAfter)
 	}
 }

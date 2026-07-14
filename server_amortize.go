@@ -1,4 +1,4 @@
-﻿package reality
+package reality
 
 import (
 	"context"
@@ -18,7 +18,6 @@ import (
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
-
 
 // detectOnceConfigs tracks which dests have already had detection launched.
 // Each dest gets exactly one DetectPostHandshakeRecordsLens goroutine.
@@ -515,6 +514,8 @@ func runL2Handshake(hs *serverHandshakeStateTLS13, profile *RealityProfile, show
 	}
 
 	hs.hello = hello
+	// D1: expose profile CertMeta to MaterializeCert path (display only).
+	hs.c.amortizeProfile = profile
 	// Prefer live-compatible R0 length from template record framing.
 	lens := profile.RecordLens
 	if lens[0] == 0 {
@@ -750,6 +751,20 @@ func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, used
 		ev = 0
 		liveEv = 0
 	}
+	dest := ""
+	sni := ""
+	if config != nil {
+		dest = config.Dest
+	}
+	if hs.clientHello != nil {
+		sni = hs.clientHello.serverName
+	}
+	// D1: snapshot dest leaf/chain meta into the profile for L2/persist.
+	certMeta := ResolveDestCertMeta(nil, dest, sni)
+	// D2: sample EE plaintext from split-mode live observations.
+	if source == "live" && dest != "" {
+		NoteDestEEFromRecordLens(dest, usedLen, mode)
+	}
 	return &RealityProfile{
 		RecordLens:          usedLen,
 		Fingerprint:         computeFingerprint(suite, alpn, usedLen[0], usedLen[2]),
@@ -759,8 +774,8 @@ func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, used
 		RecordCount:         recordCount,
 		CapturedAt:          now,
 		RecordMode:          mode,
-		Dest:                config.Dest,
-		ServerName:          hs.clientHello.serverName,
+		Dest:                dest,
+		ServerName:          sni,
 		CHClass:             chClass,
 		KeyShareGroup:       group,
 		AcceptsHRR:          false,
@@ -770,6 +785,7 @@ func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, used
 		LiveEvidence:        liveEv,
 		Source:              source,
 		CHClassVer:          CHClassVersion,
+		CertMeta:            certMeta,
 	}
 }
 
@@ -797,5 +813,3 @@ func emitHandshakeComplete(config *Config, hs *serverHandshakeStateTLS13, usedLe
 	})
 	_ = path
 }
-
-

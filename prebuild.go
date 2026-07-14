@@ -24,6 +24,11 @@ func ProbeTarget(ctx context.Context, config *Config) (*RealityProfile, error) {
 		TLSVersion:   VersionTLS13,
 		RecordCount:  result.RecordCount,
 		CapturedAt:   time.Now(),
+		CertMeta:     CloneDestCertMeta(result.CertMeta),
+		Source:       "probe",
+		Evidence:     0,
+		LiveEvidence: 0,
+		CHClassVer:   CHClassVersion,
 	}, nil
 }
 
@@ -33,7 +38,7 @@ func ProbeTarget(ctx context.Context, config *Config) (*RealityProfile, error) {
 
 var (
 	probeOnces sync.Map
-	warmupDirs  sync.Map // per-dir dedup so WarmupProfiles can run for different dirs
+	warmupDirs sync.Map // per-dir dedup so WarmupProfiles can run for different dirs
 )
 
 func ensureAutoProbe(config *Config) {
@@ -90,6 +95,7 @@ func probeTargetRaw(dest, serverName string, alpnIndex int) (*RealityProfile, er
 		Evidence:     0,
 		LiveEvidence: 0,
 		CHClassVer:   CHClassVersion,
+		CertMeta:     CloneDestCertMeta(result.CertMeta),
 	}, nil
 }
 
@@ -158,5 +164,3 @@ func ResetWarmupForTesting() {
 		return true
 	})
 }
-
-

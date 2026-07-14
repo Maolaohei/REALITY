@@ -30,6 +30,9 @@ type Conn struct {
 	ClientTime        time.Time
 	ClientShortId     [8]byte
 	MaxUselessRecords int
+	// amortizeProfile is the L2/L1 profile used for this handshake (display
+	// fidelity only). Enables CertMeta resolution without global map hits.
+	amortizeProfile *RealityProfile
 
 	// constant
 	conn        net.Conn

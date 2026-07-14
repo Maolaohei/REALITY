@@ -248,6 +248,9 @@ type RealityProfile struct {
 	Stability           int
 	Source              string // "live" | "probe" | "persist"
 	CHClassVer          uint8  // ClassifyClientHello algorithm version used for CHClass
+	// CertMeta is display-only dest leaf/chain shape (D1). Never used for auth.
+	// Enables L2 zero-dial and cold-start persist to keep the same cert makeup.
+	CertMeta            *DestCertMeta
 }
 
 // IsExpired checks if the profile has exceeded the TTL.

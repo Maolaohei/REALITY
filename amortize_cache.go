@@ -275,6 +275,10 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 			if len(obs.ServerHelloTemplate) > 0 {
 				merged.ServerHelloTemplate = append([]byte(nil), obs.ServerHelloTemplate...)
 			}
+			// D1: refresh display-only cert meta when present (never auth).
+			if obs.CertMeta != nil {
+				merged.CertMeta = CloneDestCertMeta(obs.CertMeta)
+			}
 			if isProbe {
 				// Probe match: refresh shape but do not promote LiveEvidence.
 				merged.Source = cur.Source
@@ -562,9 +566,3 @@ func WriteAll(w io.Writer, b []byte) error {
 	}
 	return nil
 }
-
-
-
-
-
-
