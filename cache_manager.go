@@ -293,19 +293,6 @@ func (m *CacheManager) StoreFingerprint(key string, fp *targetFingerprintCache) 
 	m.fingerprints.Store(key, fp)
 }
 
-// ValidateRecordLens checks that a RecordLens array contains sane values.
-func ValidateRecordLens(lens [7]int) bool {
-	for _, l := range lens {
-		if l == 0 {
-			continue
-		}
-		if l < recordHeaderLen || l > maxTLSRecordPayload {
-			return false
-		}
-	}
-	return true
-}
-
 
 // FindFullCachedProfile searches for a cached profile with ServerHello data.
 func (m *CacheManager) FindFullCachedProfile(dest, serverName string, cipherSuites []uint16, alpn string) *RealityProfile {
@@ -387,13 +374,18 @@ func (m *CacheManager) SnapshotProfiles() map[string]*RealityProfile {
 	now := time.Now()
 	m.entries.Range(func(key, val any) bool {
 		entry := val.(*ProfileEntry)
-		if entry.State == ProfileNegative {
+		// StoreObservation replaces entry.Profile under entry.mu; copy under lock.
+		entry.mu.Lock()
+		if entry.State == ProfileNegative || entry.Profile == nil {
+			entry.mu.Unlock()
 			return true
 		}
 		if now.Sub(entry.Profile.CapturedAt) > entry.TTL {
+			entry.mu.Unlock()
 			return true
 		}
 		cp := *entry.Profile
+		entry.mu.Unlock()
 		snap[key.(string)] = &cp
 		return true
 	})
@@ -500,3 +492,5 @@ func (m *CacheManager) Reset() {
 }
 
 var globalCacheManager = NewCacheManager()
+
+

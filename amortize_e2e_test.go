@@ -1,4 +1,4 @@
-﻿//go:build l2
+//go:build l2
 
 package reality
 

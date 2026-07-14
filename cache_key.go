@@ -1,4 +1,4 @@
-﻿package reality
+package reality
 
 import (
 	"strconv"

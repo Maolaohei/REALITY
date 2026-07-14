@@ -186,9 +186,11 @@ func newE2EHarness(t *testing.T, opts e2eHarnessOpts) *e2eHarness {
 		}
 	}()
 
-	// Isolate from other tests / async DetectPostHandshakeRecordsLens.
-	GlobalPostHandshakeRecordsLens = sync.Map{}
-	GlobalMaxCSSMsgCount = sync.Map{}
+		// Isolate from other tests / async DetectPostHandshakeRecordsLens.
+	// Never reassign the package-level sync.Map values: DetectPostHandshakeRecordsLens
+	// and CSS detectors may still Load/Store concurrently. Clear keys in-place.
+	clearSyncMap(&GlobalPostHandshakeRecordsLens)
+	clearSyncMap(&GlobalMaxCSSMsgCount)
 
 	// Give accept loops a moment.
 	time.Sleep(30 * time.Millisecond)
@@ -365,9 +367,13 @@ func (h *e2eHarness) maxEvidence() int {
 	maxEv := 0
 	globalCacheManager.entries.Range(func(_, v any) bool {
 		e := v.(*ProfileEntry)
+		// StoreObservation mutates entry.Profile under e.mu; take the lock
+		// so race detector does not trip on concurrent report() vs event bus.
+		e.mu.Lock()
 		if e.Profile != nil && e.Profile.Evidence > maxEv {
 			maxEv = e.Profile.Evidence
 		}
+		e.mu.Unlock()
 		return true
 	})
 	return maxEv
@@ -398,5 +404,17 @@ func (h *e2eHarness) dialPlainTLS(t *testing.T, serverName string) (*tls.Conn, e
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
 		NextProtos:         []string{"h2", "http/1.1"},
+	})
+}
+
+// clearSyncMap deletes all keys from m without replacing the map header.
+// Safe against concurrent Load/Store on the same map value.
+func clearSyncMap(m *sync.Map) {
+	if m == nil {
+		return
+	}
+	m.Range(func(key, _ any) bool {
+		m.Delete(key)
+		return true
 	})
 }

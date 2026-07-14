@@ -50,7 +50,7 @@ func ensureAutoProbe(config *Config) {
 		if !m.started {
 			m.Start()
 		}
-		// Don't register target here — serverName/ALPN are unknown at this
+		// Don't register target here ?serverName/ALPN are unknown at this
 		// point. Registration happens in RegisterRefreshHandlers via the
 		// EventHandshakeComplete event with correct parameters.
 	})
@@ -83,9 +83,13 @@ func probeTargetRaw(dest, serverName string, alpnIndex int) (*RealityProfile, er
 		TLSVersion:   VersionTLS13,
 		RecordCount:  result.RecordCount,
 		CapturedAt:   time.Now(),
+		RecordMode:   InferRecordMode(result.RecordLens),
 		Dest:         dest,
 		ServerName:   serverName,
 		Source:       "probe",
+		Evidence:     0,
+		LiveEvidence: 0,
+		CHClassVer:   CHClassVersion,
 	}, nil
 }
 
@@ -154,3 +158,5 @@ func ResetWarmupForTesting() {
 		return true
 	})
 }
+
+

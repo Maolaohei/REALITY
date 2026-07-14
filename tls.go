@@ -167,7 +167,7 @@ var (
 	maxRecordSize = 65536
 
 	// maxTLSRecordPayload is the maximum payload size of a single TLS record
-	// as defined by RFC 8446 §5.1 (2^14 = 16384 bytes).
+	// as defined by RFC 8446 ?5.1 (2^14 = 16384 bytes).
 	maxTLSRecordPayload = 16384
 
 	// maxConcurrentHandshakes limits the number of simultaneous handshake
@@ -233,6 +233,7 @@ type RealityProfile struct {
 	TLSVersion    uint16 // TLS 1.2 or 1.3 - different versions have different record layouts
 	RecordCount   int
 	CapturedAt    time.Time
+	RecordMode    uint8 // RecordModeSplit / RecordModeCoalesced
 
 	// Amortize / policy fields (optional for legacy entries).
 	Dest                string
@@ -242,9 +243,11 @@ type RealityProfile struct {
 	AcceptsHRR          bool
 	ShapeHash           uint64
 	ServerHelloTemplate []byte // handshake message only (no record header)
-	Evidence            int    // consecutive matching live observations
+	Evidence            int    // consecutive matching observations (live quality for L2)
+	LiveEvidence        int    // consecutive matching live-only observations
 	Stability           int
 	Source              string // "live" | "probe" | "persist"
+	CHClassVer          uint8  // ClassifyClientHello algorithm version used for CHClass
 }
 
 // IsExpired checks if the profile has exceeded the TTL.
@@ -271,7 +274,7 @@ func bigEndianUint16(b []byte) uint16 {
 }
 
 // computeFingerprint computes FNV64 hash of (CipherSuite, ALPN, ServerHelloLen, ExtensionsLen).
-// Used for cache hit/miss decisions — more robust than comparing individual fields.
+// Used for cache hit/miss decisions ?more robust than comparing individual fields.
 func computeFingerprint(cipherSuite uint16, alpn string, serverHelloLen, extensionsLen int) uint64 {
 	var h uint64 = fnv64Offset
 	mixU16 := func(v uint16) {
@@ -659,3 +662,5 @@ func parsePrivateKey(der []byte) (crypto.PrivateKey, error) {
 
 	return nil, errors.New("tls: failed to parse private key")
 }
+
+

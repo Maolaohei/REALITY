@@ -164,32 +164,70 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		}
 	*/
 	{
-		var cert []byte
-		if len(c.config.Mldsa65Key) > 0 {
-			cert = make([]byte, len(signedCertMldsa65))
-			copy(cert, signedCertMldsa65)
-		} else {
-			cert = make([]byte, len(signedCert))
-			copy(cert, signedCert)
+		// Fidelity CertPlan: template leaf (+ optional chain) under Ed25519+HMAC,
+		// sized toward observed Certificate record budget. Success path remains TLS 1.3 only.
+		mldsa := len(c.config.Mldsa65Key) > 0
+		mode := RecordModeSplit
+		// handshakeLen is copied before handshake(); slot 1 non-zero arms padding path.
+		// Coalesced targets buffer EE..Finished into handshakeBuf when R2 > 512.
+		if c.out.handshakeLen[2] > 512 {
+			mode = RecordModeCoalesced
+		} else if c.out.handshakeBuf != nil {
+			mode = RecordModeCoalesced
 		}
-
-		h := hmac.New(sha512.New, c.AuthKey)
-		h.Write(ed25519Priv[32:])
-		h.Sum(cert[:len(cert)-64])
-
-		if len(c.config.Mldsa65Key) > 0 {
-			h.Write(hs.clientHello.original)
-			h.Write(hs.hello.original)
-			key, err := mldsa65.Scheme().UnmarshalBinaryPrivateKey(c.config.Mldsa65Key)
-			if err != nil {
-				return fmt.Errorf("REALITY: invalid Mldsa65Key: %w", err)
+		budget := 0
+		if mode == RecordModeSplit {
+			budget = c.out.handshakeLen[3]
+		}
+		// Coalesced residual is handled by record padding to R2; keep cert minimal (budget=0).
+		plan := GetCertPlan(budget, mldsa, mode)
+		// Hard guard: if the Certificate message cannot fit the observed outer lens,
+		// fall back to historical minimal leaf. padding < 0 in encrypt is fatal EOF.
+		if plan != nil && mode == RecordModeSplit && budget > 0 && !certPlanFitsBudget(plan, budget) {
+			plan = fallbackCertPlan(mldsa)
+		}
+		if plan == nil {
+			// Last-resort historical path.
+			var cert []byte
+			if mldsa {
+				cert = make([]byte, len(signedCertMldsa65))
+				copy(cert, signedCertMldsa65)
+			} else {
+				cert = make([]byte, len(signedCert))
+				copy(cert, signedCert)
 			}
-			mldsa65.SignTo(key.(*mldsa65.PrivateKey), h.Sum(nil), nil, false, cert[126:]) // fixed location
-		}
-
-		hs.cert = &Certificate{
-			Certificate: [][]byte{cert},
-			PrivateKey:  ed25519Priv,
+			h := hmac.New(sha512.New, c.AuthKey)
+			h.Write(ed25519Priv[32:])
+			h.Sum(cert[:len(cert)-64])
+			if mldsa {
+				h.Write(hs.clientHello.original)
+				h.Write(hs.hello.original)
+				key, err := mldsa65.Scheme().UnmarshalBinaryPrivateKey(c.config.Mldsa65Key)
+				if err != nil {
+					return fmt.Errorf("REALITY: invalid Mldsa65Key: %w", err)
+				}
+				mldsa65.SignTo(key.(*mldsa65.PrivateKey), h.Sum(nil), nil, false, cert[126:])
+			}
+			hs.cert = &Certificate{
+				Certificate: [][]byte{cert},
+				PrivateKey:  ed25519Priv,
+			}
+		} else {
+			var chOrig, shOrig []byte
+			if hs.clientHello != nil {
+				chOrig = hs.clientHello.original
+			}
+			if hs.hello != nil {
+				shOrig = hs.hello.original
+			}
+			chain, err := MaterializeCert(plan, c.AuthKey, c.config.Mldsa65Key, chOrig, shOrig)
+			if err != nil {
+				return fmt.Errorf("REALITY: materialize cert: %w", err)
+			}
+			hs.cert = &Certificate{
+				Certificate: chain,
+				PrivateKey:  ed25519Priv,
+			}
 		}
 		hs.sigAlg = Ed25519
 	}
@@ -1274,3 +1312,5 @@ func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 
 	return nil
 }
+
+

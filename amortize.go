@@ -71,9 +71,15 @@ func isGREASE(v uint16) bool {
 	return v&0x0f0f == 0x0a0a && (v>>8) == (v&0xff)
 }
 
-// ClassifyClientHello derives a stable ClientHello equivalence-class id.
+// ClassifyClientHello derives a stable ClientHello equivalence-class id (v2).
 // Profiles are keyed by this so different cipher/group/ALPN/ECH shapes never mix.
 // Ordering of suites/groups is normalized so fingerprint shuffle does not split cache.
+//
+// v2 inputs (beyond v1 ALPN/group/ECH/version):
+//   - TLS 1.3 cipher suite set ? {0x1301,0x1302,0x1303} (sorted, GREASE ignored)
+//   - supported group set flags (X25519 / ML-KEM / P-256)
+//   - coarse signature-algorithm buckets (Ed25519 / ECDSA-P256 / RSA-PSS)
+// Algorithm version is CHClassVersion; bump when inputs change.
 func ClassifyClientHello(ch *clientHelloMsg) string {
 	if ch == nil {
 		return "empty"
@@ -90,6 +96,9 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 		h *= fnv64Prime
 	}
 
+	// Version tag so persisted CHClass cannot silently mix algorithms.
+	mixByte(CHClassVersion)
+
 	// Primary ALPN only (first). Empty is distinct from h2/http1.1.
 	alpn := clientALPN(ch)
 	for i := 0; i < len(alpn); i++ {
@@ -98,7 +107,43 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 	}
 	mixByte(0)
 
-	// Key-share capability flags (order/GREASE independent).
+	// TLS 1.3 suite set (order-independent, GREASE filtered).
+	var suites [3]uint16
+	nSuites := 0
+	seenSuite := [3]bool{}
+	for _, cs := range ch.cipherSuites {
+		if isGREASE(cs) {
+			continue
+		}
+		var idx int = -1
+		switch cs {
+		case 0x1301: // AES-128-GCM
+			idx = 0
+		case 0x1302: // AES-256-GCM
+			idx = 1
+		case 0x1303: // CHACHA20-POLY1305
+			idx = 2
+		}
+		if idx >= 0 && !seenSuite[idx] {
+			seenSuite[idx] = true
+			suites[nSuites] = cs
+			nSuites++
+		}
+	}
+	// Sort ascending for stable hash.
+	for i := 0; i < nSuites; i++ {
+		for j := i + 1; j < nSuites; j++ {
+			if suites[j] < suites[i] {
+				suites[i], suites[j] = suites[j], suites[i]
+			}
+		}
+	}
+	for i := 0; i < nSuites; i++ {
+		mixU16(suites[i])
+	}
+	mixByte(byte(nSuites))
+
+	// Key-share / supported_groups capability flags (order/GREASE independent).
 	var hasX25519, hasMLKEM, hasP256 bool
 	for _, ks := range ch.keyShares {
 		switch ks.group {
@@ -110,8 +155,10 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 			hasP256 = true
 		}
 	}
-	// Also consider supported_groups in case keyshare deferred (HRR).
 	for _, g := range ch.supportedCurves {
+		if isGREASE(uint16(g)) {
+			continue
+		}
 		switch g {
 		case X25519:
 			hasX25519 = true
@@ -136,6 +183,38 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 	} else {
 		mixByte(0)
 	}
+
+	// Coarse signature-algorithm buckets.
+	var hasEd25519, hasECDSA, hasRSAPSS bool
+	for _, sa := range ch.supportedSignatureAlgorithms {
+		if isGREASE(uint16(sa)) {
+			continue
+		}
+		switch sa {
+		case Ed25519:
+			hasEd25519 = true
+		case ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512:
+			hasECDSA = true
+		case PSSWithSHA256, PSSWithSHA384, PSSWithSHA512:
+			hasRSAPSS = true
+		}
+	}
+	if hasEd25519 {
+		mixByte(1)
+	} else {
+		mixByte(0)
+	}
+	if hasECDSA {
+		mixByte(1)
+	} else {
+		mixByte(0)
+	}
+	if hasRSAPSS {
+		mixByte(1)
+	} else {
+		mixByte(0)
+	}
+
 	if len(ch.encryptedClientHello) > 0 {
 		mixByte(1)
 	} else {
@@ -203,7 +282,7 @@ func ResolveAmortizeMode(mode AmortizeMode) AmortizeMode {
 
 // profileL2Eligible reports whether p may be used for zero-dial.
 // Gates (all required):
-//   - consecutive evidence ≥ MinL2Evidence
+//   - consecutive evidence ?MinL2Evidence
 //   - non-HRR path with cipher/group/template/lens
 //   - structural ShapeHash present (prevents partial/legacy templates)
 //   - CapturedAt within MaxL2ProfileAge (stale profiles fall back to L1)
@@ -211,7 +290,17 @@ func profileL2Eligible(p *RealityProfile) bool {
 	if p == nil {
 		return false
 	}
-	if p.Evidence < MinL2Evidence {
+	// Probe-only profiles must never L2 (even if Evidence was stamped by mistake).
+	if p.Source == "probe" {
+		return false
+	}
+	// Prefer LiveEvidence when present; fall back to Evidence for older entries
+	// / tests that only populated Evidence from live StoreObservation.
+	live := p.LiveEvidence
+	if live <= 0 {
+		live = p.Evidence
+	}
+	if live < MinL2Evidence {
 		return false
 	}
 	if p.AcceptsHRR {
@@ -295,3 +384,9 @@ func computeShapeHash(cipherSuite uint16, group CurveID, r0Len int, templateLen 
 	mixU16(uint16(templateLen))
 	return h
 }
+
+
+
+
+
+

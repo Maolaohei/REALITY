@@ -30,7 +30,7 @@ func triggerDetectPostHandshake(config *Config) {
 		return
 	}
 	if _, loaded := detectOnceConfigs.LoadOrStore(config.Dest, struct{}{}); !loaded {
-		// First time seeing this dest — launch detection in background.
+		// First time seeing this dest ?launch detection in background.
 		go DetectPostHandshakeRecordsLens(config)
 	}
 }
@@ -106,6 +106,23 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	alpn := clientALPN(hs.clientHello)
 	chClass := ClassifyClientHello(hs.clientHello)
 	mode := ResolveAmortizeMode(config.AmortizeMode)
+
+	// Unsuitable dest: mirror even after auth (anti-probe; no synthetic TLS1.3 success).
+	if DestShouldMirrorOnly(config.Dest) {
+		if show {
+			fmt.Printf("REALITY remoteAddr: %v\tdest unsuitable ? mirror only\n", remoteAddr)
+		}
+		return mirrorAfterFailedAuth(ctx, conn, underlying, config, hs.clientHello, remoteAddr, show,
+			"dest unsuitable for REALITY success path")
+	}
+	// Offline / unsuitable force no amortize (L0 only if we continue ? here offline also mirrors).
+	if !DestAllowsAmortize(config.Dest) {
+		mode = AmortizeL0
+		if show {
+			fmt.Printf("REALITY remoteAddr: %v\tdest capability blocks amortize (force L0)\n", remoteAddr)
+		}
+	}
+
 	// Pre-lookup without live cipher (for L2 eligibility).
 	pre := globalCacheManager.LookupAmortize(mode, config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass, 0, 0)
 	path := pre.Path
@@ -153,6 +170,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	// --- Path L0/L1: dial RA and observe ---
 	target, err := dialTarget(ctx, conn, config)
 	if err != nil {
+		NoteDestCaptureFailure(config.Dest, "dial")
 		conn.Close()
 		return nil, err
 	}
@@ -172,6 +190,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	usedLen, helloMsg, r0Template, capturedPath, err := captureTargetRecords(target, &hs, config, mode, chClass, alpn, show, remoteAddr)
 	if err != nil || helloMsg == nil || usedLen[0] == 0 {
 		// Mirror remaining like legacy failure path.
+		NoteDestCaptureFailure(config.Dest, classifyCaptureError(err))
 		if show {
 			fmt.Printf("REALITY remoteAddr: %v\ttarget capture failed: %v\n", remoteAddr, err)
 		}
@@ -230,6 +249,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 	// Build observation profile for amortize.
 	obs := buildObservationProfile(config, &hs, savedLen, chClass, alpn, r0Template, "live")
+	NoteDestTLS13Ready(config.Dest)
 	// Also store under legacy key for backward-compatible L1 hits.
 	v2Key := CacheKeyV2(config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass)
 	globalCacheManager.StoreObservation(v2Key, obs)
@@ -570,7 +590,7 @@ func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config
 			}
 			if i == 2 && handshakeLen > 512 {
 				// Large EE: same special-case as legacy (buffer, break early for this record).
-				// Do NOT use the pool buffer here — it will be returned to the pool
+				// Do NOT use the pool buffer here ?it will be returned to the pool
 				// via defer while handshakeBuf is still live in the Conn. Instead
 				// allocate a dedicated slice that the caller owns.
 				usedLen[i] = handshakeLen
@@ -608,14 +628,23 @@ func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config
 						usedLen[0] = handshakeLen
 						path = PathL1
 						if show {
-							fmt.Printf("REALITY remoteAddr: %v\tcache hit — using cached RecordLens (skipping R1-R6)\n", remoteAddr)
+							fmt.Printf("REALITY remoteAddr: %v\tcache hit ?using cached RecordLens (skipping R1-R6)\n", remoteAddr)
 						}
 						return usedLen, hello, r0Template, path, nil
 					}
 					if res.Path == PathL0 || res.Profile == nil {
 						// async reprobe on miss
 						go globalCacheManager.DoProbe(CacheKey(hs.clientHello.serverName, alpn, VersionTLS13), func() (*RealityProfile, error) {
-							return probeTargetRaw(config.Dest, hs.clientHello.serverName, alpnToInt(alpn))
+							p, err := probeTargetRaw(config.Dest, hs.clientHello.serverName, alpnToInt(alpn))
+							if err == nil && p != nil {
+								p.Source = "probe"
+								if p.RecordMode == 0 {
+									p.RecordMode = InferRecordMode(p.RecordLens)
+								}
+								// Store under legacy key without L2 promotion.
+								globalCacheManager.StoreObservation(CacheKey(hs.clientHello.serverName, alpn, VersionTLS13), p)
+							}
+							return p, err
 						})
 					}
 				}
@@ -693,6 +722,15 @@ func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, used
 		suite = hs.hello.cipherSuite
 	}
 	now := time.Now()
+	mode := InferRecordMode(usedLen)
+	liveEv := 0
+	ev := 1
+	if source == "live" {
+		liveEv = 1
+	} else if source == "probe" {
+		ev = 0
+		liveEv = 0
+	}
 	return &RealityProfile{
 		RecordLens:          usedLen,
 		Fingerprint:         computeFingerprint(suite, alpn, usedLen[0], usedLen[2]),
@@ -701,6 +739,7 @@ func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, used
 		TLSVersion:          hs.c.vers,
 		RecordCount:         recordCount,
 		CapturedAt:          now,
+		RecordMode:          mode,
 		Dest:                config.Dest,
 		ServerName:          hs.clientHello.serverName,
 		CHClass:             chClass,
@@ -708,8 +747,10 @@ func buildObservationProfile(config *Config, hs *serverHandshakeStateTLS13, used
 		AcceptsHRR:          false,
 		ShapeHash:           computeShapeHash(suite, group, usedLen[0], len(r0Template)),
 		ServerHelloTemplate: append([]byte(nil), r0Template...),
-		Evidence:            1,
+		Evidence:            ev,
+		LiveEvidence:        liveEv,
 		Source:              source,
+		CHClassVer:          CHClassVersion,
 	}
 }
 
@@ -737,3 +778,5 @@ func emitHandshakeComplete(config *Config, hs *serverHandshakeStateTLS13, usedLe
 	})
 	_ = path
 }
+
+

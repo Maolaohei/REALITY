@@ -193,6 +193,18 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 	if obs == nil || !ValidateRecordLens(obs.RecordLens) {
 		return
 	}
+	// Normalize record mode when missing.
+	if obs.RecordMode == 0 {
+		obs.RecordMode = InferRecordMode(obs.RecordLens)
+	}
+	// Probe observations refresh lens/health but never climb the L2 evidence ladder.
+	isProbe := obs.Source == "probe"
+	if isProbe {
+		// Cap evidence fields for probe-only merges below.
+		if obs.LiveEvidence != 0 {
+			obs.LiveEvidence = 0
+		}
+	}
 	if val, ok := m.entries.Load(key); ok {
 		entry := val.(*ProfileEntry)
 		entry.mu.Lock()
@@ -204,11 +216,19 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 				return
 			}
 			cp := *obs
-			cp.Evidence = 1
+			if isProbe {
+				// Probe cannot unquarantine into the L2 ladder.
+				cp.Evidence = 0
+				cp.LiveEvidence = 0
+				cp.Source = "probe"
+			} else {
+				cp.Evidence = 1
+				cp.LiveEvidence = 1
+				cp.Source = "live"
+			}
 			if cp.Stability < 1 {
 				cp.Stability = 1
 			}
-			cp.Source = "live"
 			entry.Profile = &cp
 			entry.State = ProfileValid
 			entry.atomicState.Store(int32(ProfileValid))
@@ -240,11 +260,24 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 			if len(obs.ServerHelloTemplate) > 0 {
 				merged.ServerHelloTemplate = append([]byte(nil), obs.ServerHelloTemplate...)
 			}
-			merged.Evidence = cur.Evidence + 1
-			if merged.Stability < 10 {
-				merged.Stability = cur.Stability + 1
+			if isProbe {
+				// Probe match: refresh shape but do not promote LiveEvidence.
+				merged.Source = cur.Source
+				if merged.Source == "" {
+					merged.Source = "probe"
+				}
+				// Keep existing Evidence/LiveEvidence.
+				merged.Evidence = cur.Evidence
+				merged.LiveEvidence = cur.LiveEvidence
+			} else {
+				merged.Evidence = cur.Evidence + 1
+				merged.LiveEvidence = cur.LiveEvidence + 1
+				if merged.Stability < 10 {
+					merged.Stability = cur.Stability + 1
+				}
+				merged.Source = "live"
 			}
-			merged.Source = "live"
+			merged.RecordMode = obs.RecordMode
 			entry.Profile = &merged
 			entry.State = ProfileValid
 			entry.atomicState.Store(int32(ProfileValid))
@@ -260,8 +293,18 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 			entry.FailCount++
 			if entry.FailCount >= 2 {
 				cp := *obs
-				if cp.Evidence < 1 {
-					cp.Evidence = 1
+				if isProbe {
+					cp.Evidence = 0
+					cp.LiveEvidence = 0
+					cp.Source = "probe"
+				} else {
+					if cp.Evidence < 1 {
+						cp.Evidence = 1
+					}
+					if cp.LiveEvidence < 1 {
+						cp.LiveEvidence = 1
+					}
+					cp.Source = "live"
 				}
 				entry.Profile = &cp
 				entry.State = ProfileValid
@@ -276,7 +319,15 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 		}
 		// First mismatch observation: mark suspect with new candidate.
 		cp := *obs
-		cp.Evidence = 1
+		if isProbe {
+			cp.Evidence = 0
+			cp.LiveEvidence = 0
+			cp.Source = "probe"
+		} else {
+			cp.Evidence = 1
+			cp.LiveEvidence = 1
+			cp.Source = "live"
+		}
 		entry.Profile = &cp
 		entry.State = ProfileSuspect
 		entry.atomicState.Store(int32(ProfileSuspect))
@@ -288,8 +339,21 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 
 	// New entry.
 	cp := *obs
-	if cp.Evidence < 1 {
-		cp.Evidence = 1
+	if isProbe {
+		cp.Evidence = 0
+		cp.LiveEvidence = 0
+		cp.Source = "probe"
+	} else {
+		if cp.Source == "" {
+			cp.Source = "live"
+		}
+		// Seed evidence ladder. Fixtures/legacy often set only Evidence.
+		if cp.Evidence < 1 {
+			cp.Evidence = 1
+		}
+		if cp.LiveEvidence < 1 {
+			cp.LiveEvidence = cp.Evidence
+		}
 	}
 	entry := &ProfileEntry{
 		Profile: &cp,
@@ -315,6 +379,18 @@ func profilesMatch(a, b *RealityProfile) bool {
 		return false
 	}
 	if a.AcceptsHRR != b.AcceptsHRR {
+		return false
+	}
+	// Record emission mode is part of shape (split vs coalesced).
+	am := a.RecordMode
+	bm := b.RecordMode
+	if am == 0 {
+		am = InferRecordMode(a.RecordLens)
+	}
+	if bm == 0 {
+		bm = InferRecordMode(b.RecordLens)
+	}
+	if am != bm {
 		return false
 	}
 	// Compare R0-R5; R6 (NewSessionTicket) is optional and may jitter.
@@ -471,3 +547,9 @@ func WriteAll(w io.Writer, b []byte) error {
 	}
 	return nil
 }
+
+
+
+
+
+
