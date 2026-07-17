@@ -1,6 +1,7 @@
 package reality
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
@@ -24,6 +25,40 @@ var realityAuthOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 20226, 1, 1}
 
 // ML-DSA-65 signature size used for extension capacity (matches circl mldsa65).
 const mldsa65SigSize = 3309
+
+// hmacSHA512Pool reuses HMAC-SHA512 states across MaterializeCert calls.
+// crypto/hmac binds the key at New; Reset restores that key. Entries are
+// keyed so concurrent handshakes with different AuthKeys do not cross-MAC.
+var hmacSHA512Pool = sync.Pool{}
+
+type pooledHMAC struct {
+	h   hash.Hash
+	key []byte
+}
+
+func acquireHMACSHA512(key []byte) *pooledHMAC {
+	if v := hmacSHA512Pool.Get(); v != nil {
+		ph := v.(*pooledHMAC)
+		if bytes.Equal(ph.key, key) {
+			ph.h.Reset()
+			return ph
+		}
+		// Key mismatch: discard entry (AuthKey is typically process-stable).
+	}
+	kc := append([]byte(nil), key...)
+	return &pooledHMAC{
+		h:   hmac.New(sha512.New, kc),
+		key: kc,
+	}
+}
+
+func releaseHMACSHA512(ph *pooledHMAC) {
+	if ph == nil || ph.h == nil {
+		return
+	}
+	ph.h.Reset()
+	hmacSHA512Pool.Put(ph)
+}
 
 // CertPlan describes a camouflage certificate chain for one handshake.
 // Auth invariant: leaf is Ed25519; HMAC-SHA512(AuthKey, pub) overwrites the
@@ -783,6 +818,7 @@ func MaterializeCert(plan *CertPlan, authKey []byte, mldsaKey []byte, clientHell
 		return nil, fmt.Errorf("nil cert plan")
 	}
 	// B1: one leaf copy (HMAC mutates signature slot); intermediate DERs are shared.
+	// Leaf escapes into Certificate.Certificate and cannot return to a pool.
 	leaf := make([]byte, len(plan.LeafDER))
 	copy(leaf, plan.LeafDER)
 
@@ -790,11 +826,14 @@ func MaterializeCert(plan *CertPlan, authKey []byte, mldsaKey []byte, clientHell
 	if off < 0 || off+64 > len(leaf) {
 		off = len(leaf) - 64
 	}
-	h := hmac.New(sha512.New, authKey)
+	ph := acquireHMACSHA512(authKey)
+	defer releaseHMACSHA512(ph)
+	h := ph.h
 	if len(ed25519Priv) >= 64 {
 		h.Write(ed25519Priv[32:])
 	}
-	copy(leaf[off:off+64], h.Sum(nil))
+	// Sum directly into the signature slot (avoids Sum(nil) heap slice).
+	_ = h.Sum(leaf[off:off])
 
 	if len(mldsaKey) > 0 && plan.MLDSAOffset >= 0 && plan.MLDSALen > 0 {
 		h.Write(clientHelloOrig)
@@ -811,13 +850,14 @@ func MaterializeCert(plan *CertPlan, authKey []byte, mldsaKey []byte, clientHell
 		if mOff < 0 || mOff+mldsa65SigSize > len(leaf) {
 			return nil, fmt.Errorf("REALITY: ML-DSA offset out of range")
 		}
-		mldsa65.SignTo(priv, h.Sum(nil), nil, false, leaf[mOff:mOff+mldsa65SigSize])
+		var hmacSum [64]byte
+		mldsa65.SignTo(priv, h.Sum(hmacSum[:0]), nil, false, leaf[mOff:mOff+mldsa65SigSize])
 	}
 
-	out := make([][]byte, 0, 1+len(plan.ChainDERs))
-	out = append(out, leaf)
-	// Share intermediate DER slices (immutable after plan build).
-	out = append(out, plan.ChainDERs...)
+	// Pre-size chain slice; share intermediate DER (immutable after plan build).
+	out := make([][]byte, 1+len(plan.ChainDERs))
+	out[0] = leaf
+	copy(out[1:], plan.ChainDERs)
 	return out, nil
 }
 

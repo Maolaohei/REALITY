@@ -2,7 +2,6 @@ package reality
 
 import (
 	"fmt"
-	"strconv"
 	"time"
 )
 
@@ -256,7 +255,7 @@ func ClassifyClientHello(ch *clientHelloMsg) string {
 	if has13 {
 		mixU16(VersionTLS13)
 	}
-	return strconv.FormatUint(h, 16)
+	return formatUint64Hex(h)
 }
 
 // clientALPN returns the first ALPN protocol or empty string.
@@ -415,3 +414,21 @@ func computeShapeHash(cipherSuite uint16, group CurveID, r0Len int, templateLen 
 
 
 
+
+
+// formatUint64Hex encodes v as lowercase hex without leading zeros (strconv.FormatUint base 16).
+// Uses a stack buffer so the only heap cost is the returned string.
+func formatUint64Hex(v uint64) string {
+	var buf [16]byte
+	i := len(buf)
+	if v == 0 {
+		return "0"
+	}
+	const hexdigits = "0123456789abcdef"
+	for v > 0 {
+		i--
+		buf[i] = hexdigits[v&0xf]
+		v >>= 4
+	}
+	return string(buf[i:])
+}

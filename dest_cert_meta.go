@@ -248,6 +248,10 @@ func SoftClassifyClientHello(ch *clientHelloMsg) string {
 	if ch == nil {
 		return ""
 	}
+	// Common path: no SCT/OCSP/ECH presence bits differ from exact class → soft is exact with "s:" prefix.
+	if !ch.scts && !ch.ocspStapling && len(ch.encryptedClientHello) == 0 {
+		return "s:" + ClassifyClientHello(ch)
+	}
 	tmp := *ch
 	if ch.scts || ch.ocspStapling {
 		tmp.scts = true
@@ -258,6 +262,18 @@ func SoftClassifyClientHello(ch *clientHelloMsg) string {
 	}
 	tmp.encryptedClientHello = nil
 	return "s:" + ClassifyClientHello(&tmp)
+}
+
+// SoftClassifyFromExact is SoftClassifyClientHello when the exact class is already known.
+// Avoids a second full FNV pass on the common no-SCT/OCSP/ECH path.
+func SoftClassifyFromExact(ch *clientHelloMsg, exactClass string) string {
+	if ch == nil {
+		return ""
+	}
+	if exactClass != "" && !ch.scts && !ch.ocspStapling && len(ch.encryptedClientHello) == 0 {
+		return "s:" + exactClass
+	}
+	return SoftClassifyClientHello(ch)
 }
 
 // WarmCertPlansForDest pre-builds common CertPlan entries (B2).

@@ -9,7 +9,15 @@ import (
 // Format: "serverName|alpn|tlsVersion"
 // Kept for backward compatibility with existing tests and disk profiles.
 func CacheKey(serverName, alpn string, tlsVersion uint16) string {
-	return serverName + "|" + alpn + "|" + uint16ToHex(tlsVersion)
+	var b strings.Builder
+	// Typical SNI + alpn + version hex fits well under 96B.
+	b.Grow(len(serverName) + len(alpn) + 10)
+	b.WriteString(serverName)
+	b.WriteByte('|')
+	b.WriteString(alpn)
+	b.WriteByte('|')
+	writeUint16Hex(&b, tlsVersion)
+	return b.String()
 }
 
 // CacheKeyV2 constructs a full amortize cache key.
@@ -18,7 +26,18 @@ func CacheKeyV2(dest, serverName, alpn string, tlsVersion uint16, chClass string
 	if chClass == "" {
 		chClass = "-"
 	}
-	return dest + "|" + serverName + "|" + alpn + "|" + uint16ToHex(tlsVersion) + "|" + chClass
+	var b strings.Builder
+	b.Grow(len(dest) + len(serverName) + len(alpn) + len(chClass) + 16)
+	b.WriteString(dest)
+	b.WriteByte('|')
+	b.WriteString(serverName)
+	b.WriteByte('|')
+	b.WriteString(alpn)
+	b.WriteByte('|')
+	writeUint16Hex(&b, tlsVersion)
+	b.WriteByte('|')
+	b.WriteString(chClass)
+	return b.String()
 }
 
 // CacheKeyFromProfile constructs a cache key from a RealityProfile.
@@ -78,7 +97,33 @@ func IsLegacyCacheKey(key string) bool {
 }
 
 func uint16ToHex(v uint16) string {
-	return "0x" + strconv.FormatUint(uint64(v), 16)
+	var b strings.Builder
+	b.Grow(6)
+	writeUint16Hex(&b, v)
+	return b.String()
+}
+
+// writeUint16Hex appends "0x" + lowercase hex without leading zeros (matches strconv.FormatUint).
+func writeUint16Hex(b *strings.Builder, v uint16) {
+	b.WriteByte('0')
+	b.WriteByte('x')
+	if v == 0 {
+		b.WriteByte('0')
+		return
+	}
+	const hexdigits = "0123456789abcdef"
+	// TLS versions are small (0x0303/0x0304); emit without left padding.
+	started := false
+	for shift := 12; shift >= 0; shift -= 4 {
+		nibble := byte((v >> shift) & 0xf)
+		if !started {
+			if nibble == 0 {
+				continue
+			}
+			started = true
+		}
+		b.WriteByte(hexdigits[nibble])
+	}
 }
 
 func hexToUint16(s string) uint16 {
@@ -88,14 +133,40 @@ func hexToUint16(s string) uint16 {
 }
 
 func splitKey(s string) []string {
-	var parts []string
+	// V2 keys have 5 fields; legacy has <=3. Fixed buffer avoids growable appends.
+	var buf [5]string
+	n := 0
 	start := 0
 	for i := 0; i < len(s); i++ {
 		if s[i] == '|' {
-			parts = append(parts, s[start:i])
+			if n < len(buf) {
+				buf[n] = s[start:i]
+				n++
+			} else {
+				// Rare malformed key with >4 separators: fall back to full split.
+				parts := make([]string, 0, n+2)
+				parts = append(parts, buf[:n]...)
+				parts = append(parts, s[start:i])
+				start = i + 1
+				for j := i + 1; j < len(s); j++ {
+					if s[j] == '|' {
+						parts = append(parts, s[start:j])
+						start = j + 1
+					}
+				}
+				parts = append(parts, s[start:])
+				return parts
+			}
 			start = i + 1
 		}
 	}
+	if n < len(buf) {
+		buf[n] = s[start:]
+		n++
+		return buf[:n]
+	}
+	parts := make([]string, 0, n+1)
+	parts = append(parts, buf[:n]...)
 	parts = append(parts, s[start:])
 	return parts
 }
@@ -109,9 +180,14 @@ func trimPrefix(s, prefix string) string {
 
 // isSoftCacheKey reports whether a V2 key's chClass is a soft dual-key class (A5).
 func isSoftCacheKey(key string) bool {
-	_, _, _, _, ch, ok := ParseCacheKeyV2(key)
-	if !ok {
+	// V2 keys have exactly 4 separators; soft class is the last field and starts with "s:".
+	if strings.Count(key, "|") < 4 {
 		return false
 	}
+	idx := strings.LastIndexByte(key, '|')
+	if idx < 0 || idx+1 >= len(key) {
+		return false
+	}
+	ch := key[idx+1:]
 	return len(ch) >= 2 && ch[0] == 's' && ch[1] == ':'
 }

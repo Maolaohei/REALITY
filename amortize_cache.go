@@ -37,39 +37,29 @@ func (m *CacheManager) lookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 		return LookupResult{Path: PathL0}
 	}
 
-	// Prefer V2 key when chClass is known.
-	var keys []string
-	if chClass != "" {
-		keys = append(keys, CacheKeyV2(dest, serverName, alpn, tlsVersion, chClass))
-	}
-	// A5: soft class dual-key (exact miss recovery). Soft keys are L1-only.
-	if softChClass != "" && softChClass != chClass {
-		keys = append(keys, CacheKeyV2(dest, serverName, alpn, tlsVersion, softChClass))
-	}
-	// Legacy key for backward compatibility (L1 only; never L2).
-	keys = append(keys, CacheKey(serverName, alpn, tlsVersion))
-
-	for _, key := range keys {
+	// Probe keys in priority order. Build strings lazily so an exact V2 hit
+	// pays for one CacheKeyV2 only (legacy/soft keys deferred to miss path).
+	probe := func(key string) (LookupResult, bool) {
 		val, ok := m.entries.Load(key)
 		if !ok {
-			continue
+			return LookupResult{}, false
 		}
 		entry := val.(*ProfileEntry)
 		// Lock-free fast-path: skip rejected states without taking the mutex.
 		s := ProfileState(entry.atomicState.Load())
 		if s == ProfileNegative || s == ProfileQuarantined {
-			continue
+			return LookupResult{}, false
 		}
 		entry.mu.Lock()
 		if entry.State == ProfileNegative || entry.State == ProfileQuarantined {
 			entry.mu.Unlock()
-			continue
+			return LookupResult{}, false
 		}
 		suspect := entry.State == ProfileSuspect
 		p := entry.Profile
 		if p == nil || !ValidateRecordLens(p.RecordLens) {
 			entry.mu.Unlock()
-			continue
+			return LookupResult{}, false
 		}
 		// TTL: allow stale for L1, never for L2.
 		expired := time.Since(p.CapturedAt) >= entry.TTL
@@ -84,10 +74,10 @@ func (m *CacheManager) lookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 		if !suspect && !stale && !IsLegacyCacheKey(key) && !isSoftCacheKey(key) && profileL2Eligible(p) {
 			if mode == AmortizeL2 || mode == AmortizeAuto {
 				if clientPolicyCompatible(p, liveCipher, liveGroup) {
-					cp := *p
 					entry.mu.Unlock()
 					m.stats.L2Hits.Add(1)
-					return LookupResult{Profile: &cp, Path: PathL2, Key: key, Stale: false}
+					// Read-only shared pointer: cache writers replace Profile wholesale.
+					return LookupResult{Profile: p, Path: PathL2, Key: key, Stale: false}, true
 				}
 			}
 		}
@@ -96,26 +86,44 @@ func (m *CacheManager) lookupAmortize(mode AmortizeMode, dest, serverName, alpn 
 		if mode == AmortizeL1 || mode == AmortizeAuto || mode == AmortizeL2 {
 			if liveCipher != 0 && p.CipherSuite != 0 && p.CipherSuite != liveCipher {
 				entry.mu.Unlock()
-				continue
+				return LookupResult{}, false
 			}
 			if liveGroup != 0 && p.KeyShareGroup != 0 && p.KeyShareGroup != liveGroup {
 				entry.mu.Unlock()
-				continue
+				return LookupResult{}, false
 			}
 			if p.TLSVersion != 0 && tlsVersion != 0 && p.TLSVersion != tlsVersion {
 				entry.mu.Unlock()
-				continue
+				return LookupResult{}, false
 			}
-			cp := *p
 			entry.mu.Unlock()
 			if stale {
 				m.stats.StaleServed.Add(1)
 			}
 			m.stats.L1Hits.Add(1)
-			return LookupResult{Profile: &cp, Path: PathL1, Key: key, Stale: stale}
+			// Read-only shared pointer (same contract as GetProfile).
+			return LookupResult{Profile: p, Path: PathL1, Key: key, Stale: stale}, true
 		}
 		entry.mu.Unlock()
+		return LookupResult{}, false
 	}
+
+	if chClass != "" {
+		if res, ok := probe(CacheKeyV2(dest, serverName, alpn, tlsVersion, chClass)); ok {
+			return res
+		}
+	}
+	// A5: soft class dual-key (exact miss recovery). Soft keys are L1-only.
+	if softChClass != "" && softChClass != chClass {
+		if res, ok := probe(CacheKeyV2(dest, serverName, alpn, tlsVersion, softChClass)); ok {
+			return res
+		}
+	}
+	// Legacy key for backward compatibility (L1 only; never L2).
+	if res, ok := probe(CacheKey(serverName, alpn, tlsVersion)); ok {
+		return res
+	}
+
 	return LookupResult{Path: PathL0}
 }
 

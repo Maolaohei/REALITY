@@ -104,7 +104,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	// --- Phase 3: path selection ---
 	alpn := clientALPN(hs.clientHello)
 	chClass := ClassifyClientHello(hs.clientHello)
-	softClass := SoftClassifyClientHello(hs.clientHello)
+	softClass := SoftClassifyFromExact(hs.clientHello, chClass)
 	mode := ResolveAmortizeMode(config.AmortizeMode)
 
 	// Unsuitable dest: mirror even after auth (anti-probe; no synthetic TLS1.3 success).
@@ -481,16 +481,17 @@ func runL2Handshake(hs *serverHandshakeStateTLS13, profile *RealityProfile, show
 	if !clientHasKeyShare(hs.clientHello, profile.KeyShareGroup) {
 		return nil, errors.New("client missing cached key share group")
 	}
-	random := make([]byte, 32)
-	if _, err := io.ReadFull(hs.c.config.rand(), random); err != nil {
+	var random [32]byte
+	if _, err := io.ReadFull(hs.c.config.rand(), random[:]); err != nil {
 		return nil, err
 	}
 	// Patch template: fresh random + echo client session id (TLS 1.3 middlebox compat).
+	// Still need an owned clone so unmarshal keeps a stable original buffer.
 	tpl := append([]byte(nil), profile.ServerHelloTemplate...)
 	if len(tpl) < 39 {
 		return nil, errors.New("server hello template too short")
 	}
-	copy(tpl[6:38], random)
+	copy(tpl[6:38], random[:])
 	// session_id length at offset 38
 	sidLen := int(tpl[38])
 	if 39+sidLen > len(tpl) {
