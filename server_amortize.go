@@ -250,7 +250,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	// Build observation profile for amortize.
 	obs := buildObservationProfile(config, &hs, savedLen, chClass, alpn, r0Template, "live")
 	NoteDestTLS13Ready(config.Dest)
-	// Also store under legacy key for backward-compatible L1 hits.
+	// Store under V2 key (Bray-only: no legacy dual-write).
 	v2Key := CacheKeyV2(config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass)
 	globalCacheManager.StoreObservation(v2Key, obs)
 	// A5: also index under soft class for L1 dual-key recovery.
@@ -271,19 +271,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	if config.Dest != "" {
 		go WarmCertPlansForDest(config.Dest)
 	}
-	// Legacy key for FindCachedProfileByDest / older L1 path.
-	legacyKey := CacheKey(hs.clientHello.serverName, alpn, VersionTLS13)
-	legacyObs := *obs
-	legacyObs.ServerHelloTemplate = nil
-	legacyObs.Evidence = 0 // never L2 via legacy key
-	legacyObs.CHClass = ""
-	if existing, _ := globalCacheManager.GetProfile(legacyKey); existing != nil {
-		// refresh lens/cipher only
-		legacyObs.Evidence = 0
-		globalCacheManager.HotSwapProfile(legacyKey, &legacyObs)
-	} else {
-		globalCacheManager.StoreProfile(legacyKey, &legacyObs)
-	}
+	// Bray-only: skip legacy key dual-write. V2 (+ soft class) is sufficient.
 
 	emitHandshakeComplete(config, &hs, savedLen, chClass, alpn, path, obs)
 	if show {
@@ -369,7 +357,7 @@ func authenticateClientHello(c *Conn, ch *clientHelloMsg, config *Config, show b
 	block, _ := aes.NewCipher(c.AuthKey)
 	aead, _ := cipher.NewGCM(block)
 	if show {
-		fmt.Printf("REALITY remoteAddr: %v\tAuthKey[:16]: %v\tAEAD: %T\n", remoteAddr, c.AuthKey[:16], aead)
+		fmt.Printf("REALITY remoteAddr: %v\tAuthKey: [redacted]\tAEAD: %T\n", remoteAddr, aead)
 	}
 
 	var ctBuf, ptBuf [32]byte
@@ -388,7 +376,7 @@ func authenticateClientHello(c *Conn, ch *clientHelloMsg, config *Config, show b
 	if show {
 		fmt.Printf("REALITY remoteAddr: %v\tClientVer: %v\n", remoteAddr, c.ClientVer)
 		fmt.Printf("REALITY remoteAddr: %v\tClientTime: %v\n", remoteAddr, c.ClientTime)
-		fmt.Printf("REALITY remoteAddr: %v\tClientShortId: %v\n", remoteAddr, c.ClientShortId)
+		fmt.Printf("REALITY remoteAddr: %v\tClientShortId: [redacted]\n", remoteAddr)
 	}
 
 	maxTimeDiff := config.MaxTimeDiff
@@ -654,16 +642,21 @@ func captureTargetRecords(target net.Conn, hs *serverHandshakeStateTLS13, config
 						return usedLen, hello, r0Template, path, nil
 					}
 					if res.Path == PathL0 || res.Profile == nil {
-						// async reprobe on miss
-						go globalCacheManager.DoProbe(CacheKey(hs.clientHello.serverName, alpn, VersionTLS13), func() (*RealityProfile, error) {
+						// Bray-only: async reprobe stores under V2 key (no legacy dual-write).
+						probeKey := CacheKeyV2(config.Dest, hs.clientHello.serverName, alpn, VersionTLS13, chClass)
+						go globalCacheManager.DoProbe(probeKey, func() (*RealityProfile, error) {
 							p, err := probeTargetRaw(config.Dest, hs.clientHello.serverName, alpnToInt(alpn))
 							if err == nil && p != nil {
 								p.Source = "probe"
+								p.Dest = config.Dest
+								p.ServerName = hs.clientHello.serverName
+								p.ALPN = alpn
+								p.TLSVersion = VersionTLS13
+								p.CHClass = chClass
 								if p.RecordMode == 0 {
 									p.RecordMode = InferRecordMode(p.RecordLens)
 								}
-								// Store under legacy key without L2 promotion.
-								globalCacheManager.StoreObservation(CacheKey(hs.clientHello.serverName, alpn, VersionTLS13), p)
+								globalCacheManager.StoreObservation(probeKey, p)
 							}
 							return p, err
 						})

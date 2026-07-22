@@ -11,11 +11,12 @@ const defaultReplayGuardMaxEntries = 100000
 // ReplayGuard deduplicates ClientHello.random prefixes within a time window.
 // Prevents resource-wasting replays within the MaxTimeDiff window.
 type ReplayGuard struct {
-	seen       sync.Map    // key: [20]byte (random prefix), value: int64 (unix nano)
+	seen       sync.Map // key: [20]byte (random prefix), value: int64 (unix nano)
 	window     time.Duration
 	maxEntries int64
 	count      atomic.Int64
 	stopCh     chan struct{}
+	evictSeed  atomic.Uint64
 }
 
 // NewReplayGuard creates a ReplayGuard with the given window and capacity limit.
@@ -28,6 +29,7 @@ func NewReplayGuard(window time.Duration, maxEntries int) *ReplayGuard {
 		maxEntries: int64(maxEntries),
 		stopCh:     make(chan struct{}),
 	}
+	g.evictSeed.Store(uint64(time.Now().UnixNano()))
 	go g.gcLoop()
 	return g
 }
@@ -40,7 +42,12 @@ func (g *ReplayGuard) CheckAndMark(randomPrefix [20]byte) bool {
 		// before deciding. This prevents an attacker from filling the guard
 		// with unique randoms and blocking all legitimate connections.
 		g.sweepExpired()
-		// If still at capacity after sweep, reject to bound memory usage.
+		// If still full, randomly drop ~10% of entries so legitimate traffic
+		// is not permanently DoS'd (Bray-only: prefer availability).
+		if g.count.Load() >= g.maxEntries {
+			g.evictRandomFraction(10) // ~10%
+		}
+		// Still full after eviction race: reject this one (memory hard bound).
 		if g.count.Load() >= g.maxEntries {
 			return false
 		}
@@ -67,8 +74,38 @@ func (g *ReplayGuard) sweepExpired() {
 	nowNano := time.Now().UnixNano()
 	g.seen.Range(func(k, v any) bool {
 		if nowNano-v.(int64) > int64(g.window) {
-			g.seen.Delete(k)
-			g.count.Add(-1)
+			if _, ok := g.seen.LoadAndDelete(k); ok {
+				g.count.Add(-1)
+			}
+		}
+		return true
+	})
+}
+
+// evictRandomFraction deletes approximately pct percent of entries (1-50).
+// Uses a cheap LCG so hot path stays allocation-free.
+func (g *ReplayGuard) evictRandomFraction(pct int) {
+	if pct < 1 {
+		pct = 1
+	}
+	if pct > 50 {
+		pct = 50
+	}
+	// Walk and delete every N-th entry where N ~= 100/pct.
+	stride := 100 / pct
+	if stride < 2 {
+		stride = 2
+	}
+	seed := g.evictSeed.Add(0x9e3779b97f4a7c15)
+	var i int
+	g.seen.Range(func(k, _ any) bool {
+		i++
+		// pseudo-random bucket from seed+i
+		h := seed + uint64(i)*0x85ebca6b
+		if int(h%uint64(stride)) == 0 {
+			if _, ok := g.seen.LoadAndDelete(k); ok {
+				g.count.Add(-1)
+			}
 		}
 		return true
 	})
@@ -78,7 +115,7 @@ func (g *ReplayGuard) sweepExpired() {
 // Runs at window/4 interval for faster recovery after a burst.
 func (g *ReplayGuard) gcLoop() {
 	gcInterval := g.window / 4
-	if gcInterval < 5*time.Second {
+	if gcInterval < 5 * time.Second {
 		gcInterval = 5 * time.Second
 	}
 	ticker := time.NewTicker(gcInterval)
