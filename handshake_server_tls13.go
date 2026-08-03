@@ -114,8 +114,9 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 
 	if c.config.Show {
 		remoteAddr := c.RemoteAddr().String()
-		fmt.Printf("REALITY remoteAddr: %v\tis using X25519MLKEM768 for TLS' communication: %v\n", remoteAddr, hs.hello.serverShare.group == X25519MLKEM768)
-		fmt.Printf("REALITY remoteAddr: %v\tis using ML-DSA-65 for cert's extra signature: %v\n", remoteAddr, len(c.config.Mldsa65Key) > 0)
+		// Do not log the negotiated groups / ML-DSA state: those are client
+		// fingerprint details that belong in structured metrics, not stdout.
+		fmt.Printf("REALITY remoteAddr: %v\thandshake started\n", remoteAddr)
 	}
 	// For an overview of the TLS 1.3 handshake, see RFC 8446, Section 2.
 	/*

@@ -8,15 +8,28 @@ import (
 
 const defaultReplayGuardMaxEntries = 100000
 
+// replayShardCount partitions the replay map so the hot path only touches 1/N
+// of the entries and near-capacity sweeps rotate one shard at a time instead
+// of traversing the whole table (the single big sync.Map made every
+// capacity-triggered scan O(N) and the atomic count drifted under load).
+const replayShardCount = 16
+
 // ReplayGuard deduplicates ClientHello.random prefixes within a time window.
 // Prevents resource-wasting replays within the MaxTimeDiff window.
 type ReplayGuard struct {
-	seen       sync.Map // key: [20]byte (random prefix), value: int64 (unix nano)
-	window     time.Duration
-	maxEntries int64
-	count      atomic.Int64
-	stopCh     chan struct{}
-	evictSeed  atomic.Uint64
+	shards      [replayShardCount]*replayShard
+	window      time.Duration
+	maxEntries  int64
+	count       atomic.Int64 // global live-entry count (exact capacity gate)
+	evictCursor atomic.Uint64
+	evictSeed   atomic.Uint64
+	stopCh      chan struct{}
+}
+
+// replayShard is one partition of the seen map, guarded by its own mutex.
+type replayShard struct {
+	mu   sync.Mutex
+	seen map[[20]byte]int64 // key: random prefix, value: unix nano
 }
 
 // NewReplayGuard creates a ReplayGuard with the given window and capacity limit.
@@ -29,101 +42,115 @@ func NewReplayGuard(window time.Duration, maxEntries int) *ReplayGuard {
 		maxEntries: int64(maxEntries),
 		stopCh:     make(chan struct{}),
 	}
+	for i := range g.shards {
+		g.shards[i] = &replayShard{seen: make(map[[20]byte]int64)}
+	}
 	g.evictSeed.Store(uint64(time.Now().UnixNano()))
 	go g.gcLoop()
 	return g
+}
+
+// shardFor maps a random prefix to its shard. ClientHello.random is
+// effectively random, so the first 4 bytes distribute well.
+func (g *ReplayGuard) shardFor(randomPrefix [20]byte) *replayShard {
+	h := uint32(randomPrefix[0])<<24 | uint32(randomPrefix[1])<<16 | uint32(randomPrefix[2])<<8 | uint32(randomPrefix[3])
+	return g.shards[h%replayShardCount]
 }
 
 // CheckAndMark returns true if this random prefix is seen for the first time
 // within the window (allow), or false if it's a duplicate (reject).
 func (g *ReplayGuard) CheckAndMark(randomPrefix [20]byte) bool {
 	if g.count.Load() >= g.maxEntries {
-		// At or near capacity: do an inline sweep to evict expired entries
-		// before deciding. This prevents an attacker from filling the guard
-		// with unique randoms and blocking all legitimate connections.
-		g.sweepExpired()
-		// If still full, randomly drop ~10% of entries so legitimate traffic
-		// is not permanently DoS'd (Bray-only: prefer availability).
+		// At capacity: free one shard (round-robin) before admitting. Rotating
+		// one shard per call keeps the scan cost bounded instead of walking
+		// the entire table on every hot-path arrival.
+		g.evictOneShard()
 		if g.count.Load() >= g.maxEntries {
-			g.evictRandomFraction(10) // ~10%
-		}
-		// Still full after eviction race: reject this one (memory hard bound).
-		if g.count.Load() >= g.maxEntries {
+			// Still full after eviction: reject this one (memory hard bound).
 			return false
 		}
 	}
 
-	now := time.Now()
-	nowNano := now.UnixNano()
-	existing, loaded := g.seen.LoadOrStore(randomPrefix, nowNano)
-	if !loaded {
+	s := g.shardFor(randomPrefix)
+	s.mu.Lock()
+	nowNano := time.Now().UnixNano()
+	existing, ok := s.seen[randomPrefix]
+	if !ok {
+		s.seen[randomPrefix] = nowNano
 		g.count.Add(1)
+		s.mu.Unlock()
 		return true
 	}
 	// Key exists -- check if it has expired. If so, replace it and allow.
-	if nowNano-existing.(int64) > int64(g.window) {
-		g.seen.Store(randomPrefix, nowNano)
+	if nowNano-existing > int64(g.window) {
+		s.seen[randomPrefix] = nowNano
+		s.mu.Unlock()
 		return true
 	}
+	s.mu.Unlock()
 	return false
 }
 
-// sweepExpired removes all entries older than the window. Called inline when
-// the guard is near capacity and periodically by gcLoop.
-func (g *ReplayGuard) sweepExpired() {
-	nowNano := time.Now().UnixNano()
-	g.seen.Range(func(k, v any) bool {
-		if nowNano-v.(int64) > int64(g.window) {
-			if _, ok := g.seen.LoadAndDelete(k); ok {
-				g.count.Add(-1)
-			}
-		}
-		return true
-	})
-}
+// evictOneShard sweeps expired entries from one shard (round-robin) and, if
+// that did not free room, randomly drops ~10% of the shard. Availability is
+// preferred over strict capacity: an attacker filling the guard with unique
+// randoms must not permanently block legitimate connections.
+func (g *ReplayGuard) evictOneShard() {
+	idx := g.evictCursor.Add(1) % replayShardCount
+	s := g.shards[idx]
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-// evictRandomFraction deletes approximately pct percent of entries (1-50).
-// Uses a cheap LCG so hot path stays allocation-free.
-func (g *ReplayGuard) evictRandomFraction(pct int) {
-	if pct < 1 {
-		pct = 1
+	nowNano := time.Now().UnixNano()
+	for k, v := range s.seen {
+		if nowNano-v > int64(g.window) {
+			delete(s.seen, k)
+			g.count.Add(-1)
+		}
 	}
-	if pct > 50 {
-		pct = 50
+	if g.count.Load() < g.maxEntries {
+		return
 	}
-	// Walk and delete every N-th entry where N ~= 100/pct.
-	stride := 100 / pct
-	if stride < 2 {
-		stride = 2
-	}
+	// Still full: random-evict ~10% of this shard.
+	stride := 10
 	seed := g.evictSeed.Add(0x9e3779b97f4a7c15)
 	var i int
-	g.seen.Range(func(k, _ any) bool {
+	for k := range s.seen {
 		i++
 		// pseudo-random bucket from seed+i
 		h := seed + uint64(i)*0x85ebca6b
 		if int(h%uint64(stride)) == 0 {
-			if _, ok := g.seen.LoadAndDelete(k); ok {
-				g.count.Add(-1)
-			}
+			delete(s.seen, k)
+			g.count.Add(-1)
 		}
-		return true
-	})
+	}
 }
 
-// gcLoop periodically removes expired entries from the seen map.
-// Runs at window/4 interval for faster recovery after a burst.
+// gcLoop periodically removes expired entries from all shards, one shard per
+// tick (rotating), so bursts are recovered without a full-table stall.
 func (g *ReplayGuard) gcLoop() {
 	gcInterval := g.window / 4
-	if gcInterval < 5 * time.Second {
+	if gcInterval < 5*time.Second {
 		gcInterval = 5 * time.Second
 	}
 	ticker := time.NewTicker(gcInterval)
 	defer ticker.Stop()
+	var cursor uint64
 	for {
 		select {
 		case <-ticker.C:
-			g.sweepExpired()
+			idx := cursor % replayShardCount
+			cursor++
+			s := g.shards[idx]
+			s.mu.Lock()
+			nowNano := time.Now().UnixNano()
+			for k, v := range s.seen {
+				if nowNano-v > int64(g.window) {
+					delete(s.seen, k)
+					g.count.Add(-1)
+				}
+			}
+			s.mu.Unlock()
 		case <-g.stopCh:
 			return
 		}
@@ -133,6 +160,12 @@ func (g *ReplayGuard) gcLoop() {
 // Stop terminates the background GC goroutine.
 func (g *ReplayGuard) Stop() {
 	close(g.stopCh)
+}
+
+// Count returns the total number of live entries across all shards
+// (statistics/debug helper).
+func (g *ReplayGuard) Count() int64 {
+	return g.count.Load()
 }
 
 // replayGuardInit provides safe concurrent initialization of globalReplayGuard.

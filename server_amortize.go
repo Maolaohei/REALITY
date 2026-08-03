@@ -52,6 +52,16 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		return nil, ctx.Err()
 	}
 
+	// Slow-client guard: the ClientHello read below has no deadline of its
+	// own, so a peer that connects and never sends a full ClientHello would
+	// hold a handshake slot indefinitely — 1000 such sockets exhaust
+	// handshakeSem and DoS the listener. Bound the read; the mirror path
+	// sets its own 8s deadline afterwards.
+	if tc, ok := conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = tc.SetReadDeadline(time.Now().Add(handshakeReadTimeout))
+		defer func() { _ = tc.SetReadDeadline(time.Time{}) }()
+	}
+
 	if config.MaxTimeDiff == 0 {
 		maxTimeDiffWarnOnce.Do(func() {
 			fmt.Println("REALITY WARNING: MaxTimeDiff not configured, defaulting to 90s. Set MaxTimeDiff=-1 to disable or MaxTimeDiff=<duration> to set explicitly.")
@@ -146,8 +156,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	}
 
 	if show {
-		fmt.Printf("REALITY remoteAddr: %v\tpath=%s mode=%v chClass=%s evidence=%d\n",
-			remoteAddr, path.String(), mode, chClass, profileEvidence(pre.Profile))
+		fmt.Printf("REALITY remoteAddr: %v\tpath=%s mode=%v chClass=%s\n",
+			remoteAddr, path.String(), mode, chClass)
 	}
 
 	// --- Path L2: zero-dial ---
@@ -275,16 +285,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 	emitHandshakeComplete(config, &hs, savedLen, chClass, alpn, path, obs)
 	if show {
-		fmt.Printf("REALITY remoteAddr: %v\thandshake complete path=%s evidence=%d\n", remoteAddr, path.String(), obs.Evidence)
+		fmt.Printf("REALITY remoteAddr: %v\thandshake complete path=%s\n", remoteAddr, path.String())
 	}
 	return hs.c, nil
-}
-
-func profileEvidence(p *RealityProfile) int {
-	if p == nil {
-		return 0
-	}
-	return p.Evidence
 }
 
 func initServerSideOnce(config *Config, show bool) {
@@ -375,7 +378,6 @@ func authenticateClientHello(c *Conn, ch *clientHelloMsg, config *Config, show b
 	copy(c.ClientShortId[:], plainText[8:])
 	if show {
 		fmt.Printf("REALITY remoteAddr: %v\tClientVer: %v\n", remoteAddr, c.ClientVer)
-		fmt.Printf("REALITY remoteAddr: %v\tClientTime: %v\n", remoteAddr, c.ClientTime)
 		fmt.Printf("REALITY remoteAddr: %v\tClientShortId: [redacted]\n", remoteAddr)
 	}
 
@@ -398,7 +400,69 @@ func authenticateClientHello(c *Conn, ch *clientHelloMsg, config *Config, show b
 	return true
 }
 
+// handshakeReadTimeout bounds the ClientHello read so a peer that connects
+// and never sends data cannot hold a handshake slot (and thus handshakeSem)
+// indefinitely.
+const handshakeReadTimeout = 10 * time.Second
+
+// authFailThrottle bounds unauthenticated mirror amplification per source IP:
+// each failed auth dials the RA site and mirrors for 8s, so without a throttle
+// a cheap probe can make the server open outbound connections at will.
+// Entries are capped; on overflow the table is rebuilt (lose throttle briefly,
+// never unbounded memory).
+var authFailThrottle struct {
+	mu      sync.Mutex
+	entries map[string]*authFailEntry
+}
+
+const (
+	authFailWindow     = time.Minute
+	authFailLimit      = 20
+	authFailMaxEntries = 10000
+)
+
+type authFailEntry struct {
+	count int
+	first time.Time
+}
+
+func authFailThrottled(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	now := time.Now()
+	authFailThrottle.mu.Lock()
+	defer authFailThrottle.mu.Unlock()
+	if authFailThrottle.entries == nil {
+		authFailThrottle.entries = make(map[string]*authFailEntry)
+	}
+	e, ok := authFailThrottle.entries[host]
+	if !ok {
+		if len(authFailThrottle.entries) >= authFailMaxEntries {
+			authFailThrottle.entries = make(map[string]*authFailEntry)
+		}
+		authFailThrottle.entries[host] = &authFailEntry{count: 1, first: now}
+		return false
+	}
+	if now.Sub(e.first) > authFailWindow {
+		e.count = 1
+		e.first = now
+		return false
+	}
+	e.count++
+	return e.count > authFailLimit
+}
+
 func mirrorAfterFailedAuth(ctx context.Context, conn net.Conn, underlying CloseWriteConn, config *Config, ch *clientHelloMsg, remoteAddr string, show bool, reason string) (*Conn, error) {
+	// Per-IP auth-failure throttle: every failed authentication currently
+	// dials the RA site and mirrors for 8s, which an unauthenticated probe
+	// can amplify into outbound connection/bandwidth usage. After a burst of
+	// failures from one source, stop mirroring that source entirely.
+	if authFailThrottled(remoteAddr) {
+		conn.Close()
+		return nil, fmt.Errorf("REALITY: throttled failed-auth mirror for %s: %s", remoteAddr, reason)
+	}
 	target, err := dialTarget(ctx, conn, config)
 	if err != nil {
 		conn.Close()
@@ -413,7 +477,8 @@ func mirrorAfterFailedAuth(ctx context.Context, conn net.Conn, underlying CloseW
 	if ch != nil && ch.original != nil {
 		_ = WriteAll(target, wrapHandshakeRecord(ch.original, VersionTLS10))
 		if show {
-			fmt.Printf("REALITY remoteAddr: %v\tforwarded SNI: %v\n", remoteAddr, ch.serverName)
+			// SNI is the REALITY disguise domain; do not echo it into logs.
+			fmt.Printf("REALITY remoteAddr: %v\tforwarded ClientHello to target\n", remoteAddr)
 		}
 	}
 

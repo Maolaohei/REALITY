@@ -78,12 +78,12 @@ func TestReplayGuard_CapacityLimit(t *testing.T) {
 	var key [20]byte
 	key[0] = 99
 	_ = g.CheckAndMark(key)
-	if g.count.Load() > 3 {
+	if g.Count() > 3 {
 		// After admit, count may briefly equal 4 before next sweep; ensure
 		// we never stay far above max without eviction (evict runs first).
 		// Allow +1 only if eviction did not delete enough of 3 entries.
-		if g.count.Load() > int64(4) {
-			t.Fatalf("count %d exceeds max+1", g.count.Load())
+		if g.Count() > int64(4) {
+			t.Fatalf("count %d exceeds max+1", g.Count())
 		}
 	}
 }
@@ -105,8 +105,8 @@ func TestReplayGuard_EvictsUnderPressure(t *testing.T) {
 	if allowed < 20 {
 		t.Fatalf("expected eviction to admit >=20 unique keys over time, got %d", allowed)
 	}
-	if g.count.Load() > 30 {
-		t.Fatalf("count should stay near capacity, got %d", g.count.Load())
+	if g.Count() > 30 {
+		t.Fatalf("count should stay near capacity, got %d", g.Count())
 	}
 }
 
