@@ -5,39 +5,43 @@ import (
 	"strings"
 )
 
+// cacheKeyBufSize covers the worst realistic key: dest "255.255.255.255:65535"
+// (21) + SNI up to 253 + alpn (8) + chClass (~48) + separators/version hex (~12).
+const cacheKeyBufSize = 384
+
 // CacheKey constructs a legacy cache key from connection parameters.
 // Format: "serverName|alpn|tlsVersion"
 // Kept for backward compatibility with existing tests and disk profiles.
 func CacheKey(serverName, alpn string, tlsVersion uint16) string {
-	var b strings.Builder
-	// Typical SNI + alpn + version hex fits well under 96B.
-	b.Grow(len(serverName) + len(alpn) + 10)
-	b.WriteString(serverName)
-	b.WriteByte('|')
-	b.WriteString(alpn)
-	b.WriteByte('|')
-	writeUint16Hex(&b, tlsVersion)
-	return b.String()
+	var buf [cacheKeyBufSize]byte
+	b := buf[:0]
+	b = append(b, serverName...)
+	b = append(b, '|')
+	b = append(b, alpn...)
+	b = append(b, '|')
+	b = appendUint16Hex(b, tlsVersion)
+	return string(b)
 }
 
 // CacheKeyV2 constructs a full amortize cache key.
 // Format: "dest|serverName|alpn|tlsVersion|chClass"
+// Stack-built: the only heap cost is the returned string (no strings.Builder).
 func CacheKeyV2(dest, serverName, alpn string, tlsVersion uint16, chClass string) string {
 	if chClass == "" {
 		chClass = "-"
 	}
-	var b strings.Builder
-	b.Grow(len(dest) + len(serverName) + len(alpn) + len(chClass) + 16)
-	b.WriteString(dest)
-	b.WriteByte('|')
-	b.WriteString(serverName)
-	b.WriteByte('|')
-	b.WriteString(alpn)
-	b.WriteByte('|')
-	writeUint16Hex(&b, tlsVersion)
-	b.WriteByte('|')
-	b.WriteString(chClass)
-	return b.String()
+	var buf [cacheKeyBufSize]byte
+	b := buf[:0]
+	b = append(b, dest...)
+	b = append(b, '|')
+	b = append(b, serverName...)
+	b = append(b, '|')
+	b = append(b, alpn...)
+	b = append(b, '|')
+	b = appendUint16Hex(b, tlsVersion)
+	b = append(b, '|')
+	b = append(b, chClass...)
+	return string(b)
 }
 
 // CacheKeyFromProfile constructs a cache key from a RealityProfile.
@@ -97,19 +101,15 @@ func IsLegacyCacheKey(key string) bool {
 }
 
 func uint16ToHex(v uint16) string {
-	var b strings.Builder
-	b.Grow(6)
-	writeUint16Hex(&b, v)
-	return b.String()
+	var buf [6]byte
+	return string(appendUint16Hex(buf[:0], v))
 }
 
-// writeUint16Hex appends "0x" + lowercase hex without leading zeros (matches strconv.FormatUint).
-func writeUint16Hex(b *strings.Builder, v uint16) {
-	b.WriteByte('0')
-	b.WriteByte('x')
+// appendUint16Hex appends "0x" + lowercase hex without leading zeros (matches strconv.FormatUint).
+func appendUint16Hex(b []byte, v uint16) []byte {
+	b = append(b, '0', 'x')
 	if v == 0 {
-		b.WriteByte('0')
-		return
+		return append(b, '0')
 	}
 	const hexdigits = "0123456789abcdef"
 	// TLS versions are small (0x0303/0x0304); emit without left padding.
@@ -122,8 +122,9 @@ func writeUint16Hex(b *strings.Builder, v uint16) {
 			}
 			started = true
 		}
-		b.WriteByte(hexdigits[nibble])
+		b = append(b, hexdigits[nibble])
 	}
+	return b
 }
 
 func hexToUint16(s string) uint16 {
