@@ -5,7 +5,9 @@ package reality
 // PASSES after the fix (GREEN).
 
 import (
+	"bytes"
 	"context"
+	"crypto/mlkem"
 	"errors"
 	"io"
 	"net"
@@ -13,6 +15,22 @@ import (
 	"testing"
 	"time"
 )
+
+// TestMlkemInvalidKeyReturnsErr (POC, LOW): a malicious client sharing an
+// invalid X25519MLKEM768 encapsulation key (e.g. all-0xff = every modulus
+// chunk >= q=3329) makes crypto/mlkem return an error. REALITY's
+// handshake_server_tls13.go:151 does `k, _ := mlkem.NewEncapsulationKey768(...)`
+// and then `k.Encapsulate()` — the ignored error leaves k==nil so that next
+// call nil-derefs and panics. This asserts the error is genuinely returned
+// for attacker-controllable input (the nil-deref precondition).
+func TestMlkemInvalidKeyReturnsErr(t *testing.T) {
+	badKey := bytes.Repeat([]byte{0xff}, mlkem.EncapsulationKeySize768)
+	k, err := mlkem.NewEncapsulationKey768(badKey)
+	if err == nil {
+		t.Fatalf("expected error for non-canonical encapsulation key (modulus >= q); got key %v", k != nil)
+	}
+	t.Logf("PROOF: invalid encapsulation key -> err=%v (REALITY's ignored-error path leaves k==nil -> Encapsulate panics)", err)
+}
 
 func realityTestConfig(targetAddr string) *Config {
 	priv := make([]byte, 32)
@@ -132,7 +150,32 @@ func TestHandshakeSemExhaustionBlocksLegit(t *testing.T) {
 	}
 }
 
-// TestProfileCountDriftOnNegativeSweep (POC, MED):
+// TestDirtyEpochKeepsConcurrentChanges (POC, MED): a change that lands
+// while Save() is writing must stay dirty (persisted next save), not be
+// dropped by a late clear. The old dirty-atomic.Bool + conditional-ClearDirty
+// could not express this; the epoch watermark does.
+func TestDirtyEpochKeepsConcurrentChanges(t *testing.T) {
+	m := NewCacheManager()
+	m.MarkDirty() // mutation 1
+	if !m.IsDirty() {
+		t.Fatal("expected dirty after MarkDirty")
+	}
+	snap := m.SnapshotDirty() // save copies this instant
+	m.MarkDirty()             // mutation lands during the write
+	m.PersistSnapshot(snap)   // save flushes exactly mutation 1
+	if !m.IsDirty() {
+		t.Fatalf("BUG/MED: concurrent mutation lost — IsDirty()=false after PersistSnapshot (dirty>persisted must hold)")
+	}
+
+	// Clean save: no change during write -> not dirty afterwards.
+	m2 := NewCacheManager()
+	m2.MarkDirty()
+	s2 := m2.SnapshotDirty()
+	m2.PersistSnapshot(s2)
+	if m2.IsDirty() {
+		t.Fatal("clean save should leave not-dirty")
+	}
+}
 // MarkNegative on a fresh key must account for the entry, so the later
 // sweep cannot drive ProfileEntries negative and disable the capacity gate.
 func TestProfileCountDriftOnNegativeSweep(t *testing.T) {
