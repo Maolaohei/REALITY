@@ -148,7 +148,15 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		hs.sharedKey, _ = key.ECDH(peerKey)
 
 		if hs.hello.serverShare.group == X25519MLKEM768 {
-			k, _ := mlkem.NewEncapsulationKey768(peerData[:mlkem.EncapsulationKeySize768])
+			k, err := mlkem.NewEncapsulationKey768(peerData[:mlkem.EncapsulationKeySize768])
+			if err != nil {
+				// Non-canonical encapsulation key (modulus >= q) — a
+				// malicious client can supply this. Never leave k==nil
+				// (Encapsulate would panic); reject like the client-side
+				// guard at :434.
+				c.sendAlert(alertIllegalParameter)
+				return errors.New("tls: invalid X25519MLKEM768 client key share")
+			}
 			mlkemSharedSecret, ciphertext := k.Encapsulate()
 			hs.sharedKey = append(mlkemSharedSecret, hs.sharedKey...)
 			copy(hs.hello.serverShare.data, append(ciphertext, hs.hello.serverShare.data[:32]...))
