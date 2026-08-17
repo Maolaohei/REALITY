@@ -44,10 +44,23 @@ func triggerDetectPostHandshake(config *Config) {
 // Auth always runs first. Unauthenticated traffic is never served from cache;
 // it dials RA and mirrors after replaying the original ClientHello record.
 func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
+	// Per-source handshake-slot quota: bound how many handshakeSem slots a
+	// single source IP can hold so one host's slow sockets (connect but
+	// never send a full ClientHello) can no longer exhaust the whole 1000-slot
+	// semaphore and DoS every other client. The source quota is reserved
+	// before acquiring a slot and released when the slot is released.
+	srcHost := sourceHostOf(conn)
+	if !handshakeAcquireSource(srcHost) {
+		conn.Close()
+		return nil, errors.New("REALITY: handshake slot quota reached for source")
+	}
+	releaseSource := func() { handshakeReleaseSource(srcHost) }
+
 	select {
 	case handshakeSem <- struct{}{}:
-		defer func() { <-handshakeSem }()
+		defer func() { <-handshakeSem; releaseSource() }()
 	case <-ctx.Done():
+		releaseSource()
 		conn.Close()
 		return nil, ctx.Err()
 	}
@@ -404,6 +417,65 @@ func authenticateClientHello(c *Conn, ch *clientHelloMsg, config *Config, show b
 // and never sends data cannot hold a handshake slot (and thus handshakeSem)
 // indefinitely.
 const handshakeReadTimeout = 10 * time.Second
+
+// Per-source handshake-slot quota (see Server). A single source IP can hold
+// at most handshakeSourceQuota slots so one host's slow sockets cannot
+// exhaust the 1000-slot handshakeSem on their own. 25% keeps headroom for
+// multi-client deployments while still capping a single abusive source.
+const handshakeSourceQuota = 250
+
+var handshakeSource struct {
+	mu    sync.Mutex
+	slots map[string]int // host -> slots currently held
+}
+
+// sourceHostOf returns the IP host (without port) of a connection's peer.
+func sourceHostOf(conn net.Conn) string {
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
+// handshakeAcquireSource reserves one slot budget for host. Returns false
+// when the source is already at quota (caller must reject without blocking).
+func handshakeAcquireSource(host string) bool {
+	if host == "" {
+		// No usable source: allow (cannot attribute quota — an attacker
+		// cannot hide the source this way; RemoteAddr is set by the kernel).
+		return true
+	}
+	handshakeSource.mu.Lock()
+	defer handshakeSource.mu.Unlock()
+	if n := handshakeSource.slots[host]; n >= handshakeSourceQuota {
+		return false
+	}
+	if handshakeSource.slots == nil {
+		handshakeSource.slots = make(map[string]int)
+	}
+	handshakeSource.slots[host]++
+	return true
+}
+
+// handshakeReleaseSource releases one slot budget previously reserved.
+func handshakeReleaseSource(host string) {
+	if host == "" {
+		return
+	}
+	handshakeSource.mu.Lock()
+	defer handshakeSource.mu.Unlock()
+	if n := handshakeSource.slots[host]; n > 1 {
+		handshakeSource.slots[host] = n - 1
+	} else {
+		delete(handshakeSource.slots, host)
+	}
+}
+
 
 // authFailThrottle bounds unauthenticated mirror amplification per source IP:
 // each failed auth dials the RA site and mirrors for 8s, so without a throttle
