@@ -256,6 +256,11 @@ func (m *CacheManager) MarkNegative(key string) {
 		}
 		entry.atomicState.Store(int32(ProfileNegative))
 		m.entries.Store(key, entry)
+		// Account the entry: GetProfile's negative sweep deletes with
+		// ProfileEntries.Add(-1), so without the +1 here the count drifts
+		// permanently negative and the capacity gate (evictIfFull) stops
+		// firing.
+		m.stats.ProfileEntries.Add(1)
 		return
 	}
 	entry := val.(*ProfileEntry)

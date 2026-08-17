@@ -447,6 +447,11 @@ func (m *CacheManager) Quarantine(key, reason string) {
 		entry.atomicState.Store(int32(ProfileQuarantined))
 		m.entries.Store(key, entry)
 		m.stats.Quarantines.Add(1)
+		// Account the entry for the capacity gate (evictIfFull): a
+		// quarantined entry is never swept by GetProfile, so without the
+		// +1 (balanced by evictIfFull's -1) it would be invisible to
+		// capacity accounting.
+		m.stats.ProfileEntries.Add(1)
 		m.dirty.Store(true)
 		return
 	}
