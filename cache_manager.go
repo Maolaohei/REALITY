@@ -36,7 +36,15 @@ type CacheManager struct {
 	singleflight sync.Map // map[string]*probeFlight (background refresh)
 	handshakeSF  sync.Map // map[string]*probeFlight (handshake path, short timeout)
 	stats        CacheManagerStats
-	dirty        atomic.Bool
+	// dirty is a monotonically increasing change counter; persisted is the
+// counter value last flushed to disk by PersistentProfileStore.Save. An
+// entry is "dirty" when dirty.Load() > persisted.Load(). Using counters
+// (not a bool) lets Save clear exactly the changes it snapshotted: any
+// StoreObservation landing during the write bumps dirty above the
+// snapshot, leaving IsDirty()==true so the next Save persists it — no
+// change is ever silently dropped by a late ClearDirty.
+dirty        atomic.Int64
+persisted    atomic.Int64
 	maxProfiles  int
 	baseTTL      time.Duration
 }
@@ -203,7 +211,7 @@ func (m *CacheManager) StoreProfile(key string, profile *RealityProfile) bool {
 	_, loaded := m.entries.LoadOrStore(key, entry)
 	if !loaded {
 		m.stats.ProfileEntries.Add(1)
-		m.dirty.Store(true)
+		m.MarkDirty()
 		m.evictIfFull()
 	}
 	return !loaded
@@ -219,7 +227,7 @@ func (m *CacheManager) HotSwapProfile(key string, newProfile *RealityProfile) {
 	newEntry.atomicState.Store(int32(ProfileValid))
 	m.entries.Store(key, newEntry)
 	m.stats.HotSwaps.Add(1)
-	m.dirty.Store(true)
+	m.MarkDirty()
 }
 
 // MarkStale marks a profile as stale.
@@ -286,7 +294,7 @@ func (m *CacheManager) InvalidateProfile(key string) {
 	if m.entries.CompareAndDelete(key, val) {
 		m.stats.ProfileEntries.Add(-1)
 		m.stats.ProfileInvalidated.Add(1)
-		m.dirty.Store(true)
+		m.MarkDirty()
 	}
 }
 
@@ -444,16 +452,36 @@ func (m *CacheManager) InvalidateAll() {
 		m.stats.ProfileInvalidated.Add(1)
 		return true
 	})
-	m.dirty.Store(true)
+	m.MarkDirty()
 }
 
 
+// MarkDirty records a cache mutation that should be persisted.
+func (m *CacheManager) MarkDirty() {
+	m.dirty.Add(1)
+}
+
+// IsDirty reports whether any mutation since the last successful Save.
 func (m *CacheManager) IsDirty() bool {
+	return m.dirty.Load() > m.persisted.Load()
+}
+
+// SnapshotDirty returns the mutation counter to be reflected by a Save.
+// Save must call PersistSnapshot with this value only after a successful
+// disk write, so mutations landing during the write stay unsaved.
+func (m *CacheManager) SnapshotDirty() int64 {
 	return m.dirty.Load()
 }
 
+// PersistSnapshot advances the persisted watermark to the snapshot value,
+// clearing exactly those mutations the Save flushed (older or equal).
+func (m *CacheManager) PersistSnapshot(snap int64) {
+	m.persisted.Store(snap)
+}
+
+// ClearDirty is kept for Reset/test parity: it marks everything persisted.
 func (m *CacheManager) ClearDirty() {
-	m.dirty.Store(false)
+	m.persisted.Store(m.dirty.Load())
 }
 
 // Reset clears all cache state for test isolation.
@@ -493,7 +521,7 @@ func (m *CacheManager) Reset() {
 	m.stats.L2SoftDemotions.Store(0)
 	m.stats.Quarantines.Store(0)
 	m.stats.Calibrations.Store(0)
-	m.dirty.Store(false)
+	m.ClearDirty()
 }
 
 var globalCacheManager = NewCacheManager()

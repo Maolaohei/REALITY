@@ -192,7 +192,10 @@ func (s *PersistentProfileStore) Save() {
 		Profiles: make(map[string]*PersistProfileEntry),
 	}
 
-	// Take a snapshot for consistent serialization.
+	// Take a snapshot for consistent serialization. Record the dirty
+	// watermark at the same instant so the post-write PersistSnapshot
+	// clears exactly these mutations (see PersistSnapshot contract).
+	snapDirty := globalCacheManager.SnapshotDirty()
 	snapshot := globalCacheManager.SnapshotProfiles()
 	for key, p := range snapshot {
 		file.Profiles[key] = &PersistProfileEntry{
@@ -238,8 +241,12 @@ func (s *PersistentProfileStore) Save() {
 	f.Close()
 	os.Rename(tmpPath, s.filePath)
 
-	// Clear dirty flag after successful write.
-	globalCacheManager.ClearDirty()
+	// Advance the persisted watermark to exactly the mutations this Save
+	// snapshotted. Any StoreObservation that landed during the write bumped
+	// dirty above snap -> IsDirty() stays true and the next Save persists
+	// it; the previous unconditional ClearDirty() here silently dropped a
+	// concurrent update (TOCTOU).
+	globalCacheManager.PersistSnapshot(snapDirty)
 }
 
 // load reads profiles from disk and populates caches.

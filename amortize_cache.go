@@ -260,7 +260,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 			entry.TTL = m.baseTTL
 			entry.mu.Unlock()
 			m.stats.Calibrations.Add(1)
-			m.dirty.Store(true)
+			m.MarkDirty()
 			return
 		}
 		cur := entry.Profile
@@ -311,7 +311,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 			entry.TTL = m.baseTTL
 			entry.FailCount = 0
 			entry.mu.Unlock()
-			m.dirty.Store(true)
+			m.MarkDirty()
 			return
 		}
 		// Mismatch: require two consecutive identical new observations (stored in Profile candidate via HotSwap debounce fields on entry).
@@ -341,7 +341,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 				m.stats.HotSwaps.Add(1)
 			}
 			entry.mu.Unlock()
-			m.dirty.Store(true)
+			m.MarkDirty()
 			return
 		}
 		// First mismatch observation: mark suspect with new candidate.
@@ -360,7 +360,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 		entry.atomicState.Store(int32(ProfileSuspect))
 		entry.FailCount = 1
 		entry.mu.Unlock()
-		m.dirty.Store(true)
+		m.MarkDirty()
 		return
 	}
 
@@ -390,7 +390,7 @@ func (m *CacheManager) StoreObservation(key string, obs *RealityProfile) {
 	entry.atomicState.Store(int32(ProfileValid))
 	if _, loaded := m.entries.LoadOrStore(key, entry); !loaded {
 		m.stats.ProfileEntries.Add(1)
-		m.dirty.Store(true)
+		m.MarkDirty()
 		m.evictIfFull()
 	}
 }
@@ -452,7 +452,7 @@ func (m *CacheManager) Quarantine(key, reason string) {
 		// +1 (balanced by evictIfFull's -1) it would be invisible to
 		// capacity accounting.
 		m.stats.ProfileEntries.Add(1)
-		m.dirty.Store(true)
+		m.MarkDirty()
 		return
 	}
 	entry := val.(*ProfileEntry)
@@ -469,7 +469,7 @@ func (m *CacheManager) Quarantine(key, reason string) {
 	}
 	entry.mu.Unlock()
 	m.stats.Quarantines.Add(1)
-	m.dirty.Store(true)
+	m.MarkDirty()
 	_ = reason
 }
 
@@ -506,7 +506,7 @@ func (m *CacheManager) NoteHandshakeFailure(key string, path AmortizePath) {
 		}
 		entry.mu.Unlock()
 		m.stats.Quarantines.Add(1)
-		m.dirty.Store(true)
+		m.MarkDirty()
 		return
 	}
 	if entry.State == ProfileValid {
@@ -514,7 +514,7 @@ func (m *CacheManager) NoteHandshakeFailure(key string, path AmortizePath) {
 		entry.atomicState.Store(int32(ProfileSuspect))
 	}
 	entry.mu.Unlock()
-	m.dirty.Store(true)
+	m.MarkDirty()
 }
 
 // InvalidateKey deletes a single key (precise invalidation).
