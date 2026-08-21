@@ -93,12 +93,12 @@ func (m *RefreshManager) probeTarget(dest, serverName string, entry *refreshEntr
 					return false
 				}
 				newProfile := &RealityProfile{
-					RecordLens:   result.RecordLens,
-					Fingerprint:  computeFingerprint(result.CipherSuite, entry.alpn, result.RecordLens[0], result.RecordLens[2]),
-					CipherSuite:  result.CipherSuite,
-					ALPN:         entry.alpn,
-					RecordCount:  result.RecordCount,
-					CapturedAt:   time.Now(),
+					RecordLens:  result.RecordLens,
+					Fingerprint: computeFingerprint(result.CipherSuite, entry.alpn, result.RecordLens[0], result.RecordLens[2]),
+					CipherSuite: result.CipherSuite,
+					ALPN:        entry.alpn,
+					RecordCount: result.RecordCount,
+					CapturedAt:  time.Now(),
 				}
 				globalCacheManager.HotSwapProfile(entry.cacheKey, newProfile)
 				globalCacheManager.InvalidateFingerprint()
@@ -137,9 +137,9 @@ type refreshEntry struct {
 	failCount  int // consecutive probe failures
 
 	// Debouncing: only HotSwap after consecutive identical probe results.
-	lastProbeLens      [7]int
+	lastProbeLens        [7]int
 	lastProbeCipherSuite uint16
-	stableCount        int
+	stableCount          int
 }
 
 var (
@@ -248,11 +248,11 @@ func (m *RefreshManager) AddTarget(dest, serverName, alpn string) {
 	}
 
 	entry := &refreshEntry{
-		dest:     dest,
+		dest:       dest,
 		serverName: serverName,
-		alpn:     alpn,
-		cacheKey: CacheKey(serverName, alpn, VersionTLS13),
-		stopCh:   make(chan struct{}),
+		alpn:       alpn,
+		cacheKey:   CacheKey(serverName, alpn, VersionTLS13),
+		stopCh:     make(chan struct{}),
 	}
 	entry.timer = time.AfterFunc(randomRefreshInterval(), func() {
 		m.probeAndReschedule(entry)
@@ -345,9 +345,10 @@ func recordLensMatch(a, b [7]int) bool {
 // StartBackgroundRefreshForProfile is called when a new profile is cached.
 func StartBackgroundRefreshForProfile(dest, serverName, alpn string) {
 	m := GetRefreshManager()
-	if !m.started {
-		m.Start()
-	}
+	// Start is already mutex-protected and idempotent. Reading started here
+	// raced Start/Stop/Reset when EventBus workers emitted handshakes in
+	// parallel; delegate the decision to the synchronized method.
+	m.Start()
 	m.AddTarget(dest, serverName, alpn)
 }
 

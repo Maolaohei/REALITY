@@ -11,11 +11,17 @@ import (
 
 // PersistentProfileStore manages saving and loading of cached profiles.
 type PersistentProfileStore struct {
-	mu       sync.Mutex
-	filePath string
-	enabled  atomic.Bool
-	quit     chan struct{}
+	mu            sync.Mutex
+	filePath      string
+	enabled       atomic.Bool
+	quit          chan struct{}
+	saveScheduled atomic.Bool
 }
+
+// profileSaveDebounce coalesces bursts of successful handshakes into one disk
+// snapshot. Persistence is background fidelity state, never a reason to pin
+// every EventBus worker on JSON+fsync.
+const profileSaveDebounce = time.Second
 
 // ProfileFile is the JSON structure for persistent storage.
 type ProfileFile struct {
@@ -250,6 +256,22 @@ func (s *PersistentProfileStore) Save() {
 	globalCacheManager.PersistSnapshot(snapDirty)
 }
 
+// RequestSave schedules one coalesced background Save. More handshakes during
+// the debounce interval only leave the dirty epoch higher; Save's watermark
+// preserves mutations that race its write for a later snapshot.
+func (s *PersistentProfileStore) RequestSave() {
+	if !s.enabled.Load() || !globalCacheManager.IsDirty() {
+		return
+	}
+	if !s.saveScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	time.AfterFunc(profileSaveDebounce, func() {
+		defer s.saveScheduled.Store(false)
+		s.Save()
+	})
+}
+
 // load reads profiles from disk and populates caches.
 func (s *PersistentProfileStore) load() {
 	data, err := os.ReadFile(s.filePath)
@@ -369,6 +391,7 @@ func (s *PersistentProfileStore) StopPeriodicSave() {
 
 // SaveOnShutdown should be called via defer or signal handler.
 func (s *PersistentProfileStore) SaveOnShutdown() {
+	s.saveScheduled.Store(false)
 	s.Save()
 }
 
