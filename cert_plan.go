@@ -90,6 +90,12 @@ var (
 	certPlanCache = make(map[certPlanCacheKey]*CertPlan)
 )
 
+// certPlanCacheMaxEntries bounds cumulative plan DER retained across unusual
+// record budgets and destination shapes. Eviction only drops a reusable plan:
+// in-flight handshakes hold their pointer, and a miss deterministically
+// rebuilds the same authenticated certificate shape.
+const certPlanCacheMaxEntries = 512
+
 // GetCertPlan returns a plan sized for the given record budget.
 //
 // Split mode (RecordModeSplit):
@@ -155,6 +161,15 @@ func GetCertPlanWithMeta(budget int, mldsa bool, mode uint8, dest string, meta *
 		}
 	}
 	certPlanMu.Lock()
+	if len(certPlanCache) >= certPlanCacheMaxEntries {
+		// Plans have no recency metadata by design. Removing one arbitrary
+		// entry is sufficient for a strict memory bound without introducing a
+		// global hot-path LRU lock or quantizing wire-visible record budgets.
+		for stale := range certPlanCache {
+			delete(certPlanCache, stale)
+			break
+		}
+	}
 	certPlanCache[key] = p
 	certPlanMu.Unlock()
 	return p

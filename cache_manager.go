@@ -37,16 +37,16 @@ type CacheManager struct {
 	handshakeSF  sync.Map // map[string]*probeFlight (handshake path, short timeout)
 	stats        CacheManagerStats
 	// dirty is a monotonically increasing change counter; persisted is the
-// counter value last flushed to disk by PersistentProfileStore.Save. An
-// entry is "dirty" when dirty.Load() > persisted.Load(). Using counters
-// (not a bool) lets Save clear exactly the changes it snapshotted: any
-// StoreObservation landing during the write bumps dirty above the
-// snapshot, leaving IsDirty()==true so the next Save persists it — no
-// change is ever silently dropped by a late ClearDirty.
-dirty        atomic.Int64
-persisted    atomic.Int64
-	maxProfiles  int
-	baseTTL      time.Duration
+	// counter value last flushed to disk by PersistentProfileStore.Save. An
+	// entry is "dirty" when dirty.Load() > persisted.Load(). Using counters
+	// (not a bool) lets Save clear exactly the changes it snapshotted: any
+	// StoreObservation landing during the write bumps dirty above the
+	// snapshot, leaving IsDirty()==true so the next Save persists it — no
+	// change is ever silently dropped by a late ClearDirty.
+	dirty       atomic.Int64
+	persisted   atomic.Int64
+	maxProfiles int
+	baseTTL     time.Duration
 }
 
 type probeFlight struct {
@@ -87,7 +87,7 @@ const maxTTLMultiplier = 2
 
 // --- Singleflight ---
 
-func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (*RealityProfile, error) {
+func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (value *RealityProfile, err error) {
 	m.stats.ProbeAttempts.Add(1)
 	flight := &probeFlight{done: make(chan struct{})}
 	val, loaded := m.singleflight.LoadOrStore(key, flight)
@@ -99,9 +99,16 @@ func (m *CacheManager) DoProbe(key string, fn func() (*RealityProfile, error)) (
 		}
 		return existing.value, existing.err
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			flight.value = nil
+			flight.err = fmt.Errorf("REALITY probe panic: %v", r)
+		}
+		close(flight.done)
+		m.singleflight.Delete(key)
+		value, err = flight.value, flight.err
+	}()
 	flight.value, flight.err = fn()
-	close(flight.done)
-	m.singleflight.Delete(key)
 	if flight.err == nil {
 		m.stats.ProbeSuccesses.Add(1)
 	}
@@ -133,7 +140,7 @@ func (m *CacheManager) GetOrProbeForHandshake(ctx context.Context, key, dest, se
 	})
 }
 
-func (m *CacheManager) doHandshakeProbe(key string, fn func() (*RealityProfile, error)) (*RealityProfile, error) {
+func (m *CacheManager) doHandshakeProbe(key string, fn func() (*RealityProfile, error)) (value *RealityProfile, err error) {
 	flight := &probeFlight{done: make(chan struct{})}
 	val, loaded := m.handshakeSF.LoadOrStore(key, flight)
 	if loaded {
@@ -141,9 +148,16 @@ func (m *CacheManager) doHandshakeProbe(key string, fn func() (*RealityProfile, 
 		<-existing.done
 		return existing.value, existing.err
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			flight.value = nil
+			flight.err = fmt.Errorf("REALITY handshake probe panic: %v", r)
+		}
+		close(flight.done)
+		m.handshakeSF.Delete(key)
+		value, err = flight.value, flight.err
+	}()
 	flight.value, flight.err = fn()
-	close(flight.done)
-	m.handshakeSF.Delete(key)
 	return flight.value, flight.err
 }
 
@@ -306,7 +320,6 @@ func (m *CacheManager) StoreFingerprint(key string, fp *targetFingerprintCache) 
 	m.fingerprints.Store(key, fp)
 }
 
-
 // FindFullCachedProfile searches for a cached profile with ServerHello data.
 func (m *CacheManager) FindFullCachedProfile(dest, serverName string, cipherSuites []uint16, alpn string) *RealityProfile {
 	key := CacheKey(serverName, alpn, VersionTLS13)
@@ -455,7 +468,6 @@ func (m *CacheManager) InvalidateAll() {
 	m.MarkDirty()
 }
 
-
 // MarkDirty records a cache mutation that should be persisted.
 func (m *CacheManager) MarkDirty() {
 	m.dirty.Add(1)
@@ -525,5 +537,3 @@ func (m *CacheManager) Reset() {
 }
 
 var globalCacheManager = NewCacheManager()
-
-
