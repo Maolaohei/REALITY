@@ -133,6 +133,13 @@ func (c *PostHandshakeRecordDetectConn) Read(b []byte) (n int, err error) {
 	for {
 		if len(data) >= 5 && bytes.Equal(data[:3], []byte{23, 3, 3}) {
 			length := int(binary.BigEndian.Uint16(data[3:5])) + 5
+			// A dest can close mid-record. The declared TLS record length is
+			// untrusted until its full payload is actually buffered; never
+			// reslice past the captured bytes or a background probe can panic
+			// the whole process.
+			if length > len(data) {
+				break
+			}
 			postHandshakeRecordsLens = append(postHandshakeRecordsLens, length)
 			data = data[length:]
 		} else {

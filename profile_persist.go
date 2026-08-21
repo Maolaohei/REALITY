@@ -154,8 +154,9 @@ type PersistProfileEntry struct {
 }
 
 var (
-	profileStore *PersistentProfileStore
-	loadOnce     sync.Once
+	profileStore   *PersistentProfileStore
+	profileStoreMu sync.Mutex
+	loadOnce       sync.Once
 )
 
 // InitPersistentStore initializes the persistent profile store.

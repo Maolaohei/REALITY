@@ -304,6 +304,13 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 }
 
 func initServerSideOnce(config *Config, show bool) {
+	// Server runs once per inbound connection. profileStore is initialized by
+	// loadOnce, but an unsynchronized nil read here can race the first store
+	// assignment under concurrent handshakes. Hold the store mutex across the
+	// one-time bootstrap so every later handshake observes a fully published
+	// persistent store and its handlers.
+	profileStoreMu.Lock()
+	defer profileStoreMu.Unlock()
 	if profileStore == nil {
 		cacheDir := config.CacheDir
 		if cacheDir == "-" {
@@ -475,7 +482,6 @@ func handshakeReleaseSource(host string) {
 		delete(handshakeSource.slots, host)
 	}
 }
-
 
 // authFailThrottle bounds unauthenticated mirror amplification per source IP:
 // each failed auth dials the RA site and mirrors for 8s, so without a throttle

@@ -116,6 +116,16 @@ func dialAndProbe(ctx context.Context, dest, serverName string, alpn int, xver b
 	}
 
 	pConn := newProbeConn(conn)
+	// DialContext only bounds connect. uTLS Handshake can otherwise block on a
+	// target that accepts TCP then blackholes TLS, ignoring the caller's probe
+	// deadline and starving refresh workers.
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			pConn.Close()
+			return nil, nil, fmt.Errorf("set probe deadline: %w", err)
+		}
+	}
+	defer conn.SetDeadline(time.Time{})
 
 	fingerprint, nextProtos := selectFingerprintAndALPN(alpn)
 	uConn := utls.UClient(pConn, &utls.Config{
