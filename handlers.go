@@ -23,9 +23,11 @@ func RegisterCacheHandlers(bus *EventBus) {
 // RegisterPersistHandlers subscribes PersistManager to handshake events.
 func RegisterPersistHandlers(bus *EventBus) {
 	bus.On(EventHandshakeComplete, func(e Event) {
-		// Persist new profiles to disk.
+		// EventBus already runs this handler off the handshake path with a
+		// bounded worker set. Do not spawn another goroutine per handshake:
+		// Save itself skips clean state and serializes writers with its mutex.
 		if profileStore != nil {
-			go profileStore.Save()
+			profileStore.Save()
 		}
 	})
 }
